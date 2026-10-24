@@ -1,0 +1,25 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "local-qwen",
+  "version": "0.1.0",
+  "description": "Plan with the model you selected in this window and implement with a pinned local Qwen worker on your own machine. Setup checks and installs the user-wide routing, doctor verifies an existing install read-only, and the launcher runs scoped jobs in throwaway git worktrees, returning a patch, real test results and an audit of every changed file.",
+  "keywords": [
+    "local-first",
+    "local-model",
+    "qwen",
+    "omlx",
+    "worker",
+    "skills",
+    "task-contract",
+    "verification"
+  ],
+  "extensions": {
+    "com.openai": {
+      "onboardingSkill": "./skills/setup/SKILL.md",
+      "interface": {
+        "displayName": "Local Qwen",
+        "shortDescription": "Plan here, implement with a pinned local Qwen worker"
+      }
+    }
+  }
+}

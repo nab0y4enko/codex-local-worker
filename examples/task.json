@@ -1,0 +1,18 @@
+{
+  "task_id": "example-add-fix",
+  "repo_path": "/absolute/path/to/a/git/repository",
+  "base_ref": "main",
+  "goal": "Make the test suite pass by fixing add() in add.py so that add(2, 3) returns 5. Edit add.py only; every other path is out of scope.",
+  "acceptance_criteria": [
+    "python3 -m unittest -v exits 0",
+    "add(2, 3) returns 5"
+  ],
+  "allowed_paths": [
+    "add.py"
+  ],
+  "test_commands": [
+    ["python3", "-m", "unittest", "-v"]
+  ],
+  "timeout_seconds": 180,
+  "max_attempts": 1
+}

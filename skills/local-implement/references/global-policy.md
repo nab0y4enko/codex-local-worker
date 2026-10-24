@@ -1,0 +1,41 @@
+# Canonical global policy: selected planner, local Qwen implementation
+
+This is the authoritative user-wide default policy for a new Local Qwen plugin install. Setup
+backs up `$CODEX_HOME/AGENTS.md` (default `~/.codex/AGENTS.md`) and idempotently maintains a small
+managed block there that points at this file; the block never rewrites unrelated instructions, and
+an exact copy of the legacy policy is migrated rather than duplicated.
+
+Provenance: migrated from the user-wide `AGENTS.md` that was installed on the original machine.
+That historical file stays in this package at `evidence/global-default/AGENTS.md` as an unchanged
+migration input for setup. The only change below is portability: the machine-specific skill and
+launcher paths are replaced by plugin-root resolution, and the skill is the one bundled in this
+plugin instead of a per-user copy. Everything else is the user's existing policy text.
+
+---
+
+# User-wide Codex defaults
+
+## Selected planner, local Qwen implementation
+
+Apply this default in every project without requiring a skill invocation or a repeated request.
+
+- Keep the model the user selects in the Codex window for planning, investigation, task decomposition, orchestration and review. Do not change the window model or the global default provider to Qwen.
+- Route all implementation, fixes, refactors, code/configuration edits, test authoring and corrections through local Qwen3.8-Flash-Next-UD-Q4_K_XL. Execute project tests through the local worker or the launcher's deterministic full-host verification, run directly on the host with network enabled.
+- Before implementation, read the bundled local-implement skill of the installed Local Qwen plugin and use its launcher. Resolve both from the plugin root: this policy file is <root>/skills/local-implement/references/global-policy.md and the skill is <root>/skills/local-implement/SKILL.md, so the root is three directories above this file (the directory whose plugin.json declares name local-qwen) and the launcher is <root>/bin/local-implement. Never hardcode a personal checkout path or a per-user skill directory: the root moves with every install or update. Do not wait for the user to invoke the skill. Use one shared default state directory. Jobs stay serialized by default (one worker at a time); the reviewed launcher may run up to 4 LOCAL Qwen workers only when each contract is independently scoped and correctly mergeable, through that same shared bounded pool with --max-workers 4: one isolated worktree and one task contract per worker, disjoint allowed_paths or an explicit dependency and merge plan, the primary checkout preserved, and never a cloud worker. The planner reviews every worker patch and combines accepted ones only through a separately scoped local integration contract; keep jobs sequential whenever correct integration or pool capacity is unavailable.
+- Persistent permission choice for local workers: the launcher runs every local Qwen worker with sandbox_mode danger-full-access, approval_policy never and --ignore-rules (worker execpolicy rules are ignored), with network enabled, and no launcher-imposed sandbox or approval restriction. Verification commands run directly on the host, unwrapped, and are reported sandboxed: false. The worker's own filesystem and network access are the host's, so scope comes from the task contract, allowed_paths and one isolated worktree; Git worktree isolation and the post-run audit detect and evidence scope, they do not enforce filesystem permissions.
+- Process ownership: run long commands in the foreground through exec_command with managed session polling. Never detach tests or workers with raw shell &, nohup or disown, and no sleep-and-tail loops; bare background processes may be terminated before completion and yield incomplete logs. Use the parent's deterministic verifier for broad test suites, keep targeted reads bounded, and report compact result manifests instead of long case tables.
+- The planner may read files, prepare plans and task contracts, launch workers, inspect reports and diffs, and perform authorized deterministic setup/installation. Do not write implementation patches yourself or delegate implementation to cloud subagents.
+- Preserve the primary checkout and its uncommitted changes. Review the worker evidence; send corrections back to local Qwen. Do not automatically merge or apply patches into project code.
+- If the local model/server, launcher or repository requirements are unavailable, report the concrete blocker and stop implementation. Sandbox availability is not an implementation blocker while full-host mode is active. Never silently switch to a cloud model. A project without Git support is a setup blocker for this launcher, not permission to implement in the cloud.
+- This is the user's persistent default. Change the routing only when the user explicitly requests an exception. Repository-specific build/style instructions still apply within this workflow.
+
+## Local-worker exception (prevents recursive delegation)
+
+If this process is already the local Qwen implementation worker executing an assigned launcher task contract, implement that contract directly inside its assigned worktree. Do not invoke local-implement again, spawn another worker, or act as the cloud planner. Follow the assigned scope and verification requirements. This exception applies only to the actual local worker, not to the selected planner merely reading a task contract.
+
+## Global completion rule: commit, push, clean up worktrees
+
+- When authorized work is finished, commit the reviewed task changes and push them to the task's branch before reporting completion. A request to do the work includes these completion steps; do not ask for permission again. Do not force-push or merge into a different branch without authorization.
+- Leave no temporary or linked worktrees behind for completed work. Preserve the primary checkout. Finish active work first; preserve task commits, needed uncommitted work, detached histories, logs and ignored build/test artifacts before removing linked worktrees. Make detached work recoverable on a ref or in a verified bundle; use native managed-worktree archival when applicable.
+- Keep recovery/evidence archives outside worktrees being removed. Verify the branch exists on the remote and that the repository has no remaining task worktrees after cleanup. Do not delete unrelated active work or silently discard local files.
+- If a push or safe cleanup is blocked, report the concrete remaining action and do not claim completion. This completion policy supersedes older skill defaults that retain every finished worktree or forbid the reviewed parent from committing/pushing accepted work. Workers still must not commit, push, merge or remove worktrees themselves.

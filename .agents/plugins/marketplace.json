@@ -1,0 +1,20 @@
+{
+  "name": "local-qwen-tools",
+  "interface": {
+    "displayName": "Local Qwen Tools"
+  },
+  "plugins": [
+    {
+      "name": "local-qwen",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
