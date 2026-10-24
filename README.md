@@ -1,5 +1,7 @@
 # codex-local-worker
 
+Actual source repository: <https://github.com/nab0y4enko/codex-local-worker>.
+
 Run local Codex CLI workers (one by default, up to four in the shared bounded pool) against a
 **pinned local model** on loopback, in throwaway `git worktree`s, and get back evidence: a
 patch, full-host test results, and an audit of every file that changed. Stdlib Python 3 only —
@@ -83,8 +85,10 @@ plugin at `skills/local-worker/references/global-policy.md`. The authoritative p
 in the package; only that tiny reference block is global, unrelated instructions in `AGENTS.md` are
 preserved around it, and an existing file is backed up first. That block is routing, not
 enforcement: it sends the planner selected in the Codex window to the bundled policy, and nothing
-in this package enforces a model, a route, or a worker app-wide. A legacy hand-copied
-`~/.codex/skills/local-worker/SKILL.md` can be retired after the plugin install is qualified.
+in this package enforces a model, a route, or a worker app-wide. The pre-rename hand-copied skill
+`~/.codex/skills/local-implement/SKILL.md` — the old name belongs to that historical path — can be
+retired after the plugin install is qualified; the current manual target is the
+[manual launcher path](#manual-launcher-path-legacy) below.
 The package is portable: no model weights, no credentials, and no cache or run state inside it —
 state still lives outside the repository under `$LOCAL_WORKER_STATE_DIR`.
 
@@ -108,6 +112,33 @@ JSON such as `[]`, a blocked report, or exit `0` with no JSON — fails with the
 was missing, so a receipt shape is never mistaken for an endpoint claim. Migration is narrow: a
 global `AGENTS.md` that matches the historical hand-written policy byte-for-byte is reduced to a
 short heading plus the managed block, and anything else is kept as it is.
+
+### Migration and compatibility
+
+Canonical environment names are `$LOCAL_WORKER_STATE_DIR` and `$LOCAL_WORKER_CODEX_BIN`. The
+pre-rename `$LOCAL_IMPLEMENT_STATE_DIR` and `$LOCAL_IMPLEMENT_CODEX_BIN` work **only as
+fallbacks**: they are read when the canonical name is unset or empty, and equal values in both
+names are the supported compatibility case. Two *different* nonempty values for one pair refuse
+(usage error, before any backup or write) instead of guessing, because silently picking one would
+split one shared pool or run a Codex binary the operator did not choose. An explicit CLI setting
+(`--state-dir`, `--codex-bin`) is the way to resolve such a conflict deliberately: it wins over
+both environment names.
+
+The default state root `~/.local-implement` is kept **deliberately**. That directory is the one
+existing shared pool — kernel locks, slots, leases, report history and preserved worktrees — so a
+`~/.local-worker` root would split the pool and orphan unmerged evidence. It is a retained
+compatibility path, not a missed rename; pass `--state-dir` or set `$LOCAL_WORKER_STATE_DIR` to
+start a separate root.
+
+The retired 0.1.0 package name `local-qwen` is **migration input only**: nothing installs or
+routes to it any more. The current package is `codex-local-worker`; the launcher and skill inside
+it are `local-worker`. Such a pointer is reported by `--check` as `managed_block.state`
+`legacy_pointer`; `--apply` replaces the old `local-qwen` marker pair in place with exactly one
+`local-worker` block, backs the previous bytes up under `$LOCAL_WORKER_STATE_DIR/setup-backups/`,
+preserves every byte outside the block, and reports `reason` `migrated_legacy_pointer`; a second
+apply writes nothing. Mixed, duplicated or unbalanced old/new markers are malformed: setup refuses
+with the managed-block exit code, no backup and no write, because two competing routing policies
+must never be left behind.
 
 ### Manual launcher path (legacy)
 

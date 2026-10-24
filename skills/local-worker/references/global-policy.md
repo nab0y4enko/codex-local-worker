@@ -31,7 +31,7 @@ Apply this default in every project without requiring a skill invocation or a re
 
 ## Local-worker exception (prevents recursive delegation)
 
-If this process is already the local worker implementation worker executing an assigned launcher task contract, implement that contract directly inside its assigned worktree. Do not invoke local-worker again, spawn another worker, or act as the cloud planner. Follow the assigned scope and verification requirements. This exception applies only to the actual local worker, not to the selected planner merely reading a task contract.
+If this process is already the local Qwen implementation worker executing an assigned launcher task contract, implement that contract directly inside its assigned worktree. Do not invoke local-worker again, spawn another worker, or act as the cloud planner. Follow the assigned scope and verification requirements. This exception applies only to the actual local worker, not to the selected planner merely reading a task contract.
 
 ## Global completion rule: commit, push, clean up worktrees
 
