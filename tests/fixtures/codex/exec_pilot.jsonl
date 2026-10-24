@@ -1,5 +1,5 @@
 {"type":"thread.started","thread_id":"01a16fcd-6489-7d22-ab7b-5ec55e76c0fa"}
-{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Under-development features enabled: skip_host_skill_discovery. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in /private/tmp/claude-502/-Users-oleksii-naboichenko--claude-spares-spare-2HyzdA/2a144c4a-2eac-4b5c-a9a4-53a7afa70acf/scratchpad/pilot1/codexhome/config.toml."}}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Under-development features enabled: skip_host_skill_discovery. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in <scratch>/codex-home/config.toml."}}
 {"type":"item.completed","item":{"id":"item_1","type":"error","message":"Model metadata for `Qwen3.5-9B-OptiQ-4bit` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}}
 {"type":"turn.started"}
 {"type":"item.completed","item":{"id":"item_2","type":"reasoning","text":"\nI need to fix add.py to make add(2, 3) return 5. Let me first look at the current state of add.py to understand what needs to be fixed.\n"}}

@@ -18,7 +18,9 @@ the body; a body with no ``_http_status`` was served with 200.
 Privacy: the oMLX API key is read from settings.json and sent only as a request header, to a
 loopback host. It is never printed or written. Before anything touches disk, every payload has
 `api_key`, `secret_key` and `sub_keys` dropped and the home directory replaced with `~`, and
-the script refuses to write a file that still contains a credential or the home path.
+the script refuses to write a file that still contains a credential, the home path, or a
+`/Users/` or `/private/tmp/claude` path. Scratch paths in a recorded stream become `<scratch>`
+(`<scratch>/codex-home` for the throwaway Codex home).
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -44,6 +47,12 @@ CATALOG_FIELDS = ("slug", "display_name", "description", "context_window",
 CODEX_BIN_ENV = "LOCAL_WORKER_CODEX_BIN"
 LEGACY_CODEX_BIN_ENV = "LOCAL_IMPLEMENT_CODEX_BIN"
 MIN_SECRET_LENGTH = 8
+# The repository is public. A recorded stream can name the throwaway Codex home or scratch
+# directory of the machine that produced it; those become neutral placeholders.
+SCRATCH_CODEX_HOME = re.compile(r"/private/tmp/claude[^\s\"'`\\]*/codexhome")
+SCRATCH_PATH = re.compile(r"/private/tmp/claude[^\s\"'`\\]*")
+# Never allowed in a written fixture, whatever produced it.
+FORBIDDEN_MARKERS = ("/Users/", "/private/tmp/claude")
 
 # (base_url, path, api_key or None) -> (HTTP status, decoded JSON body)
 Fetch = Callable[[str, str, Optional[str]], Tuple[int, Any]]
@@ -118,8 +127,10 @@ def _home_token(home: str) -> str:
 
 
 def sanitize_text(text: str, home: str) -> str:
-    """Replace the home directory in raw text with ``~``."""
-    return text.replace(_home_token(home), "~")
+    """Replace the home directory with ``~`` and scratch paths with neutral placeholders."""
+    text = text.replace(_home_token(home), "~")
+    text = SCRATCH_CODEX_HOME.sub("<scratch>/codex-home", text)
+    return SCRATCH_PATH.sub("<scratch>", text)
 
 
 def sanitize(value: Any, home: str) -> Any:
@@ -235,9 +246,9 @@ def capture(out_dir: Path, *, settings_path: Path, pilot_attempt: Path,
         if any(secret in text for secret in secrets):
             raise SystemExit("refusing to write {0}: it contains an oMLX credential".format(
                 relative))
-        if _home_token(home) in text:
-            raise SystemExit("refusing to write {0}: it still contains the home path".format(
-                relative))
+        if _home_token(home) in text or any(marker in text for marker in FORBIDDEN_MARKERS):
+            raise SystemExit("refusing to write {0}: it still contains a personal or scratch "
+                             "path".format(relative))
     written = []
     for relative, text in files.items():
         target = Path(out_dir) / relative

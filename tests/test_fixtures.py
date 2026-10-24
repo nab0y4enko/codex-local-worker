@@ -21,6 +21,8 @@ OMLX_FILES = ("health_ok", "health_loading", "api_status", "models_status_one",
               "models_status_helper_and_embedding")
 CODEX_FILES = ("exec_pilot.jsonl", "debug_models.json", "rollout_planner.jsonl")
 CHAT_TYPES = ("llm", "vlm")
+# The repository is public: no fixture may name a person, a home directory or a scratch path.
+PERSONAL_MARKERS = ("oleksii", "/users/", "/private/tmp/claude")
 
 
 def loaded(status, *, chat_only=False):
@@ -36,6 +38,16 @@ class FixtureHygiene(unittest.TestCase):
             text = (root / rel).read_text()
             self.assertNotRegex(text, r"(?i)bearer\s+\S{8,}|api_key\"\s*:\s*\"[^\"<]")
             self.assertNotIn(os.path.expanduser("~"), text)
+
+    def test_no_fixture_file_carries_a_personal_or_scratch_path(self):
+        files = [path for path in FIXTURES.rglob("*")
+                 if path.is_file() and "__pycache__" not in path.parts]
+        self.assertGreaterEqual(len(files), len(OMLX_FILES) + len(CODEX_FILES))
+        for path in files:
+            text = path.read_bytes().decode("utf-8", "replace").lower()
+            for marker in PERSONAL_MARKERS:
+                if marker in text:   # fail without echoing the file's content
+                    self.fail("{0} contains {1!r}".format(path.relative_to(FIXTURES), marker))
 
     def test_models_status_one_has_one_loaded_chat_model(self):
         status = sp.load_fixture("omlx/models_status_one.json")
@@ -193,6 +205,15 @@ class CaptureScript(unittest.TestCase):
         self.assertEqual(cap.sanitize(data, self.HOME), {
             "models": [{"path": "~/.omlx/models/m", "nested": {"n": 3}}], "note": "see ~/x"})
 
+    def test_sanitize_replaces_scratch_paths_with_a_neutral_placeholder(self):
+        scratch = "/private/tmp/claude-502/-Users-someone--proj/abc/scratchpad/pilot1"
+        text = ("set `x = true` in {0}/codexhome/config.toml. and also {0}/state/report.json"
+                .format(scratch))
+        self.assertEqual(cap.sanitize_text(text, self.HOME),
+                         "set `x = true` in <scratch>/codex-home/config.toml. and also <scratch>")
+        self.assertEqual(cap.sanitize({"a": [scratch + "/codexhome"]}, self.HOME),
+                         {"a": ["<scratch>/codex-home"]})
+
     def test_trim_catalog_keeps_only_the_fields_the_plugin_reads(self):
         raw = {"models": [{"slug": "a", "display_name": "A", "description": "d",
                            "context_window": 5, "supported_reasoning_levels": [],
@@ -224,10 +245,11 @@ class CaptureScript(unittest.TestCase):
                                      "path": self.HOME + "/.omlx/models/m"}]}
         return fetch
 
-    def capture(self, fetch):
+    def capture(self, fetch, pilot_extra="elsewhere"):
         pilot = self.root / "attempt-1.jsonl"
         pilot.write_text('{"type":"thread.started","thread_id":"t"}\n'
-                         '{"type":"item.completed","item":{"text":"' + self.HOME + '/repo"}}\n',
+                         '{"type":"item.completed","item":{"text":"' + self.HOME + '/repo"}}\n'
+                         '{"type":"item.completed","item":{"text":"' + pilot_extra + '"}}\n',
                          encoding="utf-8")
         models = self.root / "models.json"
         models.write_text(json.dumps({"models": [{"slug": "a", "display_name": "A",
@@ -259,6 +281,15 @@ class CaptureScript(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             self.capture(self.fake_fetch(health_status=503))
         self.assertNotIn("capture-test-key", str(ctx.exception))
+
+    def test_capture_scrubs_scratch_paths_from_the_pilot_stream(self):
+        out = self.capture(self.fake_fetch(), pilot_extra=(
+            "/private/tmp/claude-502/-Users-someone--p/x/scratchpad/pilot1/codexhome"))
+        text = (out / "codex" / "exec_pilot.jsonl").read_text()
+        self.assertIn("<scratch>/codex-home", text)
+        self.assertNotIn("/private/tmp/claude", text)
+        for line in text.splitlines():
+            json.loads(line)
 
     def test_capture_refuses_output_that_contains_the_key(self):
         def leaking(base_url, path, key):
