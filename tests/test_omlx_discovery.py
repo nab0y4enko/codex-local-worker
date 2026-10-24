@@ -207,6 +207,39 @@ class Discovery(DiscoveryCase):
         self.assertIsNone(profile.version)
         self.assertIsNone(profile.prefill_tps)
 
+    def test_an_api_status_fetch_that_raises_does_not_block_discovery(self):
+        fake = sp.FakeOmlx("one")
+        seen = []
+        for code in ("server_unreachable", "auth_failed"):
+            with self.subTest(code=code):
+                seen.clear()
+
+                def failing_status(settings, path, auth):
+                    seen.append(path)
+                    if path == "/api/status":
+                        raise d.DiscoveryError(code, "cannot reach oMLX for /api/status")
+                    return fake(settings, path, auth)
+
+                profile = d.discover(self.settings, fetch=failing_status)
+                self.assertEqual(profile.model.canonical_id, QWEN)
+                self.assertEqual(profile.model.context_window, 262144)
+                self.assertEqual((profile.version, profile.prefill_tps, profile.generation_tps),
+                                 (None, None, None))
+                self.assertEqual((profile.server_prompt_tokens, profile.active_requests),
+                                 (None, None))
+                self.assertEqual(seen, ["/health", "/v1/models/status", "/api/status"])
+
+    def test_a_failing_health_or_models_fetch_still_aborts_discovery(self):
+        fake = sp.FakeOmlx("one")
+        for broken in ("/health", "/v1/models/status"):
+            with self.subTest(path=broken):
+                def failing(settings, path, auth):
+                    if path == broken:
+                        raise d.DiscoveryError("server_unreachable", "cannot reach oMLX")
+                    return fake(settings, path, auth)
+
+                self.assertEqual(self.refused(fetch=failing).code, "server_unreachable")
+
     def test_a_model_without_a_reported_context_window_is_refused(self):
         error = self.refused(fetch=sp.FakeOmlx("one", overrides={"max_context_window": None}))
         self.assertEqual(error.code, "model_unknown")
@@ -642,7 +675,7 @@ class StubHandler(http.server.BaseHTTPRequestHandler):
     do_GET = do_POST = serve
 
 
-class HttpFetch(DiscoveryCase):
+class HttpFetchBehaviour(DiscoveryCase):
     def serve(self, routes):
         stub = StubOmlx(routes)
         self.addCleanup(stub.stop)
@@ -742,6 +775,99 @@ class HttpFetch(DiscoveryCase):
             ("GET", "/health", None),
             ("GET", "/v1/models/status", "Bearer " + sp.SECRET),
             ("GET", "/api/status", "Bearer " + sp.SECRET)])
+
+    def test_discovery_survives_an_api_status_answer_that_is_not_json(self):
+        stub, _ = self.serve({
+            ("GET", "/health"): (200, sp.load_fixture("omlx/health_ok.json"), {}),
+            ("GET", "/v1/models/status"): (200, sp.load_fixture("omlx/models_status_one.json"), {}),
+            ("GET", "/api/status"): (200, b"<html>maintenance</html>", {})})
+        profile = d.discover(self.settings)
+        self.assertEqual(profile.model.api_model, QWEN)
+        self.assertEqual((profile.version, profile.prefill_tps, profile.generation_tps),
+                         (None, None, None))
+        self.assertEqual(stub.requests, [
+            ("GET", "/health", None),
+            ("GET", "/v1/models/status", "Bearer " + sp.SECRET),
+            ("GET", "/api/status", "Bearer " + sp.SECRET)])
+
+    def test_discovery_survives_an_api_status_connection_that_dies(self):
+        # The stub closes the socket without an answer for /api/status only.
+        routes = {
+            ("GET", "/health"): (200, sp.load_fixture("omlx/health_ok.json"), {}),
+            ("GET", "/v1/models/status"): (200, sp.load_fixture("omlx/models_status_one.json"), {})}
+        stub, _ = self.serve(routes)
+        original = StubHandler.serve
+
+        def serve(handler):
+            if handler.path == "/api/status":
+                handler.server.requests.append((handler.command, handler.path,
+                                                handler.headers.get("Authorization")))
+                handler.connection.shutdown(socket.SHUT_RDWR)
+                return
+            original(handler)
+
+        with mock.patch.object(StubHandler, "do_GET", serve):
+            profile = d.discover(self.settings)
+        self.assertEqual(profile.model.api_model, QWEN)
+        self.assertIsNone(profile.version)
+        self.assertEqual([path for _, path, _ in stub.requests],
+                         ["/health", "/v1/models/status", "/api/status"])
+
+    def test_only_the_blocking_model_load_gets_the_long_timeout(self):
+        seen = []
+
+        class Answer:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b"{}"
+
+        class Opener:
+            def open(self, request, timeout=None):
+                seen.append((request.get_method(), request.selector, timeout))
+                return Answer()
+
+        settings = d.read_server_settings(self.settings)
+        paths = ("/health", "/api/status", "/v1/models/status",
+                 "/v1/models/%s/load" % QWEN, "/v1/models/%s/unload" % QWEN)
+        with mock.patch.object(d, "build_opener", return_value=Opener()):
+            for path in paths:
+                d.http_fetch(settings, path, True)
+        self.assertEqual(seen, [
+            ("GET", "/health", 15), ("GET", "/api/status", 15), ("GET", "/v1/models/status", 15),
+            ("POST", "/v1/models/%s/load" % QWEN, 900),
+            ("GET", "/v1/models/%s/unload" % QWEN, 15)])
+        self.assertEqual((d.HTTP_TIMEOUT_SECONDS, d.LOAD_TIMEOUT_SECONDS), (15, 900))
+
+    def test_load_model_waits_with_the_load_timeout(self):
+        seen = []
+
+        class Answer:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b'{"status": "ok"}'
+
+        class Opener:
+            def open(self, request, timeout=None):
+                seen.append((request.get_method(), request.selector, timeout))
+                return Answer()
+
+        with mock.patch.object(d, "build_opener", return_value=Opener()):
+            self.assertIsNone(d.load_model(self.settings, QWEN))
+        self.assertEqual(seen, [("POST", "/v1/models/%s/load" % QWEN, 900)])
 
     def test_the_key_never_appears_in_any_error(self):
         stub, settings = self.serve({

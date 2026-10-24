@@ -385,8 +385,13 @@ def discover(settings_path: Path, requested_model: Optional[str] = None,
     entry = select_model(models_status, health, requested_model)
     model = _build_model(entry)
 
-    # Throughput and version are context only: an unavailable /api/status loses them, nothing else.
-    api_status, api = fetch(settings, "/api/status", True)
+    # Throughput and version are context only: an unavailable /api/status loses them, nothing
+    # else. That covers a non-200 answer, a malformed body and a fetch that raises (reset,
+    # timeout, 2xx body that is not JSON), because /health and the model list already succeeded.
+    try:
+        api_status, api = fetch(settings, "/api/status", True)
+    except DiscoveryError:
+        api_status, api = 0, {}
     api = api if api_status == 200 and isinstance(api, dict) else {}
     prompt_tokens = api.get("total_prompt_tokens")
     prompt_tokens = prompt_tokens if isinstance(prompt_tokens, int) \
