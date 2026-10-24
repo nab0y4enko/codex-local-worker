@@ -196,17 +196,24 @@ Your repository is untouched by design. If a job reported `ok` and you already a
 `git commit`, `git merge`, `git reset`, or `git checkout` against the primary checkout, and
 never deletes a worktree, so evidence survives a run.
 
-Pruning is a reviewed checkpoint, never automatic: inventory `git worktree list` and
-`<state>/worktrees/`, keep the reports and patches of accepted or active jobs, and before
-removing a superseded **clean** worktree make its detached commits recoverable (a ref plus
-a `git bundle verify`-checked bundle, and archives of any native artifacts). Never remove
-the primary checkout, an active or claimed worktree, or the only copy of unarchived work.
+Completion cleanup is a **mandatory step for the reviewing parent on every task**; what stays
+non-automatic is who performs it. Neither a worker nor the launcher ever commits, pushes or
+removes a worktree on its own, so evidence survives a run and the parent takes the checkpoint:
+inventory `git worktree list` and `<state>/worktrees/`, commit and push accepted task changes to
+the task branch, keep the reports and patches of active jobs, then archive and remove every
+completed temporary or linked worktree, **dirty drafts included once their archive verified**,
+without asking again.
 
-The user-wide completion policy applies to the reviewing parent: commit and push accepted
-task changes to the task branch, preserve detached history and needed ignored artifacts,
-then remove completed linked worktrees. Workers and the launcher still never perform these
-Git/cleanup operations automatically. Keep primary/unrelated active work intact; report any
-push or safe-cleanup blocker explicitly.
+Make the work recoverable first: a ref plus a `git bundle verify`-checked bundle, and archives
+of any native artifacts, written outside the tree being removed. The archive helper verifies the
+copy before it runs `git worktree remove`, so a verified archive covers an uncommitted draft the
+same way it covers a clean tree; without that verification, keep the worktree. Never remove the
+primary checkout, an active or claimed worktree, or the only copy of unarchived work.
+
+Reuse the current checkout for routine planner work instead of adding planner or app worktrees;
+the launcher's per-job worktrees stay, because they are what isolates and evidences worker
+scope. Keep primary and unrelated active work intact, and report any push or safe-cleanup
+blocker explicitly instead of claiming completion.
 
 ## Usage
 

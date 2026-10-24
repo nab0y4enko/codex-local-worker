@@ -195,7 +195,7 @@ def link_destination(root, relative):
 
 
 def managed_block(root):
-    """The only global text this plugin owns: a small pointer at the installed policy."""
+    """The only global text this plugin owns: a pointer at the policy plus the completion rule."""
     policy = link_destination(root, POLICY_RELATIVE)
     skill = link_destination(root, SKILL_RELATIVE)
     setup = link_destination(root, SETUP_RELATIVE)
@@ -214,6 +214,15 @@ def managed_block(root):
         "  moved or uninstalled: run `python3 %s --check` from the current install root and"
         % shlex.quote(setup),
         "  report the blocker instead of routing implementation to a cloud model.",
+        "",
+        "## Completion: integrate and clean up on every task",
+        "",
+        "Before the final response, reuse this checkout for routine planner work instead of adding",
+        "planner/app worktrees, commit and push the reviewed task changes to the task branch, and",
+        "archive then remove completed temporary or linked worktrees (dirty drafts included, once",
+        "their archive verified) without another request. Preserve the primary checkout and",
+        "unrelated active work; if a push or safe cleanup is unsafe, report the blocker instead of",
+        "claiming completion.",
         MARKER_END,
     ]
     return "\n".join(lines) + "\n"

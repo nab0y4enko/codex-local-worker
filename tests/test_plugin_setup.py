@@ -157,6 +157,27 @@ class ManagedBlockTextTest(SetupCase):
             Path(package) / "skills" / "local-worker" / "SKILL.md"), text)
         self.assertIn("<%s>" % str(package), text)
 
+    def test_managed_block_carries_the_completion_rule_idempotently(self):
+        """Completion cleanup is global guidance, so it belongs in the one owned block."""
+        self.write_agents(HEAD + TAIL)
+        code, report, output = self.invoke(["--apply"])
+        self.assertEqual(code, 0, output)
+        raw = self.agents.read_bytes()
+        text = raw.decode("utf-8", "surrogateescape")
+        self.assertEqual(text.replace(self.block_of(text), "").strip(),
+                         (HEAD + TAIL).decode("utf-8", "surrogateescape").strip(),
+                         "unrelated bytes survive the completion rule")
+        self.assertEqual(text.count(BEGIN), 1)
+        self.assertEqual(text.count(END), 1)
+        block = self.block_of(text).lower()
+        for phrase in ("commit and push", "archive", "remove completed",
+                       "preserve the primary checkout", "report the blocker"):
+            self.assertIn(phrase, block, "completion instruction missing: " + phrase)
+        again, repeat, output = self.invoke(["--apply"])
+        self.assertEqual(again, 0, output)
+        self.assertFalse(repeat["apply"]["changed"], "the completion rule must not churn")
+        self.assertEqual(self.agents.read_bytes(), raw)
+
 
 class CheckReportTest(SetupCase):
     """The default mode is a read-only inventory; it must never touch a user file."""
@@ -303,7 +324,9 @@ class ApplyTest(SetupCase):
         self.assertEqual(text.count(BEGIN), 1)
         self.assertEqual(text.count(END), 1)
         block = self.block_of(text)
-        self.assertLess(len(block), 1500, "global guidance must stay small")
+        # Pointer paths plus the completion rule: still a fraction of a page, and bounded
+        # even when the install root and temporary home are both long.
+        self.assertLess(len(block), 2000, "global guidance must stay small")
         self.assertIn("[global-policy.md](<" + str(self.package) + "/" + POLICY_RELATIVE + ">)",
                       block)
         self.assertIn("<" + str(self.package) + "/skills/local-worker/SKILL.md>", block)

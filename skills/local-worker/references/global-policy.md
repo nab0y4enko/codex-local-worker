@@ -7,9 +7,12 @@ an exact copy of the legacy policy is migrated rather than duplicated.
 
 Provenance: migrated from the user-wide `AGENTS.md` that was installed on the original machine.
 That historical file stays in this package at `evidence/global-default/AGENTS.md` as an unchanged
-migration input for setup. The only change below is portability: the machine-specific skill and
-launcher paths are replaced by plugin-root resolution, and the skill is the one bundled in this
-plugin instead of a per-user copy. Everything else is the user's existing policy text.
+migration input for setup. Portability is no longer the only change: the machine-specific skill and launcher paths are
+replaced by plugin-root resolution, the skill is the one bundled in this plugin instead of a
+per-user copy, and the completion section below carries appended clarifications that make cleanup
+mandatory on every task and rule out extra routine planner or app worktrees. Every migrated bullet
+keeps its historical wording; clarifications are appended, never rewritten into a legacy bullet.
+Everything else is the user's existing policy text.
 
 ---
 
@@ -39,3 +42,12 @@ If this process is already the local Qwen implementation worker executing an ass
 - Leave no temporary or linked worktrees behind for completed work. Preserve the primary checkout. Finish active work first; preserve task commits, needed uncommitted work, detached histories, logs and ignored build/test artifacts before removing linked worktrees. Make detached work recoverable on a ref or in a verified bundle; use native managed-worktree archival when applicable.
 - Keep recovery/evidence archives outside worktrees being removed. Verify the branch exists on the remote and that the repository has no remaining task worktrees after cleanup. Do not delete unrelated active work or silently discard local files.
 - If a push or safe cleanup is blocked, report the concrete remaining action and do not claim completion. This completion policy supersedes older skill defaults that retain every finished worktree or forbid the reviewed parent from committing/pushing accepted work. Workers still must not commit, push, merge or remove worktrees themselves.
+
+Completion is not a separate request and not an optional courtesy. On every task the reviewing
+parent reuses the current checkout for routine planner work instead of adding new planner or app
+worktrees, commits and pushes the reviewed task changes, then archives and removes completed
+temporary or linked worktrees, dirty drafts included once their archive verified, before the
+final response. Launcher-internal per-job worktree isolation stays required: it is what scopes
+and audits a worker, so it is not one of the worktrees this rule removes. Verify the archive and
+recovery ref before removal, keep that evidence outside the tree being removed, and never treat
+an unverified or active tree as removable.

@@ -132,7 +132,8 @@ After completion, inspect `report.json`, `changes.patch`, each attempt's last me
 logs, every native preflight artifact, and every `verify-attempt-N-M.log`. Report actual worker,
 preflight, and verification durations plus measured usage by attempt. Keep cached-token
 counts separate from uncached counts; never label tokens as billed dollars or present
-missing counts as zero. The worktree, report, and patches remain available for review.
+missing counts as zero. The worktree, report, and patches remain available for review until the
+reviewed parent archives the job and removes that worktree under the global completion rule.
 
 Check the audit and each acceptance criterion yourself. A passing test does not excuse an
 out-of-scope edit. A worker summary or a readiness probe is not semantic acceptance. Never
