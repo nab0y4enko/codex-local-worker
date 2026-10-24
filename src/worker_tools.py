@@ -612,13 +612,20 @@ def observed_tool_calls(text):
 
 
 def mark_observations(evidence, text):
-    """Return *evidence* with ``observed`` set only where a configured tool actually ran."""
+    """Return *evidence* with ``observed`` set only where a configured tool actually ran.
+
+    Observations accumulate across attempts: a retry that called nothing must not erase the
+    evidence that an earlier attempt really ran a tool, so ``observed_tools`` is extended and
+    deduplicated instead of rebuilt from the latest text alone. Only an explicit matching
+    lifecycle entry from :func:`observed_tool_calls` ever marks anything observed.
+    """
     if not isinstance(evidence, dict) or not evidence:
         return evidence
     updated = json.loads(json.dumps(evidence))
     servers = updated.get('servers')
     servers = servers if isinstance(servers, dict) else {}
-    matched = []
+    previous = updated.get('observed_tools')
+    matched = [entry for entry in previous if isinstance(entry, dict)] if isinstance(previous, list) else []
     for entry in observed_tool_calls(text):
         meta = servers.get(entry['server'])
         if not isinstance(meta, dict) or entry['tool'] not in (meta.get('enabled_tools') or []):

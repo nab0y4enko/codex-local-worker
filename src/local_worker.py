@@ -200,6 +200,7 @@ EXIT_CODES = {
     "verification_blocked": 7,
     "timeout": 8,
     "model_mismatch": 9,
+    "no_changes": 10,
 }
 
 LIMITATIONS = (
@@ -740,6 +741,19 @@ def _digest_path(path: Path) -> str:
         return digest.hexdigest()
     except OSError as error:
         return f"unreadable:{error.__class__.__name__}"
+
+
+def path_state(path: Path) -> str:
+    """State fingerprint for one path: contents plus the ``lstat`` mode.
+
+    A deletion is an explicit marker rather than an absent key, so "the worker deleted this"
+    and "this never existed" stay distinguishable without holding any file content.
+    """
+    try:
+        mode = os.lstat(str(path)).st_mode & 0o7777
+    except OSError:
+        return "missing"
+    return f"{_digest_path(path)}:{mode:o}"
 
 
 def primary_fingerprint(repo: Path) -> Dict[str, Any]:
@@ -1970,6 +1984,9 @@ def new_report(options: JobOptions) -> Dict[str, Any]:
         "patch_bytes": 0,
         "patch_excerpt": None,
         "diffstat": "",
+        # Set from the worker's own scoped progress before verification can write anything:
+        # a patch that only verification produced proves nothing about the implementation.
+        "worker_patch_present": False,
         "token_counts": {"input_tokens": None, "output_tokens": None},
         "elapsed_seconds": 0.0,
         "logs": [],
@@ -2258,6 +2275,10 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     audit: Optional[Audit] = None
     stream = report.get("_policy")
     maximum_attempts = min(task.max_attempts, report.get("workstream_admission", {}).get("max_attempts", task.max_attempts))
+    # Per-path state fingerprints the worker itself authored, accumulated across attempts.
+    # Internal evidence only: it is removed before the report is written.
+    worker_authored: Dict[str, str] = {}
+    report["_worker_authored"] = worker_authored
     for attempt_number in range(1, maximum_attempts + 1):
         try:
             if stream is not None:
@@ -2297,7 +2318,11 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         argv = worker_argv(options.codex_bin, worktree, report["api_model"], last_path,
                            loaded["overrides"], list(loaded["environment"]))
         _policy_check(argv)
-        patch_before = audit_worktree(worktree, base_commit, task.allowed_paths, secrets, scratch_dir=report_dir).patch
+        before_worker = audit_worktree(worktree, base_commit, task.allowed_paths, secrets, scratch_dir=report_dir)
+        patch_before = before_worker.patch
+        # Snapshot every changed-from-base path *before* the worker runs, so whatever state a
+        # path is in afterwards can be attributed to this attempt only if it actually changed.
+        before_states = {path: path_state(worktree / path) for path in before_worker.changed_paths}
         observer = observation.RunObserver(report_dir, secrets=secrets,
                                            attempt=attempt_number, job_id=report["job_id"],
                                            job={"started_at": report.get("started_at"),
@@ -2339,7 +2364,22 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
                 evidence["usage"]["availability"] = "partial"
         # Check actual scoped changes BEFORE verification can create its own files.
         after_worker = audit_worktree(worktree, base_commit, task.allowed_paths, secrets, scratch_dir=report_dir)
-        has_patch = bool(after_worker.patch) and after_worker.patch != patch_before and not after_worker.violations
+        after_states = {path: path_state(worktree / path) for path in after_worker.changed_paths}
+        # A changed path was authored by this attempt's worker only when its state differs from
+        # the before-worker snapshot; a path that was not changed before counts as authored.
+        authored = {path: state for path, state in after_states.items()
+                    if before_states.get(path) != state}
+        has_patch = bool(authored) and not after_worker.violations
+        if has_patch:
+            worker_authored.update(authored)
+        # Drop any retained fingerprint the tree no longer matches: reverted, rewritten by
+        # verification, or deleted, the worker's provenance for that path is no longer provable.
+        for path in list(worker_authored):
+            if after_states.get(path) != worker_authored[path]:
+                del worker_authored[path]
+        # Success has to be earned by the worker, not by a verification command that happens to
+        # write a file: this is the only place the flag is set, and it is always a bool.
+        report["worker_patch_present"] = bool(after_worker.patch) and bool(worker_authored)
         if stream is not None:
             report["workstream_progress"] = stream.record_attempt(report["job_id"], has_patch=has_patch)
         report.pop("_active_attempt", None)
@@ -2442,6 +2482,14 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     report["changed_paths"] = audit.changed_paths
     report["violations"] = audit.violations
     report["ignored_paths"] = audit.ignored_paths
+    # Final provenance check, after verification and the final audit: the flag is true only
+    # while a worker-authored path still exists in its authored state. No final patch means no
+    # patch, and a leftover file from an earlier verification command proves nothing.
+    final_states = {path: path_state(worktree / path) for path in audit.changed_paths}
+    for path in list(worker_authored):
+        if final_states.get(path) != worker_authored[path]:
+            del worker_authored[path]
+    report["worker_patch_present"] = bool(audit.patch) and bool(worker_authored)
     report["dirty_primary_after"] = dirty_primary_files(task.repo_path)
     report["primary_fingerprint_after"] = primary_fingerprint(task.repo_path)
     report["primary_unchanged"] = (report["primary_fingerprint_after"]
@@ -2491,6 +2539,11 @@ def decide_status(report: Dict[str, Any], worker_ok: bool) -> str:
         return "tests_failed"
     if not statuses or any(status != "passed" for status in statuses):
         return "verification_blocked"
+    # Every failure signal above outranks this: a clean worker, passing tests and no patch of
+    # the worker's own is a no-op, and verifier-written files never count as one. The field is
+    # absent only in synthetic legacy reports, which stay on the success path.
+    if report.get("worker_patch_present") is False:
+        return "no_changes"
     return "ok"
 
 
@@ -2505,6 +2558,8 @@ STATUS_REASONS = {
     "verification_blocked": "verification produced no passing evidence",
     "timeout": "the total job budget ran out before passing verification",
     "model_mismatch": "the worker was served by a model other than the pinned canonical alias",
+    "no_changes": "the worker produced no in-scope implementation patch that survived to the "
+                  "final audit; baseline verification passed, and parent review is required",
 }
 
 
@@ -2637,6 +2692,18 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
                 report["changed_paths"] = final_audit.changed_paths
                 report["violations"] = final_audit.violations
                 report["head_commit"] = final_audit.head_commit
+                tree = Path(report["worktree"])
+                last_states = {path: path_state(tree / path) for path in final_audit.changed_paths}
+                authored = report.get("_worker_authored") or {}
+                for path in list(authored):
+                    if last_states.get(path) != authored[path]:
+                        del authored[path]
+                if report.get("worker_patch_present") and not (final_audit.patch and authored):
+                    # This audit is the last word: a patch that vanished before the report was
+                    # written cannot be reported as a patch. Failures below keep their priority.
+                    report["worker_patch_present"] = False
+                    if report.get("status") == "ok":
+                        report["status"] = "no_changes"
                 if unfinished and claimed:
                     stream.record_attempt(report["job_id"], has_patch=bool(final_audit.patch) and final_audit.patch != unfinished["before_patch"] and not final_audit.violations)
                 report["primary_fingerprint_after"] = primary_fingerprint(options.task.repo_path)
@@ -2665,6 +2732,7 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
         report["exit_code"] = EXIT_CODES.get(report["status"], 4)
         if report["status"] not in ("ok", "ready") and not report.get("failure_reason"):
             report["failure_reason"] = redact(describe_failure(report), secrets)
+        report.pop("_worker_authored", None)
         ensure_report_dir(options, report)
         attempts = [a for a in report["attempts"] if "returncode" in a]
         report.update(observation.sum_usage(attempts))

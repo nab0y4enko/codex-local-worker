@@ -149,6 +149,49 @@ that points at this skill and at [the canonical global policy](references/global
 legacy hand-copied `~/.codex/skills/local-worker/SKILL.md` can be retired once the plugin
 install is qualified. A worker never installs a skill or writes global configuration.
 
+## Per-task MCP tools and cleanup
+
+Task tooling is its own schema-1 manifest, passed per job; nothing is inherited from the plugin,
+the app configuration, or another task:
+
+```sh
+<root>/bin/local-worker run --task-file /absolute/path/task.json \
+  --tool-config /absolute/path/tools.json
+```
+
+[`../../examples/tool-config.json`](../../examples/tool-config.json) is this repository's working
+manifest for the local stdio fixture: explicit `required_commands` (`python3`), server `command`
+plus `args` (`tests/fixtures/mcp_echo.py`), `env_vars` (`TASK_TOOL_TOKEN`), a non-empty
+`enabled_tools` allowlist (`echo`), `startup_timeout_sec` 10 and `tool_timeout_sec` 15.
+
+- Credentials are environment variable **names**, never values; a selected value must be at
+  least 4 characters so it can be redacted, and it never reaches argv, the prompt, the report or
+  the logs. A manifest carrying a literal token, a missing `enabled_tools` allowlist, an
+  unresolvable `required_commands` entry, a server that cannot be probed, an allowlisted tool the
+  probe did not advertise, or an unset named credential **blocks the job before the worker
+  starts**; the report states which one. A server may advertise more tools than `enabled_tools`
+  selects: unselected advertised tools are normal and block nothing, while an allowlisted tool the
+  probe did not list is the real missing-capability block. The parent may prepare or correct the
+  per-task contract and tool manifest itself; those are parent-side orchestration artifacts, not
+  implementation work. Code changes still go to the worker in a narrowly scoped
+  `--job-kind repair` job, never to a hand edit in the worktree.
+- Keep the three evidence states apart in any report: `configured` (the manifest named it),
+  `probed` (the metadata probe initialized the server and listed its tools), `observed` (an
+  explicit `mcp_tool_call` lifecycle event in that job's own stdout named that server and tool).
+  A successful tool listing is not an observed call, a tool name quoted in prose is not one
+  either, and the probe is a capability check rather than the live worker backend. Observations
+  accumulate across attempts, so an earlier call is still evidence after an idle retry.
+- At completion the reviewed parent archives before cleanup, after the task branch is pushed:
+
+```sh
+<root>/bin/local-worker-archive archive --repo /absolute/path/repo \
+  --state-dir /absolute/path/state --job-id <job-id>
+```
+
+  The retained receipt (`prepared` before removal, `archived` after), recovery ref
+  `refs/local-worker/archive/<job-id>`, verified bundle and hash-verified archive copy are the
+  evidence that the worktree was disposable; quote them instead of claiming retention.
+
 ## Failure handling
 
 - Read the current report's `failure_reason`, gate checks, attempt records, audit, and

@@ -256,7 +256,34 @@ The versioned plan format and required evidence are in
 
 Exit codes: `0 ok`, `1 contract_invalid`, `2 preflight_failed`, `3 blocked`,
 `4 worker_failed`, `5 audit_violation`, `6 tests_failed`, `7 verification_blocked`,
-`8 timeout`, `9 model_mismatch`. Non-zero is never a success.
+`8 timeout`, `9 model_mismatch`, `10 no_changes`. Non-zero is never a success.
+
+`no_changes` (exit `10`) is the explicit no-op outcome: the worker ran cleanly and baseline
+verification passed, but no worker-authored change survived to the final audit, so there is no
+implementation to integrate. Two different runs share this status: a job where no attempt
+produced an in-scope patch at all, and a job where an attempt did patch and that patch did not
+survive — verification reverted it, or rewrote the same file so the bytes can no longer be
+attributed to the worker. `changed_paths` and `changes.patch` may still be non-empty and retain
+an artifact written by a verification command; the reviewed parent decides what, if anything, is
+worth keeping. Passing baseline verification only means the contract's own commands passed: it is
+not evidence that nothing else regressed, and it never proves an implementation.
+The report says `worker_patch_present: false`. That flag is a provenance claim, not a diff
+claim: before every worker attempt the launcher records the state of each path that already
+differs from the base commit (content digest plus `lstat` mode, with an explicit marker for a
+deletion), and after the worker it counts a path as authored by this attempt only when that
+state changed, so a path that was clean before the attempt counts as new work. Those
+path-to-state fingerprints accumulate across attempts and are pruned as soon as a path is no
+longer changed from base or no longer holds the state the worker left it in. After
+verification and the final audit the flag is true only while at least one retained
+worker-authored path still exists in the final changed set in that same state, and a final
+patch of zero bytes is never a patch. A file written only by a verification command, a worker
+edit that verification reverted, and a leftover artifact from an earlier attempt therefore all
+end `no_changes` even when `changed_paths` and `changes.patch` are non-empty. When
+verification rewrites a file the worker also wrote, the launcher cannot prove which bytes are
+the worker's, so it conservatively reports `no_changes` and requires parent review. The
+fingerprints stay internal and are removed before the report is written. Every earlier failure
+verdict keeps priority, and `no_changes` is not `worker_failed`: it is a normal terminal status
+the archive helper accepts.
 
 ### Finishing a job: integrate, push, then archive
 
@@ -284,10 +311,14 @@ committed, dirty, untracked, ignored **and staged-index** content on a recovery 
 under `<state-dir>/archives/<job-id>/` before it runs `git worktree remove` for that one path.
 Its receipt is written as `prepared` before removal and only becomes `archived` afterwards, so
 an interrupted run leaves verifiable evidence and refuses instead of archiving twice. Nothing
-is force-removed before verification, an existing ref, bundle or archive is never overwritten,
-and a failure keeps every artifact and the worktree itself. Exit codes: `0` archived (or an
-idempotent replay of a verified receipt), `2` refused, `3` blocked by a live job or lease,
-`4` failed.
+is force-removed before verification, and an existing ref, bundle or archive is never
+overwritten. Where a failure leaves you depends on when it happened: a failure **before**
+`git worktree remove` keeps every artifact and the worktree itself, while a failure **after**
+the removal (for example a receipt write that could not complete) cannot restore that worktree
+— the prepared receipt, recovery ref, bundle and archive copy are retained, the receipt stays
+`prepared`, and the job requires reconciliation (verify the ref/bundle, replay the archive)
+rather than being reported as archived. Exit codes: `0` archived (or an idempotent replay of a
+verified receipt), `2` refused, `3` blocked by a live job or lease, `4` failed.
 
 Never discard unrelated active work: the helper removes exactly the one worktree named by that
 job's terminal report, and every other worktree, branch, stash or state directory is left
@@ -309,6 +340,38 @@ Exactly these nine fields; unknown keys are refused, not ignored:
 | `test_commands` | argv arrays, run from the worktree root — never shell strings |
 | `timeout_seconds` | 30–3600, one total budget for preflight + probe + attempts + all verification |
 | `max_attempts` | 1 or 2; attempt 2 gets structured feedback from attempt 1 |
+
+### Per-task MCP tools (`--tool-config`)
+
+Task tooling is a separate schema-1 manifest, passed per job; nothing is inherited from the
+plugin, the app configuration, or another task:
+
+```sh
+bin/local-worker run --task-file /absolute/path/task.json \
+  --tool-config /absolute/path/tools.json
+```
+
+[`examples/tool-config.json`](examples/tool-config.json) is the working manifest for this
+repository's own stdio fixture (`tests/fixtures/mcp_echo.py`, one `echo` tool). Every entry is
+explicit: `required_commands`, the server `command` plus `args`, `env_vars`, and a non-empty
+`enabled_tools` allowlist. Unknown keys, a missing allowlist, or both transports at once are
+refused. A server that cannot be probed, a `required_commands` entry that is not executable,
+and a named credential that is unset all **block the job before the worker starts**.
+
+- Credentials are named, never valued: the manifest carries only environment variable *names*,
+  and the selected value must be at least 4 characters so it can be redacted. A value never
+  reaches argv, the prompt, the report, or the logs, and a literal `env`/`headers`/token value
+  in the manifest is refused.
+- Evidence keeps three states apart: `configured` (the manifest named it), `probed` (the
+  metadata probe initialized the server and listed its tools), and `observed` (an explicit
+  `mcp_tool_call` lifecycle event in that job's own stdout named that server and tool). A
+  successful tool listing is not an observed call, and a tool name merely quoted inside a
+  message, argument or output is not one either.
+- The probe is a capability check only. It starts no model turn and is not the live worker
+  backend; it cannot show that the worker can call a tool.
+- HTTP servers are supported because Codex supports them, and they are validated the same way.
+  Live qualification here was done against the **stdio** fixture only; no third-party HTTP
+  service is qualified by this repository.
 
 ### Pilot
 

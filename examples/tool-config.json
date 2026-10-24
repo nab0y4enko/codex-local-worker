@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "required_commands": [
+    "python3"
+  ],
+  "mcp_servers": {
+    "fixture": {
+      "command": "python3",
+      "args": [
+        "tests/fixtures/mcp_echo.py"
+      ],
+      "env_vars": [
+        "TASK_TOOL_TOKEN"
+      ],
+      "enabled_tools": [
+        "echo"
+      ],
+      "startup_timeout_sec": 10,
+      "tool_timeout_sec": 15
+    }
+  }
+}
