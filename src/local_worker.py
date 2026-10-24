@@ -3,9 +3,10 @@
 
 Standard library only. Design rules:
 
-* Endpoint is the literal loopback URL below; proxies and redirects are refused.
-* The exact canonical model must map to the expected API alias, the server must have
-  model fallback disabled, and the alias must appear in the served model list.
+* Nothing about the model is hardcoded: every job asks the live oMLX server which chat model
+  is loaded and what its limits are (``omlx_discovery``), then pins exactly that model, its
+  endpoint and its context window. The endpoint is loopback only; proxies and redirects are
+  refused, and the server must have model fallback disabled.
 * The oMLX key is loaded into the child environment only; it is excluded from the
   model's shell environment via shell_environment_policy and redacted from all logs.
 * Every job runs in its own detached ``git worktree``. The primary checkout is never
@@ -38,15 +39,14 @@ import subprocess
 import tempfile
 import sys
 import time
-import urllib.error
-import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import apple_verification as apple
+import omlx_discovery
 import worker_pool as pool
 import native_readiness as native
 import worker_observability as observation
@@ -59,21 +59,13 @@ _RUN_OBSERVER = contextvars.ContextVar("local_worker_observer", default=None)
 # --------------------------------------------------------------------------------------
 # Fixed local policy
 # --------------------------------------------------------------------------------------
-HOST = "127.0.0.1"
-PORT = 8000
+# oMLX serves its OpenAI-compatible API under this prefix; host and port come from discovery.
 API_PREFIX = "/v1"
-ENDPOINT = "http://127.0.0.1:8000/v1"
-# Defaults for the model a job is pinned to. ``--canonical-model``/``--api-model`` (or the
-# ``LOCAL_WORKER_*`` variables below) select another one; the chosen pair is then pinned and
-# self-checked exactly like these defaults are.
-CANONICAL_MODEL = "Qwen3.8-Flash-Next-UD-Q4_K_XL"
-EXPECTED_ALIAS = "qwen-3.8-nf-splash"
 PROVIDER_ID = "local-omlx"
 API_KEY_ENV = "LOCAL_OMLX_API_KEY"
 
 OMLX_DIR = Path("~/.omlx")
 OMLX_SETTINGS = OMLX_DIR / "settings.json"
-OMLX_MODEL_SETTINGS = OMLX_DIR / "model_settings.json"
 
 # Canonical environment names; the pre-rename names stay honored as legacy fallbacks so an
 # existing shell profile keeps working without re-exporting anything.
@@ -81,11 +73,6 @@ STATE_ENV = "LOCAL_WORKER_STATE_DIR"
 CODEX_BIN_ENV = "LOCAL_WORKER_CODEX_BIN"
 LEGACY_STATE_ENV = "LOCAL_IMPLEMENT_STATE_DIR"
 LEGACY_CODEX_BIN_ENV = "LOCAL_IMPLEMENT_CODEX_BIN"
-# Model routing settings. Resolution order is CLI flag, then this variable, then the default.
-CANONICAL_MODEL_ENV = "LOCAL_WORKER_CANONICAL_MODEL"
-API_MODEL_ENV = "LOCAL_WORKER_API_MODEL"
-CONTEXT_WINDOW_ENV = "LOCAL_WORKER_CONTEXT_WINDOW"
-ATTEMPT_SECONDS_ENV = "LOCAL_WORKER_ATTEMPT_SECONDS"
 # Deliberate legacy storage-compatibility exception, not an oversight: the state root keeps the
 # historical ``~/.local-implement`` path on purpose. That directory IS the shared pool - the
 # worker/coordinator locks, ``slots/``, ``leases/``, ``reports/`` history and preserved
@@ -99,7 +86,8 @@ ALLOWED_ATTEMPTS = (1, 2)
 LOCK_TIMEOUT_SECONDS = 30.0
 PROBE_MARKER = "__LOCAL_WORKER_SANDBOX_OK__"
 PATCH_REPORT_BYTES = 262144
-HTTP_TIMEOUT_SECONDS = 15
+# I/O chunk size when fingerprinting files; unrelated to any model.
+READ_CHUNK_BYTES = 1 << 16
 TERMINATE_GRACE_SECONDS = 5.0
 KILL_GRACE_SECONDS = 10.0
 MIN_ATTEMPT_BUDGET_SECONDS = 5.0
@@ -119,12 +107,12 @@ SANDBOX_PROFILE = "local-worker-verify"
 PROBE_TIMEOUT_SECONDS = 60.0
 # Reported with every job so a reviewer always knows what confined the verification run.
 WORKSPACE_SANDBOX_BACKEND = "codex-workspace-write"
-MODEL_CONTEXT_WINDOW = 65536
-MIN_CONTEXT_WINDOW = 4096
-MAX_CONTEXT_WINDOW = 1048576
-# Model ids are rendered inside a quoted TOML ``-c`` value, so quotes, backslashes and
-# whitespace are refused rather than escaped: a model id never needs them.
-MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
+# ``--context-cap`` only ever lowers the server's window; these bound what a caller may ask for.
+MIN_CONTEXT_CAP = 4096
+MAX_CONTEXT_CAP = 1048576
+# The worker compacts its own context at this share of the pinned window, so Codex compacts
+# before the server rejects a request that no longer fits.
+COMPACT_FRACTION = 0.8
 
 # Every launcher-driven git subprocess disables inherited hooks/fsmonitor and refuses
 # interactive editors, so a cloned repository cannot run host-side hook executables.
@@ -142,19 +130,18 @@ GIT_SAFE_ENV = {
     "GIT_EDITOR": "/usr/bin/false",
     "GIT_SEQUENCE_EDITOR": "/usr/bin/false",
 }
-# Literal ``-c key=value`` overrides that must be present in the worker argv. The worker
-# runs with --ignore-user-config, so these pins are the whole policy: no approval
-# prompts, no web search, no provider retries (a retry could mask a routing problem), a
-# bounded context window, and the local key excluded from model-generated shell commands.
+# Literal ``-c key=value`` overrides that must be present in the worker argv whatever model is
+# loaded. The worker runs with --ignore-user-config, so these pins plus the job's profile pins
+# (``policy_pins``: model, endpoint, context window, compaction) are the whole policy: no
+# approval prompts, no web search, no provider retries (a retry could mask a routing problem),
+# and the local key excluded from model-generated shell commands.
 CONFIG_PINS = {
     "model_provider": f'"{PROVIDER_ID}"',
-    f"model_providers.{PROVIDER_ID}.base_url": f'"{ENDPOINT}"',
     f"model_providers.{PROVIDER_ID}.request_max_retries": "0",
     f"model_providers.{PROVIDER_ID}.stream_max_retries": "0",
     "approval_policy": '"never"',
     "web_search": '"disabled"',
     "sandbox_mode": '"danger-full-access"',
-    "model_context_window": str(MODEL_CONTEXT_WINDOW),
     "shell_environment_policy.inherit": '"core"',
 }
 
@@ -252,7 +239,16 @@ class ContractError(LauncherError):
 
 
 class PreflightError(LauncherError):
+    """The environment cannot run a worker; ``code`` is the oMLX discovery code when one applies
+    and ``candidates`` the model names the caller could choose instead."""
+
     status = "preflight_failed"
+
+    def __init__(self, message: str = "", code: Optional[str] = None,
+                 candidates: Sequence[str] = ()) -> None:
+        super().__init__(message)
+        self.code = code
+        self.candidates: Tuple[str, ...] = tuple(candidates)
 
 
 class BlockedError(LauncherError):
@@ -465,89 +461,32 @@ class Task:
 
 
 # --------------------------------------------------------------------------------------
-# Model routing settings (CLI flag > environment variable > default)
-# --------------------------------------------------------------------------------------
-def validate_model_name(value: Any, label: str) -> str:
-    """A model id that is safe inside a quoted TOML override; anything else is refused."""
-    if not isinstance(value, str) or not MODEL_NAME_RE.match(value):
-        raise ContractError(f"{label} must match {MODEL_NAME_RE.pattern}, got {value!r}")
-    return value
-
-
-def validate_context_window(value: Any) -> int:
-    """An integer token count the worker's Codex config can be pinned to."""
-    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
-        value = int(value.strip())
-    if isinstance(value, bool) or not isinstance(value, int) \
-            or not MIN_CONTEXT_WINDOW <= value <= MAX_CONTEXT_WINDOW:
-        raise ContractError(f"context window must be an integer between {MIN_CONTEXT_WINDOW} "
-                            f"and {MAX_CONTEXT_WINDOW} tokens, got {value!r}")
-    return value
-
-
-def validate_attempt_seconds(value: Any) -> float:
-    """Per-attempt worker cap in seconds, bounded like the job budget it is carved from."""
-    try:
-        seconds = float("nan") if isinstance(value, bool) else float(value)
-    except (TypeError, ValueError):
-        raise ContractError(f"attempt timeout must be a number of seconds, got {value!r}") from None
-    # NaN fails both comparisons, so a bool, "nan" or "inf" is refused here as well.
-    if not MIN_ATTEMPT_BUDGET_SECONDS <= seconds <= MAX_TIMEOUT_SECONDS:
-        raise ContractError(f"attempt timeout must be between {MIN_ATTEMPT_BUDGET_SECONDS:.0f} "
-                            f"and {MAX_TIMEOUT_SECONDS} seconds, got {value!r}")
-    return seconds
-
-
-def resolve_setting(explicit: Optional[str], env_name: str, default: Any) -> Any:
-    """The CLI value when given, else the environment variable when set, else the default."""
-    if explicit is not None and str(explicit).strip():
-        return str(explicit).strip()
-    from_env = (os.environ.get(env_name) or "").strip()
-    return from_env or default
-
-
-def resolve_model_settings(args: argparse.Namespace) -> Dict[str, Any]:
-    """Validated model routing for one invocation; every field falls back to its default."""
-    settings: Dict[str, Any] = {
-        "canonical_model": validate_model_name(
-            resolve_setting(args.canonical_model, CANONICAL_MODEL_ENV, CANONICAL_MODEL),
-            "canonical model"),
-        "api_model": validate_model_name(
-            resolve_setting(args.api_model, API_MODEL_ENV, EXPECTED_ALIAS), "API model"),
-        "context_window": validate_context_window(
-            resolve_setting(args.context_window, CONTEXT_WINDOW_ENV, MODEL_CONTEXT_WINDOW)),
-    }
-    if hasattr(args, "attempt_timeout"):
-        settings["attempt_seconds"] = validate_attempt_seconds(
-            resolve_setting(args.attempt_timeout, ATTEMPT_SECONDS_ENV, policy.ATTEMPT_SECONDS))
-    return settings
-
-
-# --------------------------------------------------------------------------------------
 # Loopback endpoint + local provider validation
 # --------------------------------------------------------------------------------------
-ENDPOINT_RE = re.compile(r"^http://127\.0\.0\.1:8000/v1/?$")
+# Every loopback host oMLX may listen on, as it is written inside a URL (IPv6 in brackets).
+_LOOPBACK_URL_HOSTS = "|".join(
+    re.escape(f"[{host}]" if ":" in host else host) for host in omlx_discovery.LOOPBACK_HOSTS)
+ENDPOINT_RE = re.compile(rf"http://(?:{_LOOPBACK_URL_HOSTS}):([0-9]{{1,5}}){re.escape(API_PREFIX)}/?")
 
 
 def validate_endpoint(endpoint: Any) -> str:
-    """Accept only the literal loopback endpoint; anything else is a hard refusal."""
-    if not isinstance(endpoint, str) or not ENDPOINT_RE.match(endpoint):
+    """Accept only a loopback oMLX endpoint (``http://<loopback host>:<port>/v1``), without a
+    trailing slash; anything else is a hard refusal."""
+    match = ENDPOINT_RE.fullmatch(endpoint) if isinstance(endpoint, str) else None
+    if match is None or not 1 <= int(match.group(1)) <= 65535:
         raise PreflightError(
-            f"endpoint must be the literal loopback URL {ENDPOINT}, got {endpoint!r}"
-        )
-    return ENDPOINT
+            f"endpoint must be http://<{'|'.join(omlx_discovery.LOOPBACK_HOSTS)}>:<port>"
+            f"{API_PREFIX}, got {endpoint!r}")
+    return endpoint.rstrip("/")
 
 
-class RefuseRedirects(urllib.request.HTTPRedirectHandler):
-    """Redirects are refused: a 3xx must surface as an error, never be followed."""
+def profile_endpoint(profile: omlx_discovery.ServerProfile) -> str:
+    """The OpenAI-compatible endpoint of a discovered server: its base URL plus ``/v1``.
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: N803
-        return None
-
-
-def build_opener() -> urllib.request.OpenerDirector:
-    """Opener with environment proxies disabled and redirects refused."""
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}), RefuseRedirects())
+    Everything a launch command contains is derived from this, so a profile whose base URL is
+    not loopback can never reach one.
+    """
+    return validate_endpoint(profile.base_url + API_PREFIX)
 
 
 def strip_proxy_env(env: Dict[str, str]) -> Tuple[Dict[str, str], List[str]]:
@@ -564,154 +503,93 @@ def cloud_credential_names(env: Dict[str, str]) -> List[str]:
     )
 
 
-def fetch_model_ids(endpoint: str, api_key: str, opener: Any = None) -> List[str]:
-    """GET <endpoint>/models with no proxy and no redirect following."""
-    validate_endpoint(endpoint)
-    request = urllib.request.Request(
-        f"{endpoint}/models",
-        headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
-    )
-    try:
-        with (opener or build_opener()).open(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
-            body = response.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as error:
-        raise PreflightError(
-            f"{endpoint}/models returned HTTP {error.code}; authentication or model "
-            "configuration must be fixed before any worker launch"
-        ) from error
-    except Exception as error:  # URLError, socket timeout, decoded errors
-        raise PreflightError(
-            f"cannot query {endpoint}/models ({error.__class__.__name__}); is oMLX running "
-            "on the loopback endpoint?"
-        ) from error
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError as error:
-        raise PreflightError(f"{endpoint}/models did not return JSON") from error
-    items = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(items, list):
-        raise PreflightError(f"{endpoint}/models response has no 'data' list")
-    return [item["id"] for item in items if isinstance(item, dict) and isinstance(item.get("id"), str)]
+# --------------------------------------------------------------------------------------
+# Live discovery: the loaded model, its endpoint and its limits (nothing is a constant)
+# --------------------------------------------------------------------------------------
+def validate_context_cap(value: Any) -> int:
+    """An integer token count the discovered window may be capped at (CLI digits allowed)."""
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+        value = int(value.strip())
+    if isinstance(value, bool) or not isinstance(value, int) \
+            or not MIN_CONTEXT_CAP <= value <= MAX_CONTEXT_CAP:
+        raise ContractError(f"context cap must be an integer between {MIN_CONTEXT_CAP} "
+                            f"and {MAX_CONTEXT_CAP} tokens, got {value!r}")
+    return value
 
 
-def _read_json_object(path: Path, label: str) -> Dict[str, Any]:
-    try:
-        loaded = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
-    except FileNotFoundError as error:
-        raise PreflightError(f"{label} not found at {path}") from error
-    except (OSError, json.JSONDecodeError) as error:
-        raise PreflightError(f"cannot read {label} at {path}: {error.__class__.__name__}") from error
-    if not isinstance(loaded, dict):
-        raise PreflightError(f"{label} must contain a JSON object")
-    return loaded
+def _discovery_failure(error: omlx_discovery.DiscoveryError) -> PreflightError:
+    """A discovery refusal as a launcher refusal that keeps its code and candidates."""
+    return PreflightError(str(error), code=error.code, candidates=error.candidates)
 
 
 def read_api_key(settings_path: Path = OMLX_SETTINGS) -> str:
-    settings = _read_json_object(settings_path, "oMLX settings")
-    auth = settings.get("auth")
-    key = auth.get("api_key") if isinstance(auth, dict) else None
-    if not isinstance(key, str) or not key.strip():
-        raise PreflightError(f"{settings_path} has no auth.api_key; refusing to launch")
-    host = settings.get("server") if isinstance(settings.get("server"), dict) else {}
-    declared_host, declared_port = host.get("host"), host.get("port")
-    if declared_host not in (None, "", HOST) or declared_port not in (None, PORT):
-        raise PreflightError(
-            f"oMLX listens on {declared_host!r}:{declared_port!r}, which does not match the "
-            f"pinned loopback endpoint {ENDPOINT}"
-        )
-    return key.strip()
-
-
-def read_model_fallback(settings_path: Path = OMLX_SETTINGS) -> bool:
-    settings = _read_json_object(settings_path, "oMLX settings")
-    model = settings.get("model") if isinstance(settings.get("model"), dict) else {}
-    fallback = model.get("model_fallback")
-    if fallback is not False:
-        raise PreflightError(
-            f"server setting model.model_fallback must be false, got {fallback!r}; "
-            "fallback could silently replace the requested local model"
-        )
-    return False
-
-
-def read_model_alias(
-    model_settings_path: Path = OMLX_MODEL_SETTINGS,
-    canonical_model: str = CANONICAL_MODEL,
-    expected_alias: str = EXPECTED_ALIAS,
-) -> str:
-    """Return the API model id oMLX serves for ``canonical_model``; refuse anything ambiguous.
-
-    A model with no alias in oMLX is served under its own id. That is accepted only when the
-    caller asked for exactly that id (``expected_alias == canonical_model``), so the unaliased
-    case is an explicit choice, never a guess.
-    """
-    data = _read_json_object(model_settings_path, "oMLX model settings")
-    models = data.get("models") if isinstance(data.get("models"), dict) else {}
-    entry = models.get(canonical_model)
-    alias = entry.get("model_alias") if isinstance(entry, dict) else None
-    if expected_alias == canonical_model and (entry is None or (
-            isinstance(entry, dict) and alias in (None, ""))):
-        return canonical_model
-    hint = ("; set an alias for it in oMLX, or pass --api-model equal to --canonical-model to "
-            "use the model under its own id")
-    if not isinstance(entry, dict):
-        raise PreflightError(
-            f"{model_settings_path} has no saved settings for canonical model "
-            f"{canonical_model!r}{hint}"
-        )
-    if not isinstance(alias, str) or not alias.strip():
-        raise PreflightError(
-            f"canonical model {canonical_model!r} has no model_alias; refusing to guess an API "
-            f"model{hint}"
-        )
-    if alias != expected_alias:
-        raise PreflightError(
-            f"canonical model {canonical_model!r} maps to {alias!r}, not the expected "
-            f"alias {expected_alias!r}; refusing to switch models"
-        )
-    return alias
-
-
-def run_preflight(
-    *,
-    settings_path: Path = OMLX_SETTINGS,
-    model_settings_path: Path = OMLX_MODEL_SETTINGS,
-    endpoint: str = ENDPOINT,
-    canonical_model: str = CANONICAL_MODEL,
-    expected_alias: str = EXPECTED_ALIAS,
-    context_window: int = MODEL_CONTEXT_WINDOW,
-    list_models: Callable[[str, str], List[str]] = fetch_model_ids,
-) -> Dict[str, Any]:
-    """Validate server settings, alias mapping and model availability. Never returns the key."""
-    endpoint = validate_endpoint(endpoint)
-    canonical_model = validate_model_name(canonical_model, "canonical model")
-    expected_alias = validate_model_name(expected_alias, "API model")
-    context_window = validate_context_window(context_window)
-    api_key = read_api_key(settings_path)
-    read_model_fallback(settings_path)
-    alias = read_model_alias(model_settings_path, canonical_model, expected_alias)
+    """The oMLX key from ``settings.json`` (never echoed); a settings problem is a preflight
+    failure with its discovery code."""
     try:
-        served = list_models(endpoint, api_key)
-    finally:
-        api_key = ""
-    if alias not in served:
-        raise PreflightError(
-            f"API model list at {endpoint}/models does not contain {alias!r}; the exact "
-            "model is not loaded and fallback is disabled, so no launch will be attempted"
-        )
-    evidence = {
-        "endpoint": endpoint,
-        "canonical_model": canonical_model,
-        "api_model": alias,
+        return omlx_discovery.read_server_settings(settings_path).api_key
+    except omlx_discovery.DiscoveryError as error:
+        raise _discovery_failure(error) from error
+
+
+def compact_limit(context_window: int) -> int:
+    """The token count at which the worker compacts its own context."""
+    return int(context_window * COMPACT_FRACTION)
+
+
+def policy_pins(profile: omlx_discovery.ServerProfile, context_window: int) -> Dict[str, str]:
+    """Every pin that comes from the job's profile; the self-check requires these exact values."""
+    return {
+        "model": f'"{profile.model.api_model}"',
+        f"model_providers.{PROVIDER_ID}.base_url": f'"{profile_endpoint(profile)}"',
+        "model_context_window": str(context_window),
+        "model_auto_compact_token_limit": str(compact_limit(context_window)),
+    }
+
+
+def load_requested_model(settings_path: Path, model: str,
+                         fetch: omlx_discovery.HttpFetch) -> Dict[str, Any]:
+    """Explicitly ask oMLX to load ``model`` (``--load``); evidence for the report."""
+    try:
+        omlx_discovery.load_model(Path(settings_path), model, fetch=fetch)
+    except omlx_discovery.DiscoveryError as error:
+        raise _discovery_failure(error) from error
+    return {"requested": model, "loaded": True}
+
+
+def discover_job_profile(settings_path: Path, requested_model: Optional[str],
+                         context_cap: Optional[int], fetch: omlx_discovery.HttpFetch
+                         ) -> Tuple[omlx_discovery.ServerProfile, int]:
+    """Ask the live server what a worker will run on: its profile and the window to pin.
+
+    The window is the server's own, or a lower ``context_cap``; a cap never raises it. A cap that
+    is not a valid size is refused before any request is made.
+    """
+    cap = None if context_cap is None else validate_context_cap(context_cap)
+    try:
+        profile = omlx_discovery.discover(Path(settings_path), requested_model, fetch=fetch)
+    except omlx_discovery.DiscoveryError as error:
+        raise _discovery_failure(error) from error
+    return profile, profile.effective_context(cap)
+
+
+def preflight_receipt(profile: omlx_discovery.ServerProfile, context_window: int
+                      ) -> Dict[str, Any]:
+    """What preflight proved, for the report and the CLI. Never holds the key."""
+    return {
+        "endpoint": profile_endpoint(profile),
+        "profile": profile.as_report(),
+        "context_window": context_window,
         "model_fallback": False,
         "api_key": "present (value withheld)",
-        "models_endpoint": f"{endpoint}/models",
-        "served_models": sorted(served),
-        "proxies": "disabled",
-        "redirects": "refused",
-        "model_context_window": context_window,
     }
-    return evidence
+
+
+def run_preflight(settings_path: Path, requested_model: Optional[str],
+                  context_cap: Optional[int], fetch: omlx_discovery.HttpFetch) -> Dict[str, Any]:
+    """Discover the loaded model and report what a worker would be pinned to."""
+    profile, context_window = discover_job_profile(settings_path, requested_model, context_cap,
+                                                   fetch)
+    return preflight_receipt(profile, context_window)
 
 
 # --------------------------------------------------------------------------------------
@@ -827,7 +705,7 @@ def _digest_path(path: Path) -> str:
             return "directory"
         digest = hashlib.sha256()
         with open(str(path), "rb") as handle:
-            for chunk in iter(lambda: handle.read(65536), b""):
+            for chunk in iter(lambda: handle.read(READ_CHUNK_BYTES), b""):
                 digest.update(chunk)
         return digest.hexdigest()
     except OSError as error:
@@ -1231,14 +1109,18 @@ def run_bounded(argv: Sequence[str], *, cwd: Optional[Path], env: Dict[str, str]
 # --------------------------------------------------------------------------------------
 # Worker invocation
 # --------------------------------------------------------------------------------------
-def config_overrides(alias: str, context_window: int = MODEL_CONTEXT_WINDOW) -> List[str]:
-    """Explicit local provider/model overrides; the user's config is never loaded."""
+def config_overrides(profile: omlx_discovery.ServerProfile, context_window: int,
+                     catalog_path: Optional[Path] = None) -> List[str]:
+    """Explicit local provider/model overrides for the job's discovered model; the user's
+    config is never loaded. ``catalog_path`` is reserved for the generated model catalog and
+    does not change the pins yet."""
     provider = f"model_providers.{PROVIDER_ID}"
+    pins = policy_pins(profile, context_window)
     settings = [
-        ("model", f'"{alias}"'),
+        ("model", pins["model"]),
         ("model_provider", f'"{PROVIDER_ID}"'),
         (f"{provider}.name", '"Local oMLX (loopback only)"'),
-        (f"{provider}.base_url", f'"{ENDPOINT}"'),
+        (f"{provider}.base_url", pins[f"{provider}.base_url"]),
         (f"{provider}.env_key", f'"{API_KEY_ENV}"'),
         (f"{provider}.wire_api", '"responses"'),
         (f"{provider}.requires_openai_auth", "false"),
@@ -1251,7 +1133,8 @@ def config_overrides(alias: str, context_window: int = MODEL_CONTEXT_WINDOW) -> 
         ("approval_policy", '"never"'),
         ("web_search", '"disabled"'),
         ("sandbox_mode", '"danger-full-access"'),
-        ("model_context_window", str(context_window)),
+        ("model_context_window", pins["model_context_window"]),
+        ("model_auto_compact_token_limit", pins["model_auto_compact_token_limit"]),
     ]
     for key, value in sorted(FEATURE_FLAGS.items()):
         settings.append((key, "true" if value else "false"))
@@ -1364,30 +1247,34 @@ def shell_env_excludes(value: Optional[str]) -> List[str]:
     return [item for item in parsed if isinstance(item, str)] if isinstance(parsed, list) else []
 
 
-def expected_config_pins(alias: str = EXPECTED_ALIAS,
-                         context_window: int = MODEL_CONTEXT_WINDOW) -> Dict[str, str]:
+def expected_config_pins(profile: omlx_discovery.ServerProfile,
+                         context_window: int) -> Dict[str, str]:
     """The full pinned ``-c`` policy, derived from the single place that builds it."""
-    return config_overrides_map(config_overrides(alias, context_window))
+    return config_overrides_map(config_overrides(profile, context_window))
 
 
-def missing_config_pins(argv: Sequence[str], alias: str = EXPECTED_ALIAS,
-                        context_window: int = MODEL_CONTEXT_WINDOW) -> List[str]:
+def missing_config_pins(argv: Sequence[str], profile: omlx_discovery.ServerProfile,
+                        context_window: int,
+                        catalog: Optional[Tuple[Path, str]] = None) -> List[str]:
     """Self-check before launching: any drift from the pinned local policy is a refusal.
 
     ``--ignore-user-config`` means the argv *is* the whole policy, so routing flags and every
     pinned override are checked together: a missing pin, a changed value, a conflicting
     duplicate override or a second model/sandbox flag all refuse the launch instead of letting
-    the last occurrence quietly win. ``alias`` and ``context_window`` are the job's configured
-    values: the argv must carry exactly those, so a configured model is pinned as strictly as
-    the default one.
+    the last occurrence quietly win. Every expected value comes from the job's own pinned
+    ``profile`` and ``context_window``, so the argv must name exactly the model, endpoint and
+    window discovery found. ``catalog`` (the generated model catalog and its sha256) is
+    accepted for the catalog pin and is not checked yet.
     """
+    alias = profile.model.api_model
+    endpoint = profile_endpoint(profile)
     pairs = config_override_pairs(argv)
     overrides = dict(pairs)
     problems: List[str] = []
-    pinned = expected_config_pins(alias, context_window)
-    for key, expected in CONFIG_PINS.items():
-        # The documented floor stays required on its own: deleting a pin from
-        # config_overrides() must not silently delete the requirement for it.
+    pinned = expected_config_pins(profile, context_window)
+    # The documented floor stays required on its own: deleting a pin from config_overrides()
+    # must not silently delete the requirement for it.
+    for key, expected in {**CONFIG_PINS, **policy_pins(profile, context_window)}.items():
         pinned.setdefault(key, expected)
     for key, expected in sorted(pinned.items()):
         actual = overrides.get(key)
@@ -1411,8 +1298,9 @@ def missing_config_pins(argv: Sequence[str], alias: str = EXPECTED_ALIAS,
             problems.append(f"-c {key} is overridden more than once with conflicting values "
                             f"{sorted(set(values))}")
     for key, value in pairs:
-        if key.endswith(".base_url") and value != f'"{ENDPOINT}"':
-            problems.append(f"{key} must stay on the loopback endpoint {ENDPOINT}, got {value}")
+        if key.endswith(".base_url") and value != f'"{endpoint}"':
+            problems.append(f"{key} must stay on the pinned loopback endpoint {endpoint}, "
+                            f"got {value}")
     for flag in REQUIRED_WORKER_FLAGS:
         if flag not in argv:
             problems.append(f"{flag} is missing")
@@ -1428,10 +1316,12 @@ def missing_config_pins(argv: Sequence[str], alias: str = EXPECTED_ALIAS,
     return problems
 
 
-def worker_argv(codex_bin: str, worktree: Path, alias: str, last_message: Path,
+def worker_argv(codex_bin: str, worktree: Path, profile: omlx_discovery.ServerProfile,
+                context_window: int, last_message: Path,
                 tool_overrides: Sequence[str] = (),
                 shell_excludes: Sequence[str] = (),
-                context_window: int = MODEL_CONTEXT_WINDOW) -> List[str]:
+                catalog_path: Optional[Path] = None) -> List[str]:
+    """The whole worker command for the job's pinned ``profile`` and ``context_window``."""
     argv = [
         codex_bin, "exec",
         "--ignore-user-config",
@@ -1440,8 +1330,8 @@ def worker_argv(codex_bin: str, worktree: Path, alias: str, last_message: Path,
         "-s", "danger-full-access",
         "--json",
         "-o", str(last_message),
-        "-m", alias,
-        *config_overrides(alias, context_window),
+        "-m", profile.model.api_model,
+        *config_overrides(profile, context_window, catalog_path),
     ]
     argv = with_shell_env_excludes(argv, shell_excludes)
     argv.extend(str(item) for item in tool_overrides)
@@ -2019,8 +1909,13 @@ class JobOptions:
     codex_bin: str
     lock_timeout: float = LOCK_TIMEOUT_SECONDS
     settings_path: Path = OMLX_SETTINGS
-    model_settings_path: Path = OMLX_MODEL_SETTINGS
-    list_models: Callable[[str, str], List[str]] = fetch_model_ids
+    # The loaded model to use (id or alias); ``None`` lets discovery choose the only one.
+    requested_model: Optional[str] = None
+    # An optional *lower* cap on the context window discovery reports; never raises it.
+    context_cap: Optional[int] = None
+    # ``--load``: ask oMLX to load ``requested_model`` before discovery.
+    load_model: bool = False
+    omlx_fetch: omlx_discovery.HttpFetch = omlx_discovery.http_fetch
     verify: bool = True
     attempt_timeout_cap: Optional[float] = policy.ATTEMPT_SECONDS
     apple_simulator_udid: Optional[str] = None
@@ -2030,9 +1925,6 @@ class JobOptions:
     workstream: str = "default"
     job_kind: str = "implementation"
     tool_config: Optional[Path] = None
-    canonical_model: str = CANONICAL_MODEL
-    api_model: str = EXPECTED_ALIAS
-    context_window: int = MODEL_CONTEXT_WINDOW
 
 
 def new_report(options: JobOptions) -> Dict[str, Any]:
@@ -2045,10 +1937,11 @@ def new_report(options: JobOptions) -> Dict[str, Any]:
         "task_id": task.task_id,
         "status": "worker_failed",
         "failure_reason": None,
-        "endpoint": ENDPOINT,
-        "canonical_model": options.canonical_model,
-        "api_model": options.api_model,
-        "model_context_window": options.context_window,
+        # Filled from live discovery once preflight has succeeded.
+        "endpoint": None,
+        "api_model": None,
+        "model_profile": {},
+        "context_window": None,
         "attempt_timeout_cap_seconds": options.attempt_timeout_cap,
         "model_fallback": False,
         "provider": PROVIDER_ID,
@@ -2130,10 +2023,10 @@ def ensure_report_dir(options: JobOptions, report: Dict[str, Any]) -> Optional[P
     return report_dir
 
 
-def _policy_check(argv: Sequence[str], alias: str = EXPECTED_ALIAS,
-                  context_window: int = MODEL_CONTEXT_WINDOW) -> None:
+def _policy_check(argv: Sequence[str], profile: omlx_discovery.ServerProfile,
+                  context_window: int, catalog: Optional[Tuple[Path, str]] = None) -> None:
     """Refuse to launch a worker whose pinned local policy drifted in any way."""
-    problems = missing_config_pins(argv, alias, context_window)
+    problems = missing_config_pins(argv, profile, context_window, catalog)
     if problems:
         raise BlockedError("worker policy self-check refused the launch: " + "; ".join(problems))
 
@@ -2259,12 +2152,18 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     lease_update(lease, report_dir=str(report_dir))
     progress(report, "model_preflight")
     deadline.require("preflight")
-    report["preflight"] = run_preflight(
-        settings_path=options.settings_path, model_settings_path=options.model_settings_path,
-        canonical_model=options.canonical_model, expected_alias=options.api_model,
-        context_window=options.context_window, list_models=options.list_models,
-    )
-    report["api_model"] = report["preflight"]["api_model"]
+    if options.load_model:
+        if not options.requested_model:
+            raise ContractError("--load requires --model")
+        report["model_load"] = load_requested_model(options.settings_path,
+                                                    options.requested_model, options.omlx_fetch)
+    profile, context_window = discover_job_profile(
+        options.settings_path, options.requested_model, options.context_cap, options.omlx_fetch)
+    report["preflight"] = preflight_receipt(profile, context_window)
+    report["endpoint"] = report["preflight"]["endpoint"]
+    report["model_profile"] = report["preflight"]["profile"]
+    report["context_window"] = context_window
+    report["api_model"] = profile.model.api_model
     api_key = read_api_key(options.settings_path)
     # The caller's list already holds the credentials selected by the tools manifest: it grows
     # here instead of being reset, so nothing collected before the first failure is forgotten.
@@ -2341,17 +2240,16 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         report["tooling"] = probe_tools(
             loaded, codex_bin=options.codex_bin,
             env={name: value for name, value in env.items() if name != API_KEY_ENV},
-            overrides=config_overrides(report["api_model"], options.context_window),
+            overrides=config_overrides(profile, context_window),
             deadline=deadline, report_dir=report_dir)
     except ToolProbeError as error:
         raise BlockedError(f"required MCP tools could not be probed: {error}") from error
     # Self-check the pinned policy before the first subprocess: drift is a refusal, not a
     # degraded run. The sandbox probe runs on the same total budget as everything else.
-    _policy_check(worker_argv(options.codex_bin, worktree, report["api_model"],
+    _policy_check(worker_argv(options.codex_bin, worktree, profile, context_window,
                               report_dir / "policy-check.last-message.txt",
-                              loaded["overrides"], list(loaded["environment"]),
-                              context_window=options.context_window),
-                  report["api_model"], options.context_window)
+                              loaded["overrides"], list(loaded["environment"])),
+                  profile, context_window)
     sandbox = probe_sandbox(options.codex_bin, worktree, verify_env, secrets, deadline)
     if not options.verify:
         sandbox = dict(sandbox)
@@ -2420,10 +2318,9 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         stderr_path = report_dir / f"attempt-{attempt_number}.stderr.txt"
         last_path = report_dir / f"attempt-{attempt_number}.last-message.txt"
         prompt_path.write_text(redact(prompt, secrets), encoding="utf-8")
-        argv = worker_argv(options.codex_bin, worktree, report["api_model"], last_path,
-                           loaded["overrides"], list(loaded["environment"]),
-                           context_window=options.context_window)
-        _policy_check(argv, report["api_model"], options.context_window)
+        argv = worker_argv(options.codex_bin, worktree, profile, context_window, last_path,
+                           loaded["overrides"], list(loaded["environment"]))
+        _policy_check(argv, profile, context_window)
         before_worker = audit_worktree(worktree, base_commit, task.allowed_paths, secrets, scratch_dir=report_dir)
         patch_before = before_worker.patch
         # Snapshot every changed-from-base path *before* the worker runs, so whatever state a
@@ -2655,7 +2552,7 @@ def decide_status(report: Dict[str, Any], worker_ok: bool) -> str:
 
 STATUS_REASONS = {
     "contract_invalid": "the task contract was rejected",
-    "preflight_failed": "local endpoint, alias or model availability preflight failed",
+    "preflight_failed": "oMLX discovery failed: settings, endpoint or loaded model",
     "blocked": "the job was blocked before the worker could run",
     "worker_failed": "the worker exited unsuccessfully without passing verification",
     "audit_violation": "the worker changed something outside allowed_paths or touched the "
@@ -2663,7 +2560,7 @@ STATUS_REASONS = {
     "tests_failed": "verification commands failed after the worker finished",
     "verification_blocked": "verification produced no passing evidence",
     "timeout": "the total job budget ran out before passing verification",
-    "model_mismatch": "the worker was served by a model other than the pinned canonical alias",
+    "model_mismatch": "the worker was served by a model other than the pinned one",
     "no_changes": "the worker produced no in-scope implementation patch that survived to the "
                   "final audit; baseline verification passed, and parent review is required",
 }
@@ -2685,7 +2582,7 @@ def describe_failure(report: Dict[str, Any]) -> str:
     for attempt in report.get("attempts", []):
         if attempt.get("model_routing") == "mismatch":
             parts.append(f"attempt {attempt.get('attempt')} observed model(s) "
-                         f"{attempt.get('observed_models')} instead of the pinned alias "
+                         f"{attempt.get('observed_models')} instead of the pinned model "
                          f"{report.get('api_model')}")
         if attempt.get("unsupported_tools"):
             detail = attempt.get("stderr_excerpt") or "the worker stream reported an unsupported tool"
@@ -2786,6 +2683,10 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
     except LauncherError as error:
         report["status"] = error.status
         report["failure_reason"] = redact(str(error), secrets)
+        if isinstance(error, PreflightError) and error.code:
+            report["discovery_error"] = {"code": error.code,
+                                         "message": report["failure_reason"],
+                                         "candidates": list(error.candidates)}
     except Exception as error:  # noqa: BLE001 - report, never rethrow raw
         report["status"] = "worker_failed"
         report["failure_reason"] = redact(f"unexpected {error.__class__.__name__}: {error}", secrets)
@@ -2888,30 +2789,21 @@ def resolve_state_dir(explicit: Optional[str] = None) -> Path:
     return Path(os.path.expanduser(raw)).absolute()
 
 
-def add_model_arguments(parser: argparse.ArgumentParser, *, attempt: bool) -> None:
-    """Model routing flags shared by ``run`` and ``preflight``; unset means env, then default."""
-    parser.add_argument("--canonical-model", metavar="NAME",
-                        help=f"oMLX model id to pin (env {CANONICAL_MODEL_ENV}; "
-                             f"default {CANONICAL_MODEL})")
-    parser.add_argument("--api-model", metavar="NAME",
-                        help=f"alias oMLX serves that model under; equal to --canonical-model "
-                             f"for an unaliased model (env {API_MODEL_ENV}; default "
-                             f"{EXPECTED_ALIAS})")
-    parser.add_argument("--context-window", metavar="TOKENS",
-                        help=f"model_context_window pinned for the worker, "
-                             f"{MIN_CONTEXT_WINDOW}-{MAX_CONTEXT_WINDOW} (env "
-                             f"{CONTEXT_WINDOW_ENV}; default {MODEL_CONTEXT_WINDOW})")
-    if attempt:
-        parser.add_argument("--attempt-timeout", metavar="SECONDS",
-                            help=f"per-attempt worker cap inside the job budget, "
-                                 f"{MIN_ATTEMPT_BUDGET_SECONDS:.0f}-{MAX_TIMEOUT_SECONDS} (env "
-                                 f"{ATTEMPT_SECONDS_ENV}; default {policy.ATTEMPT_SECONDS:.0f})")
+def add_selection_arguments(parser: argparse.ArgumentParser) -> None:
+    """Which loaded model a worker runs on; shared by ``run`` and ``preflight``."""
+    parser.add_argument("--model", metavar="NAME",
+                        help="loaded oMLX model to use, by canonical id or alias (default: the "
+                             "only loaded chat model, else the server's default model)")
+    parser.add_argument("--context-cap", metavar="TOKENS",
+                        help=f"cap the discovered context window at this many tokens, "
+                             f"{MIN_CONTEXT_CAP}-{MAX_CONTEXT_CAP}; it only ever lowers the "
+                             "server's window")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="local-worker",
-        description="Run one local Codex CLI worker against the pinned loopback oMLX model.",
+        description="Run one local Codex CLI worker against the loaded loopback oMLX model.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -2943,26 +2835,33 @@ def build_parser() -> argparse.ArgumentParser:
                           "credentials it needs and their values never reach argv, evidence or "
                           "the prompt")
     run.add_argument("--settings", default=str(OMLX_SETTINGS))
-    run.add_argument("--model-settings", default=str(OMLX_MODEL_SETTINGS))
-    add_model_arguments(run, attempt=True)
+    add_selection_arguments(run)
+    run.add_argument("--load", action="store_true",
+                     help="ask oMLX to load --model before discovery (requires --model; the load "
+                          "time counts against the job budget)")
     run.add_argument("--json", action="store_true", help="print the full report JSON")
 
     status = sub.add_parser("status", help="read progress and actual usage without starting a worker")
     status.add_argument("--state-dir")
     status.add_argument("--job-id")
-    check = sub.add_parser("preflight", help="model metadata only; does not qualify native execution")
+    check = sub.add_parser("preflight", help="discover the loaded model and its limits; does not "
+                                             "qualify native execution")
     check.add_argument("--settings", default=str(OMLX_SETTINGS))
-    check.add_argument("--model-settings", default=str(OMLX_MODEL_SETTINGS))
-    add_model_arguments(check, attempt=False)
+    add_selection_arguments(check)
     return parser
 
 
 def summary_lines(report: Dict[str, Any]) -> List[str]:
+    model = (report.get("model_profile") or {}).get("model") or {}
+    if report.get("api_model"):
+        model_line = (f"model: {model.get('canonical_id')} -> {report.get('api_model')} @ "
+                      f"{report.get('endpoint')} (context {report.get('context_window')}, "
+                      f"attempt cap {report.get('attempt_timeout_cap_seconds')}s)")
+    else:
+        model_line = "model: not discovered"
     lines = [
         f"status: {report['status']} (exit {report.get('exit_code')})",
-        f"model: {report.get('canonical_model')} -> {report.get('api_model')} @ {report.get('endpoint')} "
-        f"(context {report.get('model_context_window')}, attempt cap "
-        f"{report.get('attempt_timeout_cap_seconds')}s)",
+        model_line,
         f"worktree: {report.get('worktree') or 'not created'}",
         f"report: {report.get('report_dir') or report.get('report_path') or 'not written'}",
         f"changed paths: {len(report.get('changed_paths', []))}",
@@ -3026,8 +2925,27 @@ def status_snapshot(item):
     return item
 
 
+def selection_from_args(args: argparse.Namespace) -> Tuple[Optional[str], Optional[int]]:
+    """The validated ``(--model, --context-cap)`` of one invocation; ``None`` means unset."""
+    model = getattr(args, "model", None)
+    if model is not None and not str(model).strip():
+        raise ContractError("--model must not be empty")
+    cap = getattr(args, "context_cap", None)
+    return model, None if cap is None else validate_context_cap(cap)
+
+
+def refusal_payload(error: LauncherError) -> Dict[str, Any]:
+    """What the CLI prints for a refused invocation; a discovery refusal also carries its code
+    and the model names the caller could choose instead."""
+    payload: Dict[str, Any] = {"status": error.status, "failure_reason": str(error)}
+    if isinstance(error, PreflightError) and error.code:
+        payload["discovery_error"] = {"code": error.code, "message": str(error),
+                                      "candidates": list(error.candidates)}
+    return payload
+
+
 def main(argv: Optional[Sequence[str]] = None, *,
-         list_models: Callable[[str, str], List[str]] = fetch_model_ids) -> int:
+         omlx_fetch: omlx_discovery.HttpFetch = omlx_discovery.http_fetch) -> int:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:
@@ -3044,16 +2962,15 @@ def main(argv: Optional[Sequence[str]] = None, *,
                 result.append(status_snapshot(item))
             print(json.dumps(result, indent=2))
             return 0
+        requested_model, context_cap = selection_from_args(args)
         if args.command == "preflight":
-            model = resolve_model_settings(args)
-            evidence = run_preflight(
-                settings_path=Path(args.settings), model_settings_path=Path(args.model_settings),
-                canonical_model=model["canonical_model"], expected_alias=model["api_model"],
-                context_window=model["context_window"], list_models=list_models,
-            )
+            evidence = run_preflight(Path(os.path.expanduser(args.settings)), requested_model,
+                                     context_cap, omlx_fetch)
             print(json.dumps(evidence, indent=2))
             return 0
 
+        if args.load and requested_model is None:
+            raise ContractError("--load requires --model")
         task = Task.from_payload(json.loads(Path(args.task_file).read_text(encoding="utf-8")))
         udid = args.apple_simulator_udid
         if udid is not None:
@@ -3062,16 +2979,17 @@ def main(argv: Optional[Sequence[str]] = None, *,
             except apple.ApplePolicyError as error:
                 raise ContractError(str(error)) from error
         maximum = parse_max_workers(args.max_workers)
-        model = resolve_model_settings(args)
         options = JobOptions(
             task=task,
             state_dir=resolve_state_dir(args.state_dir),
             codex_bin=resolve_codex_bin(args.codex_bin),
             lock_timeout=args.lock_timeout,
             settings_path=Path(os.path.expanduser(args.settings)),
-            model_settings_path=Path(os.path.expanduser(args.model_settings)),
+            requested_model=requested_model,
+            context_cap=context_cap,
+            load_model=args.load,
+            omlx_fetch=omlx_fetch,
             verify=not args.no_verify,
-            list_models=list_models,
             apple_simulator_udid=udid,
             maximum=maximum,
             native_preflight_plan=args.native_preflight_plan,
@@ -3079,14 +2997,10 @@ def main(argv: Optional[Sequence[str]] = None, *,
             workstream=args.workstream,
             job_kind=args.job_kind,
             tool_config=args.tool_config,
-            canonical_model=model["canonical_model"],
-            api_model=model["api_model"],
-            context_window=model["context_window"],
-            attempt_timeout_cap=model["attempt_seconds"],
         )
         report = run_job(options)
     except LauncherError as error:
-        print(json.dumps({"status": error.status, "failure_reason": str(error)}, indent=2))
+        print(json.dumps(refusal_payload(error), indent=2))
         return EXIT_CODES.get(error.status, 4)
     except (OSError, json.JSONDecodeError) as error:
         print(json.dumps({"status": "contract_invalid",

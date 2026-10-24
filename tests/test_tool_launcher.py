@@ -105,7 +105,9 @@ class ToolLauncher(unittest.TestCase):
         self.assertIn(VAR, joined)                                  # name only, never the value
         self.assertNotIn(TOKEN, joined)
         self.assertEqual(worker["env"][VAR], TOKEN)                 # the MCP server inherits it
-        self.assertEqual(lw.missing_config_pins(worker["argv"]), [])  # provider pins preserved
+        profile = sp.discovered_profile()                              # provider pins preserved
+        self.assertEqual(lw.missing_config_pins(worker["argv"], profile,
+                                                profile.model.context_window), [])
         excluded = json.loads([item.split("=", 1)[1] for item in worker["argv"]
                                if item.startswith(lw.SHELL_ENV_EXCLUDES_KEY + "=")][0])
         self.assertIn(VAR, excluded)

@@ -40,14 +40,14 @@ the tests pass.
 
 - macOS (the only platform tested) with `python3` (stdlib only) and `git`. Linux is unverified.
 - The Codex CLI on `PATH` (or `--codex-bin` / `LOCAL_WORKER_CODEX_BIN`).
-- oMLX serving OpenAI-compatible endpoints on `http://127.0.0.1:8000/v1` **only**; any other
-  endpoint is rejected before a request is made.
-- `~/.omlx/settings.json` containing `auth.api_key`, `server.host`/`server.port` matching
-  loopback `8000`, and `model.model_fallback: false`.
-- `~/.omlx/model_settings.json` mapping the canonical model to its API alias. The defaults are
-  `Qwen3.8-Flash-Next-UD-Q4_K_XL` and `qwen-3.8-nf-splash`; another model is selected with
-  `--canonical-model`/`--api-model` (see [Choosing the model](#choosing-the-model)). A model
-  with no alias in oMLX is used by passing its own id as both values.
+- oMLX serving OpenAI-compatible endpoints on a **loopback** address only (`127.0.0.1`,
+  `localhost` or `::1`, any port); any other endpoint is rejected before a request is made.
+- `~/.omlx/settings.json` containing `auth.api_key`, a loopback `server.host`, and
+  `model.model_fallback: false`. `server.port` is read from the file; oMLX's own default port is
+  used only when the file omits it.
+- A chat model loaded in oMLX. Nothing about the model is configured in the launcher: it asks the
+  live server which model is loaded and what its limits are (see
+  [Choosing the model](#choosing-the-model)).
 
 ## Installation
 
@@ -108,8 +108,8 @@ nonempty or unreadable `$CODEX_HOME/AGENTS.override.md` — Codex reads that ove
 with the blocker and `--apply` refuses before any backup or write, and the override's contents are
 never printed. `--preflight` is delegated to the packaged `bin/local-worker preflight` and
 `endpoint_passed` is true only when that exits `0` **and** prints a valid launcher success receipt:
-a JSON object with nonempty `endpoint`, `canonical_model` and `api_model`, `model_fallback`
-exactly `false`, and a `served_models` list containing `api_model`. Any other output — arbitrary
+a JSON object with a nonempty `endpoint`, `profile.model.api_model` present, `model_fallback`
+exactly `false`, and a positive integer `context_window`. Any other output — arbitrary
 JSON such as `[]`, a blocked report, or exit `0` with no JSON — fails with the reason naming what
 was missing, so a receipt shape is never mistaken for an endpoint claim. Migration is narrow: a
 global `AGENTS.md` that matches the historical hand-written policy byte-for-byte is reduced to a
@@ -220,12 +220,15 @@ safe-cleanup blocker explicitly instead of claiming completion.
 
 ## Usage
 
-Preflight checks pinned model routing only; no worker starts and the API key is never printed:
+Preflight discovers the loaded model and its limits only; no worker starts and the API key is
+never printed. Its receipt carries the `endpoint`, the discovered `profile` (model, context
+window, output cap, vision support, throughput) and the `context_window` a worker would be
+pinned to:
 
 ```sh
 bin/local-worker preflight
-bin/local-worker preflight --settings ~/.omlx/settings.json \
-  --model-settings ~/.omlx/model_settings.json
+bin/local-worker preflight --settings ~/.omlx/settings.json --model Qwen3.5-9B-OptiQ-4bit
+bin/local-worker preflight --context-cap 32768
 ```
 
 Run one job:
@@ -261,30 +264,34 @@ The versioned plan format and required evidence are in
 | `--workstream` | stable repair-history key; defaults to `default`, and changing task/job IDs does not reset it |
 | `--job-kind` | `implementation` for initial work or `repair` for a follow-up |
 | `status` | read live or completed progress and measured usage for a state directory/job |
-| `--settings`, `--model-settings` | oMLX settings paths |
-| `--canonical-model` | oMLX model id to pin (`run`, `preflight`); env `LOCAL_WORKER_CANONICAL_MODEL`, default `Qwen3.8-Flash-Next-UD-Q4_K_XL` |
-| `--api-model` | id oMLX serves that model under; the model's own id when it has no alias (`run`, `preflight`); env `LOCAL_WORKER_API_MODEL`, default `qwen-3.8-nf-splash` |
-| `--context-window` | `model_context_window` pinned for the worker, 4096-1048576 (`run`, `preflight`); env `LOCAL_WORKER_CONTEXT_WINDOW`, default `65536` |
-| `--attempt-timeout` | per-attempt worker cap in seconds, 5-3600, still bounded by the job budget (`run`); env `LOCAL_WORKER_ATTEMPT_SECONDS`, default `300` |
+| `--settings` | oMLX `settings.json` path (`run`, `preflight`); default `~/.omlx/settings.json` |
+| `--model` | loaded oMLX model to use, by canonical id or alias (`run`, `preflight`); default: the only loaded chat model, else the server's default model |
+| `--context-cap` | cap the discovered context window at this many tokens, 4096-1048576 (`run`, `preflight`); it only ever lowers the server's window |
+| `--load` | ask oMLX to load `--model` before discovery (`run`; requires `--model`); the load time counts against the job budget |
 | `--json` | print the full report instead of the summary |
 
 ### Choosing the model
 
-The model settings resolve as CLI flag, then environment variable, then default. Whatever is
-chosen is pinned and self-checked exactly like the defaults: the worker argv must carry that
-alias and context window, and any other value is refused as drift. Example for a model that oMLX
-serves under its own id, on a server capped at 32K tokens:
+Every job asks the live oMLX server (`/health`, `/v1/models/status`, `/api/status`) which chat
+model is loaded and what its limits are, and pins exactly that: the API name (the model's alias
+when it has one, else its id), the endpoint, the context window and the compaction threshold
+(80% of the window). The worker argv must carry those values, and any other value is refused as
+drift. There are no model environment variables and no model constants in the launcher.
+
+- With one loaded chat model it is used. With several, oMLX's default model is used if it is one
+  of them; otherwise preflight refuses with the candidate list (`model_ambiguous`) and `--model`
+  names one. Helper, embedding and other non-chat models are never chosen.
+- The context window is the one oMLX reports for the loaded model. `--context-cap N` can only
+  lower it; it never raises it.
+- A model that is known to oMLX but not loaded is refused (`model_not_loaded`) unless `run` is
+  given `--load`, which asks oMLX to load `--model` first. The refusal is recorded in the report
+  as `discovery_error` with its `code` and `candidates`.
 
 ```sh
-export LOCAL_WORKER_CANONICAL_MODEL=Qwen3.5-9B-OptiQ-4bit
-export LOCAL_WORKER_API_MODEL=Qwen3.5-9B-OptiQ-4bit
-export LOCAL_WORKER_CONTEXT_WINDOW=32768
-export LOCAL_WORKER_ATTEMPT_SECONDS=600
-bin/local-worker preflight
+bin/local-worker preflight                       # which model would run, and its limits
+bin/local-worker run --task-file task.json --model Qwen3.5-9B-OptiQ-4bit --context-cap 32768
+bin/local-worker run --task-file task.json --model Qwen3.5-9B-OptiQ-4bit --load
 ```
-
-An alias is never guessed: when oMLX has an alias for the model, `--api-model` must be that
-alias, and the bare id is accepted only when the model has none.
 
 Exit codes: `0 ok`, `1 contract_invalid`, `2 preflight_failed`, `3 blocked`,
 `4 worker_failed`, `5 audit_violation`, `6 tests_failed`, `7 verification_blocked`,
@@ -440,14 +447,15 @@ The launcher never loads your interactive `~/.codex/config.toml`; it pins everyt
 explicit `-c` overrides and then **self-checks its own argv** before the first subprocess.
 Any drift is a refusal (`blocked`), not a degraded run:
 
-- `model=<api model>` (default `qwen-3.8-nf-splash`), `model_provider=local-omlx` with
-  `base_url="http://127.0.0.1:8000/v1"`, `env_key=LOCAL_OMLX_API_KEY`, `wire_api=responses`,
+- `model=<discovered api model>`, `model_provider=local-omlx` with
+  `base_url="<discovered loopback endpoint>/v1"`, `env_key=LOCAL_OMLX_API_KEY`, `wire_api=responses`,
   `requires_openai_auth=false`, and **zero** request/stream retries (a retry could be served
   by something else). Zero retries exist so a failure stays **bounded and visible** — one
   attempt, one honest status — rather than being silently retried onto a different backend.
 - `approval_policy=never`, `web_search=disabled`, `sandbox_mode=danger-full-access`,
-  `model_context_window=<context window>` (default `65536`), and `shell_environment_policy` restricted with
-  `LOCAL_OMLX_API_KEY` excluded from the shell.
+  `model_context_window=<discovered window, or the lower --context-cap>`,
+  `model_auto_compact_token_limit=<80% of that window>`, and `shell_environment_policy` restricted
+  with `LOCAL_OMLX_API_KEY` excluded from the shell.
 - Worker argv also carries `--ignore-user-config --ignore-rules -C <worktree>
   -s danger-full-access --json -o <last-message> -m <alias>`. `--ignore-rules` means the
   worker's execpolicy rules are not consulted; nothing prompts for approval.
@@ -456,8 +464,8 @@ Any drift is a refusal (`blocked`), not a degraded run:
   `full-host-access` backend and `none` confinement. A command that could not run at all is
   reported `verification_blocked` with the concrete reason, never as a pass.
 - Model identity rests on **routing evidence**, not a double check. The request config (the
-  `-c` pins plus the argv self-check) and preflight (the alias must be served in `/v1/models`,
-  with fallback disabled) are what route the job to the local model. The worker's own event
+  `-c` pins plus the argv self-check) and discovery (the pinned model must be the one loaded in
+  oMLX, with fallback disabled) are what route the job to the local model. The worker's own event
   stream is parsed for the routed model **when it includes one** — a conflicting value is
   `model_mismatch`, but the stream can legitimately omit the field, which is recorded as
   `absent`; that missing-model-metadata warning is not a model fallback and never a silent
@@ -528,13 +536,13 @@ These are two different interfaces and the launcher uses only the first:
 python3 -m unittest discover -s tests -v
 ```
 
-`tests/test_contract_policy.py` covers contract validation, loopback/alias pinning,
+`tests/test_contract_policy.py` covers contract validation, argv pinning for the discovered model,
 environment isolation, argv self-check, and full-host verification readiness (a readiness
 command that runs yields `passed`; one that cannot run yields `blocked`). `tests/test_audit.py`
 covers the git audit on real disposable repos (in-scope edits, staged, untracked, renames,
 worker commits, ignored output, symlink escapes, scratch-dir placement) and the
 primary-checkout fingerprint. `tests/test_run_job.py` covers job orchestration with a mocked
-worker/model list (success and every failure path, preflight report and persistence, report
+worker and discovery fake (success and every failure path, preflight report and persistence, report
 dir before preflight, budget exhaustion, second-attempt feedback, key never reaching the
 shell env), plus lock exclusivity and process-group termination including children that
 ignore `SIGTERM`.

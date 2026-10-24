@@ -28,8 +28,8 @@ FIX = "def add(a, b):\n    return a + b\n"
 
 class AliasedFlagsAreOneSetting(unittest.TestCase):
     def test_second_alias_conflict_is_not_missed(self):
-        problems = lw._single_valued_flag(["-m", lw.EXPECTED_ALIAS, "--model", "gpt-5"],
-                                          lw.MODEL_FLAGS, lw.EXPECTED_ALIAS)
+        problems = lw._single_valued_flag(["-m", sp.MODEL, "--model", "gpt-5"],
+                                          lw.MODEL_FLAGS, sp.MODEL)
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("conflicting values", problems[0])
 
@@ -40,28 +40,30 @@ class AliasedFlagsAreOneSetting(unittest.TestCase):
         self.assertEqual(len(problems), 1, problems)
 
     def test_conflict_is_reported_in_either_alias_order(self):
-        for argv in (["--model", "gpt-5", "-m", lw.EXPECTED_ALIAS],
+        for argv in (["--model", "gpt-5", "-m", sp.MODEL],
                      ["-s", "read-only", "--sandbox", lw.REQUIRED_SANDBOX_MODE]):
             flags = lw.MODEL_FLAGS if "-m" in argv else lw.SANDBOX_FLAGS
-            expected = lw.EXPECTED_ALIAS if "-m" in argv else lw.REQUIRED_SANDBOX_MODE
+            expected = sp.MODEL if "-m" in argv else lw.REQUIRED_SANDBOX_MODE
             self.assertTrue(lw._single_valued_flag(argv, flags, expected), argv)
 
     def test_agreeing_aliases_and_a_single_alias_stay_clean(self):
-        self.assertEqual(lw._single_valued_flag(["-m", lw.EXPECTED_ALIAS, "--model",
-                                                 lw.EXPECTED_ALIAS],
-                                                lw.MODEL_FLAGS, lw.EXPECTED_ALIAS), [])
+        self.assertEqual(lw._single_valued_flag(["-m", sp.MODEL, "--model",
+                                                 sp.MODEL],
+                                                lw.MODEL_FLAGS, sp.MODEL), [])
         self.assertEqual(lw._single_valued_flag(["--sandbox", lw.REQUIRED_SANDBOX_MODE],
                                                 lw.SANDBOX_FLAGS, lw.REQUIRED_SANDBOX_MODE), [])
 
     def test_wrong_value_and_absence_still_report(self):
         self.assertIn("--model", lw._single_valued_flag(["--model", "gpt-5"], lw.MODEL_FLAGS,
-                                                        lw.EXPECTED_ALIAS)[0])
+                                                        sp.MODEL)[0])
         self.assertIn("is missing", lw._single_valued_flag(["-C", "/tmp"], lw.MODEL_FLAGS,
-                                                           lw.EXPECTED_ALIAS)[0])
+                                                           sp.MODEL)[0])
 
     def test_the_real_worker_argv_still_passes_the_policy_check(self):
-        argv = lw.worker_argv("codex", Path("/tmp/wt"), lw.EXPECTED_ALIAS, Path("/tmp/last.txt"))
-        self.assertEqual(lw.missing_config_pins(argv), [])
+        profile = sp.discovered_profile()
+        window = profile.model.context_window
+        argv = lw.worker_argv("codex", Path("/tmp/wt"), profile, window, Path("/tmp/last.txt"))
+        self.assertEqual(lw.missing_config_pins(argv, profile, window), [])
 
 
 def attempt(number, *, terminal=(), returncode=0):
@@ -101,7 +103,7 @@ class TerminalRun(sp.FakeRun):
         if self.worker_edit:
             self.worker_edit(Path(cwd), self.exec_calls)
         events = [{"type": "thread.started", "thread_id": "thr-1"},
-                  {"type": "turn.completed", "model": lw.EXPECTED_ALIAS,
+                  {"type": "turn.completed", "model": sp.worker_model(argv),
                    "usage": {"input_tokens": 11, "output_tokens": 7}},
                   {"type": "turn.failed", "error": {"message": "the turn was aborted"}}]
         return sp.result(list(argv), 0, "".join(json.dumps(e) + "\n" for e in events))

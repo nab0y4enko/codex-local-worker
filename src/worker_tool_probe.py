@@ -47,10 +47,10 @@ class ToolProbeError(ValueError):
 def probe_tools(loaded, *, codex_bin, env, overrides, deadline, report_dir):
     """Return a copy of ``loaded['evidence']`` with every selected server marked probed.
 
-    ``overrides`` is the launcher's own ``config_overrides(alias)`` (local pins, features off)
-    and ``loaded['overrides']`` adds the selected MCP servers, so the probe asks the real Codex
-    MCP client the very same questions the worker will run under. No servers means nothing to
-    check and the evidence comes back unchanged.
+    ``overrides`` is the launcher's own ``config_overrides(profile, context_window)`` (local
+    pins, features off) and ``loaded['overrides']`` adds the selected MCP servers, so the probe
+    asks the real Codex MCP client the very same questions the worker will run under. No
+    servers means nothing to check and the evidence comes back unchanged.
     """
     evidence = _evidence(loaded)
     servers = evidence.get("servers")

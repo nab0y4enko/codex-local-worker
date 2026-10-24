@@ -8,7 +8,8 @@ import sys
 import tempfile
 import urllib.parse
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import local_worker as lw  # noqa: E402
@@ -25,6 +26,10 @@ IOS_RUNTIME = "com.apple.CoreSimulator.SimRuntime.iOS-18-0"
 BASE_FILES = {".gitignore": "__pycache__/\n*.pyc\n",
               "add.py": "def add(a, b):\n    return a - b\n", "notes.md": "base notes\n"}
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+# The model ``FakeOmlx("one")`` has loaded, and its window: what discovery reports in tests.
+MODEL = "Qwen3.5-9B-OptiQ-4bit"
+MODEL_WINDOW = 262144
+FIX_ADD = "def add(a, b):\n    return a + b\n"
 
 
 def load_fixture_text(relative):
@@ -71,21 +76,6 @@ def make_repo(parent, files=None):
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "base")
     return repo
-
-
-def write_legacy_settings(root):
-    """Pre-discovery fixture: a directory holding ``settings.json`` and ``model_settings.json``
-    for the hardcoded-model launcher. Returns ``(settings, model_settings)``; Task 4 retires it."""
-    root = Path(root)
-    root.mkdir(parents=True, exist_ok=True)
-    settings = root / "settings.json"
-    settings.write_text(json.dumps({"auth": {"api_key": SECRET},
-                                    "server": {"host": lw.HOST, "port": lw.PORT},
-                                    "model": {"model_fallback": False}}), encoding="utf-8")
-    model_settings = root / "model_settings.json"
-    model_settings.write_text(json.dumps(
-        {"models": {lw.CANONICAL_MODEL: {"model_alias": lw.EXPECTED_ALIAS}}}), encoding="utf-8")
-    return settings, model_settings
 
 
 def write_settings(path, *, host="127.0.0.1", port=8000, model_fallback=False):
@@ -171,14 +161,6 @@ class FakeOmlx:
         return 404, {"detail": "Model not found: " + model_id}
 
 
-def models_available(endpoint, api_key):
-    return [lw.EXPECTED_ALIAS, "some-other-model"]
-
-
-def models_missing(endpoint, api_key):
-    return ["some-other-model"]
-
-
 def task_payload(repo, **overrides):
     payload = {"task_id": "task-1", "repo_path": str(Path(repo)), "base_ref": "main",
                "goal": "Make add() return the sum.", "acceptance_criteria": ["test_add passes"],
@@ -202,13 +184,50 @@ def apple_home(parent, udid=APPLE_UDID, name="home"):
     return home
 
 
-def job_options(root, repo, verify=True, list_models=models_available, max_attempts=1,
-                apple_udid=None):
-    settings, model_settings = write_legacy_settings(Path(root) / "omlx")
-    task = lw.Task.from_payload(task_payload(repo, max_attempts=max_attempts))
+def fix_add(cwd, attempt=1):
+    """A worker edit that makes the base repository's ``add()`` correct."""
+    Path(cwd, "add.py").write_text(FIX_ADD, encoding="utf-8")
+
+
+def discovered_profile(variant="one", overrides=None, requested=None):
+    """The ``ServerProfile`` discovery builds from a ``FakeOmlx`` variant (a throwaway
+    ``settings.json`` is written and removed)."""
+    root = tmpdir()
+    try:
+        settings = write_settings(root / "settings.json")
+        return omlx_discovery.discover(settings, requested, fetch=FakeOmlx(variant, overrides))
+    finally:
+        cleanup(root)
+
+
+def job_options(root, repo, verify=True, omlx=None, max_attempts=1, apple_udid=None,
+                **contract_overrides):
+    """``JobOptions`` for a disposable job: settings under ``root/omlx``, discovery served by
+    ``omlx`` (default ``FakeOmlx("one")``), contract fields overridable by keyword."""
+    settings = write_settings(Path(root) / "omlx" / "settings.json")
+    task = lw.Task.from_payload(task_payload(repo, **dict({"max_attempts": max_attempts},
+                                                          **contract_overrides)))
     return lw.JobOptions(task=task, state_dir=Path(root) / "state", codex_bin="codex-mock",
-                         settings_path=settings, model_settings_path=model_settings,
-                         list_models=list_models, verify=verify, apple_simulator_udid=apple_udid)
+                         settings_path=settings,
+                         omlx_fetch=omlx if omlx is not None else FakeOmlx("one"),
+                         verify=verify, apple_simulator_udid=apple_udid)
+
+
+def run_clean_job(root, repo, *, omlx=None, fake_run=None, worker_edit=None,
+                  **contract_overrides) -> Tuple[Dict, "FakeRun"]:
+    """One job end to end on the mocked worker; returns ``(report, fake_run)``.
+
+    The worker makes ``add()`` correct (``fix_add``) unless ``worker_edit`` says otherwise; a
+    ``fake_run`` of the caller's is used as given (``worker_edit`` is still applied when passed).
+    ``omlx`` is the discovery fake and ``contract_overrides`` replace task contract fields.
+    """
+    options = job_options(root, repo, omlx=omlx, **contract_overrides)
+    fake = fake_run if fake_run is not None else FakeRun(worker_edit=worker_edit or fix_add)
+    if fake_run is not None and worker_edit is not None:
+        fake.worker_edit = worker_edit
+    with mock.patch.object(lw, "run_bounded", fake):
+        report = lw.run_job(options)
+    return report, fake
 
 
 def result(argv, rc, out="", err="", timed_out=False):
@@ -268,12 +287,21 @@ def seatbelt_write_allowed(text, target):
     return verdict
 
 
+def worker_model(argv):
+    """The ``-m`` model of a worker argv, which is what a correctly routed worker reports."""
+    argv = [str(item) for item in argv]
+    return argv[argv.index("-m") + 1] if "-m" in argv else MODEL
+
+
 class FakeRun:
     """Stand-in for run_bounded: the worker and the sandbox are mocked, every git call is real."""
 
     def __init__(self, worker_rc=0, test_rc=0, probe_ok=True, worker_edit=None,
-                 worker_timed_out=False, worker_stderr="", apple=None):
+                 worker_timed_out=False, worker_stderr="", apple=None, routed_model=None):
         self.worker_rc, self.test_rc, self.probe_ok = worker_rc, test_rc, probe_ok
+        # The model the worker's events name: the job's own ``-m`` model unless a test routes
+        # the worker somewhere else on purpose.
+        self.routed_model = routed_model
         self.worker_edit, self.worker_timed_out, self.worker_stderr = (worker_edit,
             worker_timed_out, worker_stderr)
         # Knobs for the mocked /usr/bin/sandbox-exec backend: devices, verdicts, failures.
@@ -364,7 +392,8 @@ class FakeRun:
             self.exec_calls += 1
             if self.worker_edit:
                 self.worker_edit(Path(cwd), self.exec_calls)
-            stream = json.dumps({"type": "turn.completed", "model": lw.EXPECTED_ALIAS,
+            stream = json.dumps({"type": "turn.completed",
+                                 "model": self.routed_model or worker_model(argv),
                                  "usage": {"input_tokens": 11, "output_tokens": 7}})
             return result(argv, self.worker_rc, stream + "\n", self.worker_stderr,
                           timed_out=self.worker_timed_out)

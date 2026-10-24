@@ -1,11 +1,9 @@
-"""Task contract validation, loopback/model pinning, environment isolation, argv policy."""
+"""Task contract validation, environment isolation, argv policy for the discovered model."""
 import json
 import os
 import sys
 import tempfile
 import unittest
-import urllib.error
-import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -14,15 +12,6 @@ import support as sp  # noqa: E402
 
 lw = sp.lw
 TMP = tempfile.gettempdir()
-
-
-def fake_opener(outcome):
-    opener = mock.MagicMock()
-    if isinstance(outcome, Exception):
-        opener.open.side_effect = outcome
-    else:
-        opener.open.return_value.__enter__.return_value.read.return_value = outcome.encode()
-    return opener
 
 
 class Contract(unittest.TestCase):
@@ -76,87 +65,12 @@ class Contract(unittest.TestCase):
                 self.assertEqual(lw.is_allowed(path, task.allowed_paths), allowed)
 
 
-class EndpointAndModels(unittest.TestCase):
-    def test_only_the_literal_loopback_endpoint_is_accepted(self):
-        for value in (lw.ENDPOINT, lw.ENDPOINT + "/"):
-            self.assertEqual(lw.validate_endpoint(value), lw.ENDPOINT)
-        for value in ("https://127.0.0.1:8000/v1", "http://localhost:8000/v1",
-                      "http://127.0.0.1:8001/v1", "http://0.0.0.0:8000/v1",
-                      "http://evil.example/v1", "http://127.0.0.1:8000/v1/x",
-                      "http://127.0.0.1:8000/v1 ; curl evil", "", None, 8000):
-            with self.subTest(value=value):
-                with self.assertRaises(lw.PreflightError):
-                    lw.validate_endpoint(value)
-        with self.assertRaises(lw.PreflightError):
-            lw.fetch_model_ids("http://evil.example/v1", "k", opener=fake_opener("{}"))
-
-    def test_model_list_no_proxy_no_redirect_and_honest_errors(self):
-        with mock.patch.dict(os.environ, {"HTTP_PROXY": "http://corp:3128"}):
-            self.assertFalse(any(isinstance(h, urllib.request.ProxyHandler) and h.proxies
-                                 for h in lw.build_opener().handlers))
-        self.assertIsNone(lw.RefuseRedirects().redirect_request(None, None, 302, "", None,
-                                                                "http://evil.example"))
-        opener = fake_opener(json.dumps({"data": [{"id": "a"}, {"id": "b"}, {"id": 3}]}))
-        self.assertEqual(lw.fetch_model_ids(lw.ENDPOINT, "key-1", opener=opener), ["a", "b"])
-        self.assertEqual(opener.open.call_args[0][0].get_header("Authorization"), "Bearer key-1")
-        for outcome, hint in (("not json", "did not return JSON"), ('{"nope": 1}', "no 'data' list"),
-                              (urllib.error.HTTPError(lw.ENDPOINT, 401, "no", None, None), "HTTP 401"),
-                              (OSError("refused"), "is oMLX running")):
-            with self.subTest(hint=hint), self.assertRaises(lw.PreflightError) as ctx:
-                lw.fetch_model_ids(lw.ENDPOINT, "k", opener=fake_opener(outcome))
-            self.assertIn(hint, str(ctx.exception))
-
-
-class ModelPinning(unittest.TestCase):
-    def setUp(self):
-        self.root = sp.tmpdir()
-        self.addCleanup(sp.cleanup, self.root)
-        self.settings, self.model_settings = sp.write_legacy_settings(self.root)
-
-    def preflight(self, list_models=sp.models_available):
-        return lw.run_preflight(settings_path=self.settings,
-                                model_settings_path=self.model_settings, list_models=list_models)
-
-    def break_setting(self, path, change):
-        data = json.loads(path.read_text())
-        change(data)
-        path.write_text(json.dumps(data))
-
-    def test_key_fallback_alias_and_availability_are_verified(self):
-        self.assertEqual(lw.read_api_key(self.settings), sp.SECRET)
-        self.assertIs(lw.read_model_fallback(self.settings), False)
-        self.assertEqual(lw.read_model_alias(self.model_settings), lw.EXPECTED_ALIAS)
-        evidence = self.preflight()
-        self.assertEqual(evidence["api_model"], lw.EXPECTED_ALIAS)
-        self.assertEqual(evidence["model_fallback"], False)
-        self.assertNotIn(sp.SECRET, json.dumps(evidence))
-        with self.assertRaises(lw.PreflightError) as ctx:      # exact model not loaded
-            self.preflight(list_models=sp.models_missing)
-        self.assertIn(lw.EXPECTED_ALIAS, str(ctx.exception))
-        self.assertIn("fallback", str(ctx.exception))
-        self.settings.unlink()                                  # missing settings file
-        with self.assertRaises(lw.PreflightError):
-            self.preflight()
-
-    def test_every_pinning_rule_refuses_the_launch(self):
-        model = lw.CANONICAL_MODEL
-        rules = [(self.settings, lambda d: d["model"].update({"model_fallback": True})),
-                 (self.settings, lambda d: d["server"].update({"host": "0.0.0.0"})),
-                 (self.settings, lambda d: d.pop("auth")),
-                 (self.model_settings, lambda d: d["models"][model].update({"model_alias": "gpt"})),
-                 (self.model_settings, lambda d: d["models"][model].pop("model_alias")),
-                 (self.model_settings, lambda d: d["models"].pop(model))]
-        for index, (path, change) in enumerate(rules):
-            self.break_setting(path, change)
-            with self.subTest(rule=index):
-                with self.assertRaises(lw.PreflightError):
-                    self.preflight()
-            sp.write_legacy_settings(self.root)
-
-
 class EnvironmentAndArgv(unittest.TestCase):
     def setUp(self):
-        self.argv = lw.worker_argv("codex", Path("/wt"), lw.EXPECTED_ALIAS, Path("/r/last.txt"))
+        self.profile = sp.discovered_profile()
+        self.window = self.profile.model.context_window
+        self.argv = lw.worker_argv("codex", Path("/wt"), self.profile, self.window,
+                                   Path("/r/last.txt"))
         self.task = lw.Task.from_payload(sp.task_payload(TMP))
 
     def test_cloud_credentials_and_proxies_never_reach_the_worker(self):
@@ -175,14 +89,14 @@ class EnvironmentAndArgv(unittest.TestCase):
         self.assertEqual(lw.redact("key=sk-cloud tail", ["sk-cloud"]), "key=[REDACTED] tail")
 
     def test_worker_and_sandbox_argv_are_pinned_and_self_checked(self):
-        self.assertEqual(lw.missing_config_pins(self.argv), [])
-        lw._policy_check(self.argv)
+        self.assertEqual(lw.missing_config_pins(self.argv, self.profile, self.window), [])
+        lw._policy_check(self.argv, self.profile, self.window)
         self.assertIn("--ignore-user-config", self.argv)
         self.assertIn("--ignore-rules", self.argv)
         self.assertEqual(self.argv[self.argv.index("-s") + 1], "danger-full-access")
         self.assertIn("-c", self.argv)
         self.assertIn('sandbox_mode="danger-full-access"', self.argv)
-        self.assertEqual(self.argv[self.argv.index("-m") + 1], lw.EXPECTED_ALIAS)
+        self.assertEqual(self.argv[self.argv.index("-m") + 1], self.profile.model.api_model)
         self.assertEqual(self.argv[-2:], ["--", "-"])
         self.assertIn(lw.API_KEY_ENV, json.dumps(self.argv))       # key by env name only
         self.assertNotIn(sp.SECRET, json.dumps(self.argv))
@@ -194,7 +108,8 @@ class EnvironmentAndArgv(unittest.TestCase):
         self.assertNotIn("/bin/sh", wrapped)
 
     def test_any_policy_drift_is_a_refusal(self):
-        variants = [[i.replace(lw.ENDPOINT, "https://api.openai.com/v1") for i in self.argv],
+        endpoint = lw.profile_endpoint(self.profile)
+        variants = [[i.replace(endpoint, "https://api.openai.com/v1") for i in self.argv],
                     [i for i in self.argv if not i.endswith("request_max_retries=0")],
                     [i.replace('"never"', '"on-request"') for i in self.argv],
                     [i.replace('"danger-full-access"', '"workspace-write"') for i in self.argv],
@@ -202,9 +117,9 @@ class EnvironmentAndArgv(unittest.TestCase):
                     [i.replace('inherit="core"', 'inherit="all"') for i in self.argv]]
         for index, argv in enumerate(variants):
             with self.subTest(variant=index):
-                self.assertTrue(lw.missing_config_pins(argv))
+                self.assertTrue(lw.missing_config_pins(argv, self.profile, self.window))
                 with self.assertRaises(lw.BlockedError):
-                    lw._policy_check(argv)
+                    lw._policy_check(argv, self.profile, self.window)
 
     def test_unavailable_sandbox_and_short_budget_block_never_run_unsandboxed(self):
         for probe_ok, expected in ((True, "passed"), (False, "blocked")):

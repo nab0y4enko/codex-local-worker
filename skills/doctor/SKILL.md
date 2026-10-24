@@ -46,13 +46,13 @@ model-endpoint request only by delegating to the packaged launcher:
 ```
 
 `endpoint_passed` is `true` only when that launcher exited 0 inside the timeout with a well-formed
-success *receipt*: a JSON object with nonempty `endpoint`, `canonical_model` and `api_model`,
-`model_fallback` exactly `false`, and a `served_models` list that actually contains `api_model`.
+success *receipt*: a JSON object with a nonempty `endpoint`, `profile.model.api_model` present,
+`model_fallback` exactly `false`, and a positive integer `context_window`.
 Arbitrary JSON is not a receipt - a JSON list or string, a blocked or partial object, fallback
-enabled, or a model that was never served - and neither is silence: any of those names the concrete
+enabled, or no discovered model - and neither is silence: any of those names the concrete
 reason in `preflight.reason` and exits nonzero, so an absent, silent or unconvincing launcher is never
-reported as a passing endpoint. When it does pass it confirms the pinned alias, loopback endpoint,
-availability, and disabled fallback. It is the only step that contacts the server, and it qualifies
+reported as a passing endpoint. When it does pass it confirms the discovered model, loopback
+endpoint, context window, and disabled fallback. It is the only step that contacts the server, and it qualifies
 model routing only — never the native toolchain, simulator, or dependency cache.
 
 ## Reporting

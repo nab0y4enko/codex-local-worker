@@ -14,6 +14,7 @@ import sys
 import threading
 import traceback
 import unittest
+import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
@@ -714,6 +715,16 @@ class HttpFetchBehaviour(DiscoveryCase):
         self.assertEqual(ctx.exception.code, "server_unreachable")
         self.assertIn("redirect", str(ctx.exception))
         self.assertEqual([path for _, path, _ in stub.requests], ["/health"])
+
+    def test_the_opener_disables_proxies_and_refuses_redirects(self):
+        opener = d.build_opener()
+        self.assertFalse(any(isinstance(h, urllib.request.ProxyHandler) and h.proxies
+                             for h in opener.handlers))
+        with mock.patch.dict(os.environ, {"HTTP_PROXY": "http://corp:3128"}):
+            self.assertFalse(any(isinstance(h, urllib.request.ProxyHandler) and h.proxies
+                                 for h in d.build_opener().handlers))
+        self.assertIsNone(d._RefuseRedirects().redirect_request(
+            None, None, 302, "", None, "http://evil.example"))
 
     def test_environment_proxies_are_ignored(self):
         stub, settings = self.serve({("GET", "/health"): (200, {"status": "healthy"}, {})})

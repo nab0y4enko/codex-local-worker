@@ -189,10 +189,9 @@ class NativeGateIntegrationTests(unittest.TestCase):
         with self.injected(), contextlib.redirect_stdout(output):
             status = lw.main(['run', '--task-file', str(task), '--state-dir',
                 str(self.options.state_dir), '--settings', str(self.options.settings_path),
-                '--model-settings', str(self.options.model_settings_path), '--codex-bin',
-                sys.executable, '--apple-simulator-udid', sp.APPLE_UDID,
+                '--codex-bin', sys.executable, '--apple-simulator-udid', sp.APPLE_UDID,
                 '--native-preflight-plan', str(self.plan), '--preflight-only', '--json'],
-                list_models=sp.models_available)
+                omlx_fetch=sp.FakeOmlx('one'))
         self.assertEqual(status, 0, output.getvalue())
         self.assertEqual(json.loads(output.getvalue())['status'], 'ready')
         self.assertEqual(self.fake.exec_calls, 0)

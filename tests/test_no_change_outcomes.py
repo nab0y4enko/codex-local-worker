@@ -27,7 +27,7 @@ ATTEMPT = {"attempt": 1, "returncode": 0, "timed_out": False, "model_routing": "
 
 def report(**overrides):
     base = {"status": "worker_failed", "attempts": [dict(ATTEMPT)], "tests": PASSED,
-            "violations": [], "primary_unchanged": True, "api_model": lw.EXPECTED_ALIAS,
+            "violations": [], "primary_unchanged": True, "api_model": sp.MODEL,
             "budget": {"exceeded": False}, "worker_patch_present": False}
     base.update(overrides)
     return base
@@ -185,13 +185,12 @@ class RunJobOutcome(unittest.TestCase):
 
     def task_options(self, tag, allowed=("add.py",), max_attempts=1):
         """Options for a contract that also allows the file verification itself writes."""
-        settings, model_settings = sp.write_legacy_settings(self.root / ("omlx-" + tag))
+        settings = sp.write_settings(self.root / ("omlx-" + tag) / "settings.json")
         task = lw.Task.from_payload(sp.task_payload(self.repo, allowed_paths=list(allowed),
                                                     max_attempts=max_attempts))
         return lw.JobOptions(task=task, state_dir=self.root / ("state-" + tag),
                              codex_bin="codex-mock", settings_path=settings,
-                             model_settings_path=model_settings,
-                             list_models=sp.models_available, verify=True)
+                             omlx_fetch=sp.FakeOmlx("one"), verify=True)
 
     def test_worker_patch_that_verification_reverts_is_no_changes(self):
         report = self.run_job(VerifierActs(reverts=True, worker_edit=self.fix))

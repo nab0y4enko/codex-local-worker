@@ -123,7 +123,8 @@ class FakeAppServer(unittest.TestCase):
                "TASK_MCP_TOKEN": TOKEN, lw.API_KEY_ENV: MODEL_KEY, "CODEX_HOME": str(self.root)}
         loaded = self.loaded(tools)
         result = probe.probe_tools(loaded, codex_bin=str(script), env=env,
-                                   overrides=lw.config_overrides("fake-alias"),
+                                   overrides=lw.config_overrides(sp.discovered_profile(),
+                                                                 sp.MODEL_WINDOW),
                                    deadline=lw.Deadline(seconds), report_dir=self.report)
         return loaded, result
 

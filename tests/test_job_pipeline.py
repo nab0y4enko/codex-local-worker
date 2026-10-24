@@ -17,12 +17,12 @@ PASSED = [{"status": "passed", "command": ["python3"], "sandboxed": True}]
 BLOCKED = [{"status": "blocked", "command": ["python3"], "returncode": None, "reason": "no sandbox"}]
 FAILED = [{"status": "failed", "command": ["python3"], "returncode": 1}]
 ATTEMPT = {"attempt": 1, "returncode": 0, "timed_out": False, "model_routing": "ok",
-           "unsupported_tools": False, "observed_models": [lw.EXPECTED_ALIAS]}
+           "unsupported_tools": False, "observed_models": [sp.MODEL]}
 
 
 def report(**overrides):
     base = {"status": "worker_failed", "attempts": [dict(ATTEMPT)], "tests": PASSED,
-            "violations": [], "primary_unchanged": True, "api_model": lw.EXPECTED_ALIAS,
+            "violations": [], "primary_unchanged": True, "api_model": sp.MODEL,
             "budget": {"exceeded": False}}
     base.update(overrides)
     return base
@@ -248,10 +248,10 @@ class RunJob(unittest.TestCase):
     def test_refusals_are_persisted_and_nothing_is_launched(self):
         fake = sp.FakeRun()
         report = self.run_job(fake, sp.job_options(self.root / "pf", self.repo,
-                                                   list_models=sp.models_missing))
+                                                   omlx=sp.FakeOmlx("none_loaded")))
         self.assertEqual((report["status"], fake.calls, report["worktree"]),
                          ("preflight_failed", [], None))
-        self.assertIn(lw.EXPECTED_ALIAS, json.loads(self.persisted(report))["failure_reason"])
+        self.assertIn(sp.MODEL, json.loads(self.persisted(report))["failure_reason"])
         options = sp.job_options(self.root / "sd", self.repo)
         options.state_dir = self.repo / "state"
         report = lw.run_job(options)

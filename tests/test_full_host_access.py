@@ -46,7 +46,9 @@ class WorkerArgv(unittest.TestCase):
     def setUp(self):
         self.root = sp.tmpdir()
         self.addCleanup(sp.cleanup, self.root)
-        self.argv = lw.worker_argv("codex", self.root, lw.EXPECTED_ALIAS,
+        self.profile = sp.discovered_profile()
+        self.window = self.profile.model.context_window
+        self.argv = lw.worker_argv("codex", self.root, self.profile, self.window,
                                    self.root / "last-message.txt")
         self.overrides = lw.config_overrides_map(self.argv)
 
@@ -61,15 +63,17 @@ class WorkerArgv(unittest.TestCase):
         self.assertEqual(self.overrides["approval_policy"], '"never"')
         self.assertEqual(self.overrides["web_search"], '"disabled"')
         self.assertEqual(lw.CONFIG_PINS["sandbox_mode"], '"danger-full-access"')
-        self.assertEqual(lw.missing_config_pins(self.argv), [])
-        lw._policy_check(self.argv)
+        self.assertEqual(lw.missing_config_pins(self.argv, self.profile, self.window), [])
+        lw._policy_check(self.argv, self.profile, self.window)
 
     def test_local_worker_routing_and_no_fallback_pins_are_unchanged(self):
         provider = f"model_providers.{lw.PROVIDER_ID}"
-        self.assertEqual(self.argv[self.argv.index("-m") + 1], lw.EXPECTED_ALIAS)
-        self.assertEqual(self.overrides["model"], f'"{lw.EXPECTED_ALIAS}"')
+        alias = self.profile.model.api_model
+        self.assertEqual(self.argv[self.argv.index("-m") + 1], alias)
+        self.assertEqual(self.overrides["model"], f'"{alias}"')
         self.assertEqual(self.overrides["model_provider"], f'"{lw.PROVIDER_ID}"')
-        self.assertEqual(self.overrides[f"{provider}.base_url"], f'"{lw.ENDPOINT}"')
+        self.assertEqual(self.overrides[f"{provider}.base_url"],
+                         f'"{lw.profile_endpoint(self.profile)}"')
         self.assertEqual(self.overrides[f"{provider}.env_key"], f'"{lw.API_KEY_ENV}"')
         self.assertEqual(self.overrides[f"{provider}.request_max_retries"], "0")
         self.assertEqual(self.overrides[f"{provider}.stream_max_retries"], "0")
@@ -80,7 +84,7 @@ class WorkerArgv(unittest.TestCase):
     def test_sandboxed_worker_argv_is_now_a_policy_violation(self):
         drifted = [item.replace("danger-full-access", "workspace-write") for item in self.argv]
         with self.assertRaises(lw.BlockedError):
-            lw._policy_check(drifted)
+            lw._policy_check(drifted, self.profile, self.window)
 
     def test_git_and_audit_policies_are_preserved(self):
         self.assertIn("core.hooksPath=/dev/null", lw.GIT_GLOBAL_ARGS)

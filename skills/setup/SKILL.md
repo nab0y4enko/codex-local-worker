@@ -105,9 +105,9 @@ apply; `6` is a failed explicit `--preflight`; `7` is a nonempty or uninspectabl
 the model server, and it is delegated entirely to the packaged launcher
 `<root>/bin/local-worker preflight` instead of issuing a request of its own. `endpoint_passed` is
 `true` only when that launcher exits 0 inside the timeout with a complete success receipt: a JSON
-object with nonempty `endpoint`, `canonical_model` and `api_model`, `model_fallback` exactly `false`,
-and a `served_models` list that contains `api_model`. Any other output - no JSON, a JSON list or
-string, a blocked or partial object, fallback enabled, or a model that is not actually served - is
+object with a nonempty `endpoint`, `profile.model.api_model` present, `model_fallback` exactly
+`false`, and a positive integer `context_window`. Any other output - no JSON, a JSON list or
+string, a blocked or partial object, fallback enabled, or no discovered model - is
 reported as failed with the concrete reason in `preflight.reason`, never as an endpoint claim; the
 launcher's own values are redacted rather than echoed, and `stdout_parsed` says whether JSON was
 decoded at all. Routing policy stays inside the launcher: this checks the receipt it delegated, it
@@ -116,14 +116,13 @@ does not re-issue a request. Never report a passing endpoint without that field 
 ## Prerequisites (reported, not installed)
 
 - macOS with `python3` (stdlib only), `git`, and the Codex CLI on `PATH`.
-- oMLX serving an OpenAI-compatible endpoint on `http://127.0.0.1:8000/v1` only, with
-  `~/.omlx/settings.json` carrying `auth.api_key`, loopback `server.host`/`server.port` on `8000`,
-  and `model.model_fallback: false`.
-- `~/.omlx/model_settings.json` mapping the canonical model to its alias: by default
-  `Qwen3.8-Flash-Next-UD-Q4_K_XL` to `qwen-3.8-nf-splash`. For another model, set
-  `LOCAL_WORKER_CANONICAL_MODEL` and `LOCAL_WORKER_API_MODEL` (the model's own id for both
-  when oMLX has no alias for it) and, when the server caps context lower,
-  `LOCAL_WORKER_CONTEXT_WINDOW`; `--preflight` inherits them.
+- oMLX serving an OpenAI-compatible endpoint on a loopback address only, with
+  `~/.omlx/settings.json` carrying `auth.api_key`, a loopback `server.host` (and `server.port`,
+  which falls back to oMLX's own default only when omitted), and `model.model_fallback: false`.
+- A chat model loaded in oMLX. The launcher discovers it, and its real per-model context window,
+  from the live server; nothing is configured by environment variable. oMLX's
+  `sampling.max_context_window` setting is only a fallback default, not a cap. When several chat
+  models are loaded, `bin/local-worker preflight --model <id-or-alias>` names the one to use.
 - Xcode and a booted simulator only for native Apple jobs; nothing in this plugin needs them to
   install.
 

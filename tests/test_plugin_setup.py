@@ -32,14 +32,13 @@ PACKAGE_KEYS = ("canonical_policy", "launcher", "launcher_skill", "setup_script"
 
 # The exact success receipt `bin/local-worker preflight` prints; nothing else may pass.
 RECEIPT = {"endpoint": "http://127.0.0.1:8000/v1",
-           "canonical_model": "Qwen3.8-Flash-Next-UD-Q4_K_XL",
-           "api_model": "qwen-3.8-nf-splash",
+           "profile": {"base_url": "http://127.0.0.1:8000", "version": "0.0.0-test",
+                       "model": {"canonical_id": "Example-Model-4bit",
+                                 "api_model": "Example-Model-4bit",
+                                 "model_type": "llm", "context_window": 32768}},
+           "context_window": 32768,
            "model_fallback": False,
-           "api_key": SENTINEL,
-           "models_endpoint": "http://127.0.0.1:8000/v1/models",
-           "served_models": ["gpt-oss-120b", "qwen-3.8-nf-splash"],
-           "proxies": "disabled",
-           "redirects": "refused"}
+           "api_key": SENTINEL}
 
 
 def launcher_script(payload, returncode, before=""):
@@ -507,17 +506,32 @@ class PreflightReceiptTest(SetupCase):
     """Endpoint claims only exist when the packaged launcher actually answered."""
 
     def test_zero_exit_without_a_complete_success_receipt_is_not_an_endpoint_pass(self):
-        incomplete = {key: value for key, value in RECEIPT.items() if key != "api_model"}
+        no_endpoint = {key: value for key, value in RECEIPT.items() if key != "endpoint"}
+        no_window = {key: value for key, value in RECEIPT.items() if key != "context_window"}
         cases = [("json list", []),
                  ("json string", "ready"),
                  ("blocked object", {"status": "blocked", "reason": "model not loaded"}),
                  ("empty object", {}),
                  ("fallback enabled", dict(RECEIPT, model_fallback=True)),
                  ("fallback as text", dict(RECEIPT, model_fallback="false")),
-                 ("missing api_model", incomplete),
+                 ("missing endpoint", no_endpoint),
                  ("blank endpoint", dict(RECEIPT, endpoint="   ")),
-                 ("model not served", dict(RECEIPT, served_models=["gpt-oss-120b"])),
-                 ("served_models not a list", dict(RECEIPT, served_models="qwen-3.8-nf-splash"))]
+                 ("missing profile", {k: v for k, v in RECEIPT.items() if k != "profile"}),
+                 ("profile not an object", dict(RECEIPT, profile="Example-Model-4bit")),
+                 ("profile without model", dict(RECEIPT, profile={"base_url": "http://x"})),
+                 ("model without api_model",
+                  dict(RECEIPT, profile={"model": {"canonical_id": "Example-Model-4bit"}})),
+                 ("blank api_model", dict(RECEIPT, profile={"model": {"api_model": " "}})),
+                 ("api_model not a string", dict(RECEIPT, profile={"model": {"api_model": 7}})),
+                 ("missing context_window", no_window),
+                 ("zero context_window", dict(RECEIPT, context_window=0)),
+                 ("negative context_window", dict(RECEIPT, context_window=-1)),
+                 ("context_window as text", dict(RECEIPT, context_window="32768")),
+                 ("context_window as bool", dict(RECEIPT, context_window=True)),
+                 ("context_window as float", dict(RECEIPT, context_window=32768.0)),
+                 ("v1 receipt", {"endpoint": "http://127.0.0.1:8000/v1", "canonical_model": "x",
+                                 "api_model": "x", "model_fallback": False,
+                                 "served_models": ["x"]})]
         for label, payload in cases:
             with self.subTest(case=label):
                 self.fake_launcher(payload)
@@ -644,8 +658,7 @@ class PreflightTest(SetupCase):
 
     def test_successful_preflight_delegates_and_sanitizes_the_report(self):
         self.fake_launcher(dict(RECEIPT, message="model ready token=" + SENTINEL,
-                                nested={"Authorization": "Bearer " + SENTINEL, "model": "qwen"},
-                                profile="Qwen3.8-Flash-Next-UD-Q4_K_XL"))
+                                nested={"Authorization": "Bearer " + SENTINEL, "model": "m"}))
         started = time.time()
         code, report, output = self.invoke(["--check", "--preflight"])
         self.assertLess(time.time() - started, 60)
@@ -668,7 +681,8 @@ class PreflightTest(SetupCase):
         self.assertNotIn(SENTINEL, detail["message"])
         self.assertIn("<redacted>", detail["message"])
         self.assertIs(detail["model_fallback"], False)
-        self.assertIn(RECEIPT["api_model"], detail["served_models"])
+        self.assertEqual(detail["profile"]["model"]["api_model"], "Example-Model-4bit")
+        self.assertEqual(detail["context_window"], 32768)
         self.assertIn("receipt", preflight["reason"])
 
     def test_failing_preflight_is_nonzero_and_never_claims_the_endpoint(self):

@@ -2,7 +2,7 @@
 
 Nothing here talks to a model or to a server: the worker and the sandbox probe are
 stand-ins for inference (``support.FakeRun``), every git call is a real disposable
-repository, and the model list is a stubbed callable.
+repository, and oMLX discovery is a recorded fake (``support.FakeOmlx``).
 """
 import json
 import os
@@ -27,7 +27,7 @@ class StatusDecision(unittest.TestCase):
 
     def report(self, **overrides):
         report = {"status": "worker_failed", "attempts": [dict(self.attempt)], "tests": self.passed,
-                  "violations": [], "primary_unchanged": True, "api_model": lw.EXPECTED_ALIAS,
+                  "violations": [], "primary_unchanged": True, "api_model": sp.MODEL,
                   "budget": {"exceeded": False}}
         report.update(overrides)
         return report
@@ -162,11 +162,11 @@ class RunJob(unittest.TestCase):
     def test_successful_run_reports_preflight_evidence_without_the_key(self):
         report = self.run_job(sp.FakeRun(worker_edit=self.fix))
         preflight = report["preflight"]
-        self.assertEqual(preflight["endpoint"], lw.ENDPOINT)
-        self.assertEqual(preflight["api_model"], lw.EXPECTED_ALIAS)
-        self.assertEqual(preflight["canonical_model"], lw.CANONICAL_MODEL)
+        self.assertEqual(preflight["endpoint"], "http://127.0.0.1:8000/v1")
+        self.assertEqual(preflight["profile"]["model"]["api_model"], sp.MODEL)
+        self.assertEqual(preflight["profile"]["model"]["canonical_id"], sp.MODEL)
+        self.assertEqual(preflight["context_window"], sp.MODEL_WINDOW)
         self.assertIs(preflight["model_fallback"], False)
-        self.assertIn(lw.EXPECTED_ALIAS, preflight["served_models"])
         self.assertNotIn(sp.SECRET, json.dumps(preflight))
         self.assertNotIn(sp.SECRET, str(report["logs"]))
         self.assertEqual(report["sandbox"]["backend"], lw.FULL_HOST_BACKEND)
@@ -202,13 +202,13 @@ class RunJob(unittest.TestCase):
         self.assertIn("outside allowed_paths", report["failure_reason"])
 
     def test_failed_preflight_still_persists_a_report_and_launches_nothing(self):
-        options = sp.job_options(self.root / "pf", self.repo, list_models=sp.models_missing)
+        options = sp.job_options(self.root / "pf", self.repo, omlx=sp.FakeOmlx("none_loaded"))
         fake = sp.FakeRun()
         report = self.run_job(fake, options)
         self.assertEqual(report["status"], "preflight_failed")
         self.assertIsNone(report["worktree"])
         self.assertEqual(fake.calls, [])
-        self.assertIn(lw.EXPECTED_ALIAS, json.loads(self.report_json(report))["failure_reason"])
+        self.assertIn(sp.MODEL, json.loads(self.report_json(report))["failure_reason"])
 
     def test_state_dir_inside_the_repository_is_refused(self):
         options = sp.job_options(self.root, self.repo)

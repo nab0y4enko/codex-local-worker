@@ -10,7 +10,7 @@ import support as sp  # noqa: E402
 lw = sp.lw
 
 PHRASE = "unsupported tool"
-CLEAN = {"model": lw.EXPECTED_ALIAS, "type": "token_count",
+CLEAN = {"model": sp.MODEL, "type": "token_count",
          "usage": {"input_tokens": 11, "output_tokens": 7}}
 READER_SOURCE = ('UNSUPPORTED_RE = re.compile(r"unsupported (?:tool|function)"\n'
                  '        if evidence["unsupported_tools"]:\n')
@@ -45,7 +45,7 @@ class UnsupportedToolEvidence(unittest.TestCase):
         parsed = reading_stream()
         self.assertFalse(parsed["unsupported_tools"])
         self.assertEqual(parsed["tool_call_events"], 1)
-        self.assertEqual(parsed["observed_models"], [lw.EXPECTED_ALIAS])
+        self.assertEqual(parsed["observed_models"], [sp.MODEL])
         self.assertEqual(parsed["token_counts"], {"input_tokens": 11, "output_tokens": 7})
 
     def test_failing_command_output_that_quotes_the_phrase_is_not_a_failure(self):
@@ -73,7 +73,7 @@ class UnsupportedToolEvidence(unittest.TestCase):
         parsed = lw.parse_worker_log(stream(CLEAN, "note: source contains unsupported tool text",
                                             raw_command))
         self.assertFalse(parsed["unsupported_tools"])
-        self.assertEqual(parsed["observed_models"], [lw.EXPECTED_ALIAS])
+        self.assertEqual(parsed["observed_models"], [sp.MODEL])
 
     def test_structured_tool_error_events_fail_closed(self):
         variants = (
@@ -87,7 +87,7 @@ class UnsupportedToolEvidence(unittest.TestCase):
             with self.subTest(variant=index):
                 parsed = evidence(CLEAN, event)
                 self.assertTrue(parsed["unsupported_tools"])
-                self.assertEqual(parsed["observed_models"], [lw.EXPECTED_ALIAS])
+                self.assertEqual(parsed["observed_models"], [sp.MODEL])
 
     def test_failed_tool_result_errors_fail_closed(self):
         variants = (
@@ -112,12 +112,12 @@ class UnsupportedToolEvidence(unittest.TestCase):
             with self.subTest(line=line):
                 parsed = lw.parse_worker_log(stream(CLEAN, line))
                 self.assertTrue(parsed["unsupported_tools"])
-                self.assertEqual(parsed["observed_models"], [lw.EXPECTED_ALIAS])
+                self.assertEqual(parsed["observed_models"], [sp.MODEL])
 
     def test_malformed_json_never_breaks_evidence_and_fails_closed_on_errors(self):
         truncated_error = '{"type":"error","message":"unsupported tool \'web_search\''
         parsed = lw.parse_worker_log(stream(CLEAN, truncated_error))
-        self.assertEqual(parsed["observed_models"], [lw.EXPECTED_ALIAS])
+        self.assertEqual(parsed["observed_models"], [sp.MODEL])
         self.assertEqual(parsed["token_counts"], {"input_tokens": 11, "output_tokens": 7})
         self.assertTrue(parsed["unsupported_tools"])
 
@@ -134,9 +134,9 @@ class UnsupportedToolEvidence(unittest.TestCase):
         parsed = reading_stream({"type": "function_call", "name": "read_file"})
         self.assertEqual(parsed["tool_call_events"], 2)
         self.assertEqual(parsed["token_counts"], {"input_tokens": 11, "output_tokens": 7})
-        self.assertEqual(lw.model_routing(parsed, lw.EXPECTED_ALIAS), "ok")
-        self.assertEqual(lw.model_routing({"observed_models": []}, lw.EXPECTED_ALIAS), "absent")
-        self.assertEqual(lw.model_routing({"observed_models": ["gpt-5"]}, lw.EXPECTED_ALIAS),
+        self.assertEqual(lw.model_routing(parsed, sp.MODEL), "ok")
+        self.assertEqual(lw.model_routing({"observed_models": []}, sp.MODEL), "absent")
+        self.assertEqual(lw.model_routing({"observed_models": ["gpt-5"]}, sp.MODEL),
                          "mismatch")
 
 

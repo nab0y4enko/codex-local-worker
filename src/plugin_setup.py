@@ -84,7 +84,6 @@ EXIT_OVERRIDE = 7
 PREFLIGHT_COMMAND = ("bin", "local-worker")
 PREFLIGHT_ARGS = ("preflight",)
 DEFAULT_PREFLIGHT_TIMEOUT = 60.0
-RECEIPT_STRING_FIELDS = ("endpoint", "canonical_model", "api_model")
 AGENTS_OVERRIDE_FILENAME = "AGENTS.override.md"
 
 SECRET_KEY_TOKENS = ("key", "token", "secret", "password", "passwd", "credential",
@@ -513,24 +512,28 @@ def sanitize(value, depth=0):
 def receipt_issue(parsed):
     """Why delegated output is not a launcher success receipt; `None` when it is one.
 
-    This checks only the shape of the receipt the launcher emits on success (endpoint, canonical
-    and API model, fallback disabled, model actually served). Routing policy stays in the launcher;
-    without this check any parsed JSON - `[]`, or a blocked report - would become an endpoint claim.
-    Launcher-supplied values are never echoed into the reason, so nothing secret can ride along.
+    This checks only the shape of the receipt the launcher emits on success (endpoint, the
+    discovered model's API name under `profile.model`, fallback disabled, a positive context
+    window). Discovery and routing policy stay in the launcher; without this check any parsed
+    JSON - `[]`, or a blocked report - would become an endpoint claim. Launcher-supplied values
+    are never echoed into the reason, so nothing secret can ride along.
     """
     if not isinstance(parsed, dict):
         return "output is %s, not the JSON object of a launcher receipt" % type(parsed).__name__
-    for field in RECEIPT_STRING_FIELDS:
-        value = parsed.get(field)
-        if not isinstance(value, str) or not value.strip():
-            return "%s is missing or not a nonempty string" % field
+    endpoint = parsed.get("endpoint")
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        return "endpoint is missing or not a nonempty string"
+    profile = parsed.get("profile")
+    model = profile.get("model") if isinstance(profile, dict) else None
+    api_model = model.get("api_model") if isinstance(model, dict) else None
+    if not isinstance(api_model, str) or not api_model.strip():
+        return "profile.model.api_model is missing or not a nonempty string"
     if parsed.get("model_fallback") is not False:
-        return "model_fallback is not exactly false, so the served model is not proven canonical"
-    served = parsed.get("served_models")
-    if not isinstance(served, list):
-        return "served_models is missing or not a list"
-    if parsed.get("api_model") not in served:
-        return "served_models does not contain the receipt's api_model"
+        return "model_fallback is not exactly false, so the served model is not proven to be " \
+               "the pinned one"
+    window = parsed.get("context_window")
+    if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+        return "context_window is missing or not a positive integer"
     return None
 
 

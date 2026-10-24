@@ -15,7 +15,7 @@ import support as sp  # noqa: E402
 
 lw = sp.lw
 obs = lw.observation
-ALIAS = lw.EXPECTED_ALIAS
+ALIAS = sp.MODEL
 OTHER = "some-other-model"
 CLEAN = {"model": ALIAS, "type": "token_count",
          "usage": {"input_tokens": 11, "output_tokens": 7}}
