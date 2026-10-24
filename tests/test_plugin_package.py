@@ -16,9 +16,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_ID = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
-PLUGIN_NAME = "local-qwen"
-PLUGIN_VERSION = "0.1.0"
-MARKETPLACE_NAME = "local-qwen-tools"
+PLUGIN_NAME = "codex-local-worker"
+PLUGIN_VERSION = "0.2.0"
+MARKETPLACE_NAME = "codex-local-worker"
 ONBOARDING = "./skills/setup/SKILL.md"
 
 # Closed portable manifest: anything else at top level is a schema violation.
@@ -26,18 +26,18 @@ MANIFEST_FIELDS = {"$schema", "name", "version", "description", "author", "homep
                    "repository", "license", "keywords", "extensions"}
 NAME_PATTERN = re.compile(r"^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
 
-LAUNCHER_FILES = ["bin/local-implement", "src/local_worker.py", "src/run_policy.py",
+LAUNCHER_FILES = ["bin/local-worker", "src/local_worker.py", "src/run_policy.py",
                   "src/worker_pool.py", "src/native_readiness.py", "src/worker_observability.py",
                   "src/apple_verification.py", "examples/task.json"]
-SKILL_NAMES = {"local-implement", "setup", "doctor"}
+SKILL_NAMES = {"local-worker", "setup", "doctor"}
 PERSONAL = re.compile(r"oleksii|/Users/", re.IGNORECASE)
 ACTIVE_INSTRUCTIONS = ["plugin.json", ".agents/plugins/marketplace.json", "README.md",
-                       "skills/local-implement/SKILL.md",
-                       "skills/local-implement/references/global-policy.md",
+                       "skills/local-worker/SKILL.md",
+                       "skills/local-worker/references/global-policy.md",
                        "skills/setup/SKILL.md", "skills/doctor/SKILL.md"]
 NON_MCP_OR_HOOKS_NAMES = {"mcp.json", ".mcp.json", "hooks.json", "hooks.yaml", "plugin.lock.json"}
-POLICY_ANCHORS = ["Selected planner, local Qwen implementation", "danger-full-access",
-                  "--ignore-rules", "sandboxed: false", "4 LOCAL Qwen workers",
+POLICY_ANCHORS = ["Selected planner, local worker implementation", "danger-full-access",
+                  "--ignore-rules", "sandboxed: false", "4 local workers",
                   "Local-worker exception", "Global completion rule", "exec_command"]
 
 
@@ -119,8 +119,8 @@ class CopiedPackageTest(PackageBase):
 
     @classmethod
     def setUpClass(cls):
-        cls.temp = Path(tempfile.mkdtemp(prefix="Local Qwen Plugin "))
-        cls.root = cls.temp / "installs with spaces" / "local-qwen"
+        cls.temp = Path(tempfile.mkdtemp(prefix="Local Worker Plugin "))
+        cls.root = cls.temp / "installs with spaces" / "codex-local-worker"
         cls.root.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(str(ROOT), str(cls.root), symlinks=False,
                         ignore=shutil.ignore_patterns(".git", "evidence", "__pycache__",
@@ -177,7 +177,7 @@ class CopiedPackageTest(PackageBase):
         interface = client.get("interface")
         self.assertIsInstance(interface, dict)
         self.assertEqual(set(interface), {"displayName", "shortDescription"})
-        self.assertEqual(interface.get("displayName"), "Local Qwen")
+        self.assertEqual(interface.get("displayName"), "Local Worker")
         short = interface.get("shortDescription")
         self.assertTrue(short and len(short) <= 80 and short != interface["displayName"])
         self.assertNotIn("onboardingSkill", interface, "onboardingSkill is not an interface field")
@@ -185,7 +185,7 @@ class CopiedPackageTest(PackageBase):
     def test_marketplace_resolves_the_repository_root(self):
         marketplace = load_json(Path(self.root) / ".agents" / "plugins" / "marketplace.json")
         self.assertEqual(marketplace.get("name"), MARKETPLACE_NAME)
-        self.assertEqual(marketplace["interface"]["displayName"], "Local Qwen Tools")
+        self.assertEqual(marketplace["interface"]["displayName"], "Local Worker Tools")
         entries = marketplace.get("plugins")
         self.assertIsInstance(entries, list)
         self.assertEqual(len(entries), 1)
@@ -223,7 +223,7 @@ class CopiedPackageTest(PackageBase):
         for relative in LAUNCHER_FILES:
             shipped = self.resolve(relative)
             self.assertTrue(shipped.is_file(), "launcher file missing from package: " + relative)
-        shim = Path(self.root) / "bin" / "local-implement"
+        shim = Path(self.root) / "bin" / "local-worker"
         self.assertTrue(os.access(str(shim), os.X_OK), "launcher shim is not executable")
         self.assertIn("src/local_worker.py", shim.read_text(encoding="utf-8"))
 
@@ -261,11 +261,11 @@ class CopiedPackageTest(PackageBase):
             text = (skills / name / "SKILL.md").read_text(encoding="utf-8")
             self.assertIn("<root>", text, "skill must document plugin-root resolution: " + name)
 
-    def test_local_implement_skill_resolves_root_and_packaged_example(self):
-        skill = (Path(self.root) / "skills" / "local-implement" / "SKILL.md")
+    def test_local_worker_skill_resolves_root_and_packaged_example(self):
+        skill = (Path(self.root) / "skills" / "local-worker" / "SKILL.md")
         text = skill.read_text(encoding="utf-8")
-        self.assertIn("<root>/skills/local-implement/SKILL.md", text)
-        self.assertIn("<root>/bin/local-implement", text)
+        self.assertIn("<root>/skills/local-worker/SKILL.md", text)
+        self.assertIn("<root>/bin/local-worker", text)
         self.assertIn("[`examples/task.json`](../../examples/task.json)", text)
         link = re.search(r"\]\((\.\./\.\./examples/task\.json)\)", text).group(1)
         example = self.resolve(link, skill.parent)
@@ -280,16 +280,18 @@ class CopiedPackageTest(PackageBase):
             self.assertTrue(target.is_file(), "skill reference is missing: " + reference)
 
     def test_canonical_global_policy_is_portable_and_faithful(self):
-        policy_path = self.resolve("skills/local-implement/references/global-policy.md")
+        policy_path = self.resolve("skills/local-worker/references/global-policy.md")
         policy = policy_path.read_text(encoding="utf-8")
         for anchor in POLICY_ANCHORS:
             self.assertIn(anchor, policy, "policy anchor missing: " + anchor)
         self.assertIsNone(PERSONAL.search(policy))
-        self.assertIn("<root>/bin/local-implement", policy)
-        self.assertIn("<root>/skills/local-implement/SKILL.md", policy)
+        self.assertIn("<root>/bin/local-worker", policy)
+        self.assertIn("<root>/skills/local-worker/SKILL.md", policy)
         self.assertIn("plugin.json", policy)
-        self.assertIn("bundled local-implement skill", policy)
+        self.assertIn("bundled local-worker skill", policy)
         legacy = (ROOT / "evidence" / "global-default" / "AGENTS.md").read_text(encoding="utf-8")
+        # Immutable migration fixture: the historical file keeps its pre-rename bytes (and the
+        # embedded LEGACY_SHA256 depends on them), so the old path is asserted, not renamed.
         self.assertIn("/Users/oleksii.naboichenko/.codex/skills/local-implement/SKILL.md", legacy,
                       "the historical migration input must stay unchanged")
         moved = 0
@@ -311,7 +313,7 @@ class CopiedPackageTest(PackageBase):
                        "backup"):
             self.assertIn(phrase, setup, "setup must document: " + phrase)
         self.assertIn("python3 <root>/src/plugin_setup.py --check --preflight", doctor)
-        self.assertIn("<root>/bin/local-implement preflight", doctor)
+        self.assertIn("<root>/bin/local-worker preflight", doctor)
         for must_not in ("plugin_setup.py --apply", "install oMLX"):
             self.assertNotIn(must_not, doctor, "doctor must stay read-only: " + must_not)
         self.assertIn("no credentials", setup.lower())
@@ -326,7 +328,7 @@ class CopiedPackageTest(PackageBase):
         self.assertNotRegex(source, r"(?m)^[ \t]*(?:from|import)[ \t]+(?:src\.)?local_worker\b",
                             "setup must not import the launcher engine")
         for phrase in ("--check", "--apply", "--preflight", "CODEX_HOME",
-                       "LOCAL_IMPLEMENT_STATE_DIR", "AGENTS.md"):
+                       "LOCAL_WORKER_STATE_DIR", "AGENTS.md"):
             self.assertIn(phrase, source, "helper must document " + phrase)
         self.assertIn("endpoint_passed", source)
 
@@ -342,9 +344,9 @@ class CopiedPackageTest(PackageBase):
             (directory / "sentinel.txt").write_text("must stay untouched", encoding="utf-8")
         before = (tree(home), tree(state))
         env = {key: value for key, value in os.environ.items()
-               if key not in ("CODEX_HOME", "LOCAL_IMPLEMENT_STATE_DIR",
-                              "LOCAL_IMPLEMENT_CODEX_BIN")}
-        env.update({"CODEX_HOME": str(home), "LOCAL_IMPLEMENT_STATE_DIR": str(state)})
+               if key not in ("CODEX_HOME", "LOCAL_WORKER_STATE_DIR",
+                              "LOCAL_WORKER_CODEX_BIN")}
+        env.update({"CODEX_HOME": str(home), "LOCAL_WORKER_STATE_DIR": str(state)})
         result = subprocess.run([sys.executable, "-I", "-S", str(script), "--check"],
                                 cwd=str(working), env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, universal_newlines=True, timeout=120)
@@ -368,13 +370,13 @@ class CopiedPackageTest(PackageBase):
         self.assertEqual(report["preflight"]["status"], "not-requested")
 
     def test_packaged_launcher_runs_from_the_relocated_path(self):
-        result = subprocess.run([str(Path(self.root) / "bin" / "local-implement"), "--help"],
+        result = subprocess.run([str(Path(self.root) / "bin" / "local-worker"), "--help"],
                                 cwd=str(Path(self.root)), stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, universal_newlines=True, timeout=120,
                                 env={key: value for key, value in os.environ.items()
-                                     if key != "LOCAL_IMPLEMENT_STATE_DIR"})
+                                     if key != "LOCAL_WORKER_STATE_DIR"})
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("usage: local-implement", result.stdout)
+        self.assertIn("usage: local-worker", result.stdout)
         for command in ("run", "status", "preflight"):
             self.assertIn(command, result.stdout)
         self.assertNotIn(str(Path(self.root)), result.stdout)
@@ -392,7 +394,7 @@ class ManifestParityTest(PackageBase):
         self.assertEqual(manifest["name"], PLUGIN_NAME)
         self.assertEqual(manifest["extensions"]["com.openai"]["onboardingSkill"], ONBOARDING)
         self.assertEqual(manifest["extensions"]["com.openai"]["interface"]["displayName"],
-                         "Local Qwen")
+                         "Local Worker")
         self.assertNotIn("com.openai.interface", manifest["extensions"])
         marketplace = load_json(ROOT / ".agents" / "plugins" / "marketplace.json")
         entry = marketplace["plugins"][0]

@@ -1,11 +1,11 @@
 {
-  "name": "local-qwen-tools",
+  "name": "codex-local-worker",
   "interface": {
-    "displayName": "Local Qwen Tools"
+    "displayName": "Local Worker Tools"
   },
   "plugins": [
     {
-      "name": "local-qwen",
+      "name": "codex-local-worker",
       "source": {
         "source": "local",
         "path": "./"

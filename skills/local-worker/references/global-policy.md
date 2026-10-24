@@ -1,6 +1,6 @@
-# Canonical global policy: selected planner, local Qwen implementation
+# Canonical global policy: selected planner, local worker implementation
 
-This is the authoritative user-wide default policy for a new Local Qwen plugin install. Setup
+This is the authoritative user-wide default policy for a new Local Worker plugin install. Setup
 backs up `$CODEX_HOME/AGENTS.md` (default `~/.codex/AGENTS.md`) and idempotently maintains a small
 managed block there that points at this file; the block never rewrites unrelated instructions, and
 an exact copy of the legacy policy is migrated rather than duplicated.
@@ -15,13 +15,13 @@ plugin instead of a per-user copy. Everything else is the user's existing policy
 
 # User-wide Codex defaults
 
-## Selected planner, local Qwen implementation
+## Selected planner, local worker implementation
 
 Apply this default in every project without requiring a skill invocation or a repeated request.
 
 - Keep the model the user selects in the Codex window for planning, investigation, task decomposition, orchestration and review. Do not change the window model or the global default provider to Qwen.
 - Route all implementation, fixes, refactors, code/configuration edits, test authoring and corrections through local Qwen3.8-Flash-Next-UD-Q4_K_XL. Execute project tests through the local worker or the launcher's deterministic full-host verification, run directly on the host with network enabled.
-- Before implementation, read the bundled local-implement skill of the installed Local Qwen plugin and use its launcher. Resolve both from the plugin root: this policy file is <root>/skills/local-implement/references/global-policy.md and the skill is <root>/skills/local-implement/SKILL.md, so the root is three directories above this file (the directory whose plugin.json declares name local-qwen) and the launcher is <root>/bin/local-implement. Never hardcode a personal checkout path or a per-user skill directory: the root moves with every install or update. Do not wait for the user to invoke the skill. Use one shared default state directory. Jobs stay serialized by default (one worker at a time); the reviewed launcher may run up to 4 LOCAL Qwen workers only when each contract is independently scoped and correctly mergeable, through that same shared bounded pool with --max-workers 4: one isolated worktree and one task contract per worker, disjoint allowed_paths or an explicit dependency and merge plan, the primary checkout preserved, and never a cloud worker. The planner reviews every worker patch and combines accepted ones only through a separately scoped local integration contract; keep jobs sequential whenever correct integration or pool capacity is unavailable.
+- Before implementation, read the bundled local-worker skill of the installed Local Worker plugin and use its launcher. Resolve both from the plugin root: this policy file is <root>/skills/local-worker/references/global-policy.md and the skill is <root>/skills/local-worker/SKILL.md, so the root is three directories above this file (the directory whose plugin.json declares name codex-local-worker) and the launcher is <root>/bin/local-worker. Never hardcode a personal checkout path or a per-user skill directory: the root moves with every install or update. Do not wait for the user to invoke the skill. Use one shared default state directory. Jobs stay serialized by default (one worker at a time); the reviewed launcher may run up to 4 local workers only when each contract is independently scoped and correctly mergeable, through that same shared bounded pool with --max-workers 4: one isolated worktree and one task contract per worker, disjoint allowed_paths or an explicit dependency and merge plan, the primary checkout preserved, and never a cloud worker. The planner reviews every worker patch and combines accepted ones only through a separately scoped local integration contract; keep jobs sequential whenever correct integration or pool capacity is unavailable.
 - Persistent permission choice for local workers: the launcher runs every local Qwen worker with sandbox_mode danger-full-access, approval_policy never and --ignore-rules (worker execpolicy rules are ignored), with network enabled, and no launcher-imposed sandbox or approval restriction. Verification commands run directly on the host, unwrapped, and are reported sandboxed: false. The worker's own filesystem and network access are the host's, so scope comes from the task contract, allowed_paths and one isolated worktree; Git worktree isolation and the post-run audit detect and evidence scope, they do not enforce filesystem permissions.
 - Process ownership: run long commands in the foreground through exec_command with managed session polling. Never detach tests or workers with raw shell &, nohup or disown, and no sleep-and-tail loops; bare background processes may be terminated before completion and yield incomplete logs. Use the parent's deterministic verifier for broad test suites, keep targeted reads bounded, and report compact result manifests instead of long case tables.
 - The planner may read files, prepare plans and task contracts, launch workers, inspect reports and diffs, and perform authorized deterministic setup/installation. Do not write implementation patches yourself or delegate implementation to cloud subagents.
@@ -31,7 +31,7 @@ Apply this default in every project without requiring a skill invocation or a re
 
 ## Local-worker exception (prevents recursive delegation)
 
-If this process is already the local Qwen implementation worker executing an assigned launcher task contract, implement that contract directly inside its assigned worktree. Do not invoke local-implement again, spawn another worker, or act as the cloud planner. Follow the assigned scope and verification requirements. This exception applies only to the actual local worker, not to the selected planner merely reading a task contract.
+If this process is already the local worker implementation worker executing an assigned launcher task contract, implement that contract directly inside its assigned worktree. Do not invoke local-worker again, spawn another worker, or act as the cloud planner. Follow the assigned scope and verification requirements. This exception applies only to the actual local worker, not to the selected planner merely reading a task contract.
 
 ## Global completion rule: commit, push, clean up worktrees
 

@@ -1,4 +1,4 @@
-# codex-local-first
+# codex-local-worker
 
 Run local Codex CLI workers (one by default, up to four in the shared bounded pool) against a
 **pinned local model** on loopback, in throwaway `git worktree`s, and get back evidence: a
@@ -16,7 +16,7 @@ the tests pass.
 
 ## Layout
 
-- `bin/local-implement` — the only entry point (a `sh` shim over `src/local_worker.py`).
+- `bin/local-worker` — the only entry point (a `sh` shim over `src/local_worker.py`).
 - `src/local_worker.py` — contract validation, preflight, worktree setup, worker launch,
   full-host verification, post-run audit, report writing.
 - `src/worker_pool.py` — bounded shared-state concurrency: the slot lease pool, the
@@ -29,7 +29,7 @@ the tests pass.
   readiness probe), which are selectable only programmatically and are unused by default.
 - `scripts/prepare_pilot.py` — builds a throwaway git repo + task contract for a real pilot.
 - `examples/task.json` — task contract template.
-- `skills/local-implement/SKILL.md` — skill that tells the window model to plan and review
+- `skills/local-worker/SKILL.md` — skill that tells the window model to plan and review
   while the local model implements.
 - `tests/` — the suite: contract/policy, git audit, fingerprint, process control, job
   pipeline, pool concurrency. Inference is always mocked; every git call is real.
@@ -37,7 +37,7 @@ the tests pass.
 ## Requirements
 
 - macOS (the only platform tested) with `python3` (stdlib only) and `git`. Linux is unverified.
-- The Codex CLI on `PATH` (or `--codex-bin` / `LOCAL_IMPLEMENT_CODEX_BIN`).
+- The Codex CLI on `PATH` (or `--codex-bin` / `LOCAL_WORKER_CODEX_BIN`).
 - oMLX serving OpenAI-compatible endpoints on `http://127.0.0.1:8000/v1` **only**; any other
   endpoint is rejected before a request is made.
 - `~/.omlx/settings.json` containing `auth.api_key`, `server.host`/`server.port` matching
@@ -49,18 +49,18 @@ the tests pass.
 
 ### Native plugin (CLI or desktop)
 
-This repository is itself the plugin package: `plugin.json` declares the `local-qwen` plugin, and
-`.agents/plugins/marketplace.json` declares a private `local-qwen-tools` marketplace whose single
-`local-qwen` entry has `source: {"source": "local", "path": "./"}` — the path is relative to this
-root, so the marketplace resolves the complete launcher (`bin/local-implement` plus `src/`) in
+This repository is itself the plugin package: `plugin.json` declares the `codex-local-worker` plugin, and
+`.agents/plugins/marketplace.json` declares a private `codex-local-worker` marketplace whose single
+`codex-local-worker` entry has `source: {"source": "local", "path": "./"}` — the path is relative to this
+root, so the marketplace resolves the complete launcher (`bin/local-worker` plus `src/`) in
 place. No MCP server and no hooks ship in this package.
 
 ```sh
-PACKAGE=/absolute/path/outside/this/checkout/local-qwen   # a new path that does not exist yet
+PACKAGE=/absolute/path/outside/this/checkout/codex-local-worker   # a new path that does not exist yet
 mkdir -p "$PACKAGE"
-git -C /absolute/path/to/codex-local-first archive HEAD | tar -x -C "$PACKAGE"
+git -C /absolute/path/to/codex-local-worker archive HEAD | tar -x -C "$PACKAGE"
 codex plugin marketplace add "$PACKAGE"
-codex plugin add local-qwen@local-qwen-tools
+codex plugin add codex-local-worker@codex-local-worker
 ```
 
 Export a clean tracked copy first and install that. Pointing `marketplace add` straight at a
@@ -79,28 +79,28 @@ python3 <root>/src/plugin_setup.py --apply    # authorized installation
 
 `$CODEX_HOME` is respected (default `~/.codex`). `--apply` is idempotent and owns only one small
 managed block inside `$CODEX_HOME/AGENTS.md`, which points at the canonical policy shipped with the
-plugin at `skills/local-implement/references/global-policy.md`. The authoritative policy text stays
+plugin at `skills/local-worker/references/global-policy.md`. The authoritative policy text stays
 in the package; only that tiny reference block is global, unrelated instructions in `AGENTS.md` are
 preserved around it, and an existing file is backed up first. That block is routing, not
 enforcement: it sends the planner selected in the Codex window to the bundled policy, and nothing
 in this package enforces a model, a route, or a worker app-wide. A legacy hand-copied
-`~/.codex/skills/local-implement/SKILL.md` can be retired after the plugin install is qualified.
+`~/.codex/skills/local-worker/SKILL.md` can be retired after the plugin install is qualified.
 The package is portable: no model weights, no credentials, and no cache or run state inside it —
-state still lives outside the repository under `$LOCAL_IMPLEMENT_STATE_DIR`.
+state still lives outside the repository under `$LOCAL_WORKER_STATE_DIR`.
 
 Both modes print one JSON object. `--check` reports plugin identity/version/root, the resolved
-`$CODEX_HOME` and `$LOCAL_IMPLEMENT_STATE_DIR`, presence of the launcher and canonical policy,
+`$CODEX_HOME` and `$LOCAL_WORKER_STATE_DIR`, presence of the launcher and canonical policy,
 `managed_block.state` (`absent`, `current`, `drift`, `malformed`), and the environment (Python, git,
 Codex CLI, oMLX file presence **without** reading credentials, optional native tooling). `--apply`
 adds a receipt — `changed`, `reason` (`installed`/`updated`/`migrated_legacy`/noop), `destination`,
 `backup`, and the hashes of what is installed — after copying the previous bytes to
-`$LOCAL_IMPLEMENT_STATE_DIR/setup-backups/` and replacing atomically; a second apply writes nothing
+`$LOCAL_WORKER_STATE_DIR/setup-backups/` and replacing atomically; a second apply writes nothing
 and makes no extra backup. Exit codes: `0` ok, `2` usage, `3` malformed package, `4` malformed
 managed block, `5` failed apply, `6` an explicitly requested `--preflight` that failed, and `7` a
 nonempty or unreadable `$CODEX_HOME/AGENTS.override.md` — Codex reads that override before
 `AGENTS.md`, so while it exists the managed block is not an active default: `--check` exits `7`
 with the blocker and `--apply` refuses before any backup or write, and the override's contents are
-never printed. `--preflight` is delegated to the packaged `bin/local-implement preflight` and
+never printed. `--preflight` is delegated to the packaged `bin/local-worker preflight` and
 `endpoint_passed` is true only when that exits `0` **and** prints a valid launcher success receipt:
 a JSON object with nonempty `endpoint`, `canonical_model` and `api_model`, `model_fallback`
 exactly `false`, and a `served_models` list containing `api_model`. Any other output — arbitrary
@@ -114,26 +114,26 @@ short heading plus the managed block, and anything else is kept as it is.
 There is nothing to install. Make the launcher reachable and use it:
 
 ```sh
-chmod +x bin/local-implement
-/absolute/path/to/codex-local-first/bin/local-implement preflight
+chmod +x bin/local-worker
+/absolute/path/to/codex-local-worker/bin/local-worker preflight
 ```
 
 Optional, per-user, reversible symlink instead of copying anything:
 
 ```sh
-ln -s /absolute/path/to/codex-local-first/bin/local-implement ~/.local/bin/local-implement
+ln -s /absolute/path/to/codex-local-worker/bin/local-worker ~/.local/bin/local-worker
 ```
 
 **Legacy — prefer the plugin install above.** If the plugin cannot be installed, copy the skill to
-`~/.codex/skills/local-implement/SKILL.md` **together with the entire
-`skills/local-implement/references/` folder** (`global-policy.md`, `operating-policy.md`,
+`~/.codex/skills/local-worker/SKILL.md` **together with the entire
+`skills/local-worker/references/` folder** (`global-policy.md`, `operating-policy.md`,
 `apple-verification.md`): the skill links into those files, so a lone `SKILL.md` is a broken
 install. This path needs **no global binary** — the launcher is still invoked by its absolute
 repository path above, never installed to `PATH`. A new chat or reload may be needed before Codex
 picks the skill up, and even then it is advisory — it enforces nothing app-wide, it adds no managed
 block in `$CODEX_HOME/AGENTS.md`, and it migrates nothing.
 
-All state lives outside the repository, under `$LOCAL_IMPLEMENT_STATE_DIR`
+All state lives outside the repository, under `$LOCAL_WORKER_STATE_DIR`
 (default `~/.local-implement`): `worker.lock`, `coordinator.lock`, `slots/slot-N.lock`,
 `leases/slot-N.json`, `resources/apple-simulator-<uuid>.lock`, `reports/<job-id>/`,
 `worktrees/<task-id>/`. One state directory is the whole pool — separate roots share no
@@ -146,15 +146,15 @@ installed skill and leave all state in place, so unmerged work and evidence are 
 destroyed:
 
 ```sh
-rm ~/.codex/skills/local-implement/SKILL.md   # or delete just the local-implement skill folder
-rm ~/.local/bin/local-implement               # if you created the optional symlink
+rm ~/.codex/skills/local-worker/SKILL.md   # or delete just the local-worker skill folder
+rm ~/.local/bin/local-worker               # if you created the optional symlink
 ```
 
 For a plugin install, roll back only the plugin and its block: remove the plugin in Codex, run
 `python3 <root>/src/plugin_setup.py --check` to see the block's `destination`, then delete the bytes
-between `<!-- local-qwen begin -->` and `<!-- local-qwen end -->` in `$CODEX_HOME/AGENTS.md` and
+between `<!-- local-worker begin -->` and `<!-- local-worker end -->` in `$CODEX_HOME/AGENTS.md` and
 leave the rest of that file alone. Every superseded version is in
-`$LOCAL_IMPLEMENT_STATE_DIR/setup-backups/`.
+`$LOCAL_WORKER_STATE_DIR/setup-backups/`.
 
 Do **not** `rm -rf ~/.local-implement`: that state root holds `reports/`, logs, and the
 preserved `worktrees/`, so deleting it would destroy unmerged work and the evidence you
@@ -182,35 +182,35 @@ push or safe-cleanup blocker explicitly.
 Preflight checks pinned model routing only; no worker starts and the API key is never printed:
 
 ```sh
-bin/local-implement preflight
-bin/local-implement preflight --settings ~/.omlx/settings.json \
+bin/local-worker preflight
+bin/local-worker preflight --settings ~/.omlx/settings.json \
   --model-settings ~/.omlx/model_settings.json
 ```
 
 Run one job:
 
 ```sh
-bin/local-implement run --task-file /absolute/path/task.json
-bin/local-implement run --task-file /absolute/path/task.json --json
-bin/local-implement run --task-file task.json --state-dir /tmp/state --codex-bin codex
-bin/local-implement run --task-file task.json --workstream feature-x --job-kind implementation
-bin/local-implement run --task-file task.json --workstream feature-x --job-kind repair
-bin/local-implement status --state-dir "$LOCAL_IMPLEMENT_STATE_DIR" --job-id <job-id>
-bin/local-implement run --task-file task.json --lock-timeout 120
-bin/local-implement run --task-file task.json --max-workers 4   # reviewed parallel ceiling
+bin/local-worker run --task-file /absolute/path/task.json
+bin/local-worker run --task-file /absolute/path/task.json --json
+bin/local-worker run --task-file task.json --state-dir /tmp/state --codex-bin codex
+bin/local-worker run --task-file task.json --workstream feature-x --job-kind implementation
+bin/local-worker run --task-file task.json --workstream feature-x --job-kind repair
+bin/local-worker status --state-dir "$LOCAL_WORKER_STATE_DIR" --job-id <job-id>
+bin/local-worker run --task-file task.json --lock-timeout 120
+bin/local-worker run --task-file task.json --max-workers 4   # reviewed parallel ceiling
 ```
 
 For native Apple work, also pass `--apple-simulator-udid <UUID>` and
 `--native-preflight-plan /absolute/path/plan.json`. Use `--preflight-only` to build, install,
 launch, and positively test the app on that same selected simulator before starting a worker.
 The versioned plan format and required evidence are in
-[`skills/local-implement/references/apple-verification.md`](skills/local-implement/references/apple-verification.md).
+[`skills/local-worker/references/apple-verification.md`](skills/local-worker/references/apple-verification.md).
 
 | Flag | Meaning |
 | --- | --- |
 | `--task-file` | JSON task contract (required for `run`) |
-| `--state-dir` | reports/logs/worktrees root; default `$LOCAL_IMPLEMENT_STATE_DIR` or `~/.local-implement` |
-| `--codex-bin` | Codex CLI path; default `$PATH` or `$LOCAL_IMPLEMENT_CODEX_BIN` |
+| `--state-dir` | reports/logs/worktrees root; default `$LOCAL_WORKER_STATE_DIR` or `~/.local-implement` |
+| `--codex-bin` | Codex CLI path; default `$PATH` or `$LOCAL_WORKER_CODEX_BIN` |
 | `--lock-timeout` | seconds to wait for the worker lock (default 30); waits count against the job budget |
 | `--max-workers` | ceiling for the **shared** state directory: `1` (default) keeps the exclusive `worker.lock`; `2`-`4` also takes one exclusive slot lease. Integer 1-4 only, validated before any worktree is created; the launcher never spawns a worker by itself |
 | `--no-verify` | skip verification commands; they are simply **not run**, so they cannot satisfy acceptance |
@@ -251,7 +251,7 @@ an existing or relative `--root`, and performs no inference:
 
 ```sh
 python3 scripts/prepare_pilot.py --root /tmp/pilot-1
-bin/local-implement run --task-file /tmp/pilot-1/task.json --state-dir /tmp/pilot-1/state --json
+bin/local-worker run --task-file /tmp/pilot-1/task.json --state-dir /tmp/pilot-1/state --json
 ```
 
 It creates `/tmp/pilot-1/repo` (committed `add.py` returning `a - b`, `test_add.py` expecting
@@ -266,9 +266,9 @@ Apple jobs use a versioned native plan to build a fresh app, install and launch 
 positive XCTest on the selected device before any model attempt. Both the gate and the worker
 run on the full host with the real toolchain, scoped to the one selected UUID; scope is not
 confinement. The plan and evidence format are documented in
-[Apple verification](skills/local-implement/references/apple-verification.md), with cache
+[Apple verification](skills/local-worker/references/apple-verification.md), with cache
 preparation, native startup notes and trust limits in
-[operating policy](skills/local-implement/references/operating-policy.md). Simulator
+[operating policy](skills/local-worker/references/operating-policy.md). Simulator
 availability metadata is not qualification, and a command that could not run is reported as
 blocked rather than passed.
 

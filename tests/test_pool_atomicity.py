@@ -324,6 +324,18 @@ class JobDeadlineBoundsMetadata(PoolAtomicityCase):
         self.assertGreater(admitted["metadata_deadline"], 0.0,
                            "the holder must carry a real metadata deadline")
 
+        # The assertion below is a precondition of the scenario, not a race to win: the child's
+        # metadata write is only meaningful once its own job budget has been spent. On a fast
+        # interpreter the parent otherwise reaches the check before the 0.3s child deadline has
+        # elapsed. Wait explicitly (bounded) for the observed deadline to expire instead of
+        # relaxing the budget, so the cross-process locking assertions stay exactly as strict.
+        expiry_bound = time.monotonic() + 5.0
+        while time.monotonic() < admitted["metadata_deadline"]:
+            if time.monotonic() > expiry_bound:
+                self.fail("the holder's job deadline %r never expired within 5s: %s"
+                          % (admitted["metadata_deadline"], self.tail(holder)))
+            time.sleep(0.02)
+
         proceed = holder["directory"] / "proceed"
         with self.hold_coordinator():
             self.assertTrue(wp.slot_is_live(self.state, slot))

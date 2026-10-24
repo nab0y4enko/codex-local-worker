@@ -1,12 +1,12 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
-  "name": "local-qwen",
-  "version": "0.1.0",
-  "description": "Plan with the model you selected in this window and implement with a pinned local Qwen worker on your own machine. Setup checks and installs the user-wide routing, doctor verifies an existing install read-only, and the launcher runs scoped jobs in throwaway git worktrees, returning a patch, real test results and an audit of every changed file.",
+  "name": "codex-local-worker",
+  "version": "0.2.0",
+  "description": "Plan with the model you selected in this window and implement with a pinned local worker model on your own machine. Setup checks and installs the user-wide routing (migrating the pre-rename pointer block), doctor verifies an existing install read-only, and the launcher runs scoped jobs in throwaway git worktrees, returning a patch, real test results and an audit of every changed file.",
   "keywords": [
     "local-first",
     "local-model",
-    "qwen",
+    "local-worker",
     "omlx",
     "worker",
     "skills",
@@ -17,8 +17,8 @@
     "com.openai": {
       "onboardingSkill": "./skills/setup/SKILL.md",
       "interface": {
-        "displayName": "Local Qwen",
-        "shortDescription": "Plan here, implement with a pinned local Qwen worker"
+        "displayName": "Local Worker",
+        "shortDescription": "Plan here, implement with a pinned local worker"
       }
     }
   }

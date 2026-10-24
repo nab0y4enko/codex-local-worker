@@ -1,11 +1,11 @@
 ---
 name: doctor
-description: "Use when diagnosing or verifying an existing Local Qwen plugin install: routing block, launcher presence, model endpoint, and native readiness, without writing anything."
+description: "Use when diagnosing or verifying an existing Local Worker plugin install: routing block, launcher presence, model endpoint, and native readiness, without writing anything."
 ---
 
-# Local Qwen Doctor
+# Local Worker Doctor
 
-Read-only health check for an installed Local Qwen plugin. Doctor reports; it never repairs,
+Read-only health check for an installed Local Worker plugin. Doctor reports; it never repairs,
 installs, or rewrites configuration. Use [setup](../setup/SKILL.md) for any change.
 
 Resolve the plugin root from this file's path: it is `<root>/skills/doctor/SKILL.md`, so the root is
@@ -23,8 +23,8 @@ python3 <root>/src/plugin_setup.py --check --preflight
 the `CODEX_HOME` target (respected, default `~/.codex`) and state directory, manifest and skill
 discovery, whether the managed instruction block in `$CODEX_HOME/AGENTS.md` is `absent`, `current`,
 `drift` (it points at a different install root) or `malformed`, whether the canonical policy file and
-launcher `bin/local-implement` and `src/local_worker.py` exist, and the environment: `python`, `git`,
-the Codex CLI on `PATH` or through `$LOCAL_IMPLEMENT_CODEX_BIN`, oMLX file presence with contents
+launcher `bin/local-worker` and `src/local_worker.py` exist, and the environment: `python`, `git`,
+the Codex CLI on `PATH` or through `$LOCAL_WORKER_CODEX_BIN`, oMLX file presence with contents
 never read, and optional native tooling. A malformed block exits nonzero; drift is reported with exit
 status `0` and named in `managed_block.reason`.
 
@@ -42,7 +42,7 @@ not observe.
 model-endpoint request only by delegating to the packaged launcher:
 
 ```sh
-<root>/bin/local-implement preflight
+<root>/bin/local-worker preflight
 ```
 
 `endpoint_passed` is `true` only when that launcher exited 0 inside the timeout with a well-formed

@@ -64,7 +64,7 @@ class WorkerArgv(unittest.TestCase):
         self.assertEqual(lw.missing_config_pins(self.argv), [])
         lw._policy_check(self.argv)
 
-    def test_local_qwen_routing_and_no_fallback_pins_are_unchanged(self):
+    def test_local_worker_routing_and_no_fallback_pins_are_unchanged(self):
         provider = f"model_providers.{lw.PROVIDER_ID}"
         self.assertEqual(self.argv[self.argv.index("-m") + 1], lw.EXPECTED_ALIAS)
         self.assertEqual(self.overrides["model"], f'"{lw.EXPECTED_ALIAS}"')
@@ -124,7 +124,7 @@ class Probe(unittest.TestCase):
 
     def test_probe_runs_one_trivial_command_directly_with_no_wrapper(self):
         with mock.patch.object(lw, "run_bounded",
-                               return_value=sandbox_result(stdout=b"__LOCAL_IMPLEMENT_SANDBOX_OK__\n")) as run:
+                               return_value=sandbox_result(stdout=b"__LOCAL_WORKER_SANDBOX_OK__\n")) as run:
             info = lw.probe_sandbox("codex", self.root, self.env, (), lw.Deadline(120))
         argv = run.call_args.args[0]
         self.assertEqual(list(argv), lw.FULL_HOST_PROBE_ARGV)
@@ -144,7 +144,7 @@ class Probe(unittest.TestCase):
 
     def test_probe_keeps_the_legacy_confined_backend_available(self):
         with mock.patch.object(lw, "run_bounded",
-                               return_value=sandbox_result(stdout=b"__LOCAL_IMPLEMENT_SANDBOX_OK__\n")) as run:
+                               return_value=sandbox_result(stdout=b"__LOCAL_WORKER_SANDBOX_OK__\n")) as run:
             info = lw.probe_sandbox("codex", self.root, self.env, (), lw.Deadline(120),
                                     backend=lw.WORKSPACE_SANDBOX_BACKEND)
         self.assertEqual(run.call_args.args[0][:2], ["codex", "sandbox"])

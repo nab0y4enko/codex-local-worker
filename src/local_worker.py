@@ -70,15 +70,24 @@ OMLX_DIR = Path("~/.omlx")
 OMLX_SETTINGS = OMLX_DIR / "settings.json"
 OMLX_MODEL_SETTINGS = OMLX_DIR / "model_settings.json"
 
-STATE_ENV = "LOCAL_IMPLEMENT_STATE_DIR"
-CODEX_BIN_ENV = "LOCAL_IMPLEMENT_CODEX_BIN"
+# Canonical environment names; the pre-rename names stay honored as legacy fallbacks so an
+# existing shell profile keeps working without re-exporting anything.
+STATE_ENV = "LOCAL_WORKER_STATE_DIR"
+CODEX_BIN_ENV = "LOCAL_WORKER_CODEX_BIN"
+LEGACY_STATE_ENV = "LOCAL_IMPLEMENT_STATE_DIR"
+LEGACY_CODEX_BIN_ENV = "LOCAL_IMPLEMENT_CODEX_BIN"
+# Deliberate legacy storage-compatibility exception, not an oversight: the state root keeps the
+# historical ``~/.local-implement`` path on purpose. That directory IS the shared pool - the
+# worker/coordinator locks, ``slots/``, ``leases/``, ``reports/`` history and preserved
+# ``worktrees/`` all live there - so a new name would silently split one pool into two roots and
+# let two jobs believe they own it. Only the *names around* the storage were renamed.
 DEFAULT_STATE_DIR = "~/.local-implement"
 
 MIN_TIMEOUT_SECONDS = 30
 MAX_TIMEOUT_SECONDS = 3600
 ALLOWED_ATTEMPTS = (1, 2)
 LOCK_TIMEOUT_SECONDS = 30.0
-PROBE_MARKER = "__LOCAL_IMPLEMENT_SANDBOX_OK__"
+PROBE_MARKER = "__LOCAL_WORKER_SANDBOX_OK__"
 PATCH_REPORT_BYTES = 262144
 HTTP_TIMEOUT_SECONDS = 15
 TERMINATE_GRACE_SECONDS = 5.0
@@ -758,7 +767,7 @@ def resolve_commit(repo: Path, ref: str) -> str:
 
 def worktree_name(task_id: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]", "-", task_id)[:40]
-    return f"local-implement-{slug}-{_now_stamp()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+    return f"local-worker-{slug}-{_now_stamp()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
 
 
 def add_worktree(repo: Path, commit: str, destination: Path) -> None:
@@ -2365,29 +2374,55 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
 # --------------------------------------------------------------------------------------
 # Command line
 # --------------------------------------------------------------------------------------
+def resolve_environment_value(new_name: str, legacy_name: str, explicit: Optional[str]) -> Optional[str]:
+    """Explicit CLI argument wins; else the canonical env name, else the legacy one.
+
+    Without an explicit argument, two *different* nonempty values for the canonical and the
+    legacy name are refused instead of guessed: picking one would silently split one shared pool
+    (or pick one of two Codex binaries) with no way for the operator to see the choice. Equal
+    values are the documented compatibility case and are accepted.
+    """
+    if explicit is not None and str(explicit).strip():
+        return str(explicit)
+    canonical = (os.environ.get(new_name) or "").strip()
+    legacy = (os.environ.get(legacy_name) or "").strip()
+    if canonical and legacy and canonical != legacy:
+        raise PreflightError(
+            f"{new_name} and legacy {legacy_name} are both set to different values "
+            f"({canonical!r} vs {legacy!r}); unset one, make them equal, or pass the CLI argument")
+    return canonical or legacy or None
+
+
 def resolve_codex_bin(explicit: Optional[str] = None) -> str:
-    candidate = explicit or os.environ.get(CODEX_BIN_ENV) or shutil.which("codex")
+    candidate = (resolve_environment_value(CODEX_BIN_ENV, LEGACY_CODEX_BIN_ENV, explicit)
+                 or shutil.which("codex"))
     if not candidate:
-        raise PreflightError(f"Codex CLI not found; pass --codex-bin or set {CODEX_BIN_ENV}")
+        raise PreflightError(
+            f"Codex CLI not found; pass --codex-bin or set {CODEX_BIN_ENV} "
+            f"(legacy {LEGACY_CODEX_BIN_ENV} is still honored)")
     return str(Path(candidate).expanduser())
 
 
 def resolve_state_dir(explicit: Optional[str] = None) -> Path:
-    raw = explicit or os.environ.get(STATE_ENV) or DEFAULT_STATE_DIR
+    raw = resolve_environment_value(STATE_ENV, LEGACY_STATE_ENV, explicit) or DEFAULT_STATE_DIR
     return Path(os.path.expanduser(raw)).absolute()
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="local-implement",
+        prog="local-worker",
         description="Run one local Codex CLI worker against the pinned loopback oMLX model.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     run = sub.add_parser("run", help="run one job from a task contract file")
     run.add_argument("--task-file", required=True, help="JSON task contract")
-    run.add_argument("--state-dir", help="reports/logs/worktrees root (default ~/.local-implement)")
-    run.add_argument("--codex-bin", help=f"Codex CLI path (default PATH or {CODEX_BIN_ENV})")
+    run.add_argument("--state-dir",
+                     help="reports/logs/worktrees root (env %s, legacy %s; default %s, kept as the "
+                          "one shared legacy pool root)"
+                          % (STATE_ENV, LEGACY_STATE_ENV, DEFAULT_STATE_DIR))
+    run.add_argument("--codex-bin", help=f"Codex CLI path (default PATH or {CODEX_BIN_ENV}, "
+                                         f"legacy {LEGACY_CODEX_BIN_ENV})")
     run.add_argument("--lock-timeout", type=float, default=LOCK_TIMEOUT_SECONDS)
     run.add_argument("--max-workers", metavar="N", default="1",
                      help="shared-pool ceiling: 1 (default) keeps the exclusive legacy "

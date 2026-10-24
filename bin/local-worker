@@ -3,7 +3,7 @@
 set -eu
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 if [ ! -f "$here/../src/local_worker.py" ]; then
-  echo "local-implement: cannot find $here/../src/local_worker.py" >&2
+  echo "local-worker: cannot find $here/../src/local_worker.py" >&2
   exit 1
 fi
 exec "${PYTHON:-python3}" "$here/../src/local_worker.py" "$@"

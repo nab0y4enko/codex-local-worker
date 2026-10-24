@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Setup helper for the local-qwen plugin: stdlib only, portable, read-only by default.
+"""Setup helper for the codex-local-worker plugin: stdlib only, portable, read-only by default.
 
 Run it from any working directory; the plugin root is inferred from this file (``src`` is one
 level below the root), so an installed copy works wherever the plugin lands:
@@ -8,8 +8,13 @@ level below the root), so an installed copy works wherever the plugin lands:
     python3 <root>/src/plugin_setup.py --apply                  # authorized installation
     python3 <root>/src/plugin_setup.py --check --preflight      # also ask the packaged launcher
 
-``$CODEX_HOME`` (default ``~/.codex``) and ``$LOCAL_IMPLEMENT_STATE_DIR`` (default
-``~/.local-implement``) are respected. stdout is one JSON document; nothing is written by
+``$CODEX_HOME`` (default ``~/.codex``) and ``$LOCAL_WORKER_STATE_DIR`` (default
+``~/.local-implement``) are respected; the pre-rename ``$LOCAL_IMPLEMENT_STATE_DIR`` and
+``$LOCAL_IMPLEMENT_CODEX_BIN`` are still honored as legacy fallbacks, and two *different* nonempty
+values for one pair refuse instead of guessing. The state root keeps the historical
+``~/.local-implement`` path deliberately: that directory is the one existing shared pool (locks,
+slots, leases, report history, preserved worktrees), so renaming storage would split it. stdout is
+one JSON document; nothing is written by
 ``--check``, no credential or settings content is ever read or printed, and no config, provider,
 model or project file is touched by ``--apply``.
 
@@ -37,24 +42,36 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 SCHEMA_VERSION = 1
-PLUGIN_NAME = "local-qwen"
-POLICY_RELATIVE = ("skills", "local-implement", "references", "global-policy.md")
-SKILL_RELATIVE = ("skills", "local-implement", "SKILL.md")
+PLUGIN_NAME = "codex-local-worker"
+PLUGIN_VERSION = "0.2.0"
+POLICY_RELATIVE = ("skills", "local-worker", "references", "global-policy.md")
+SKILL_RELATIVE = ("skills", "local-worker", "SKILL.md")
 SETUP_RELATIVE = ("src", "plugin_setup.py")
 LAUNCHER_ENGINE_RELATIVE = ("src", "local_worker.py")
-SKILLS = ("local-implement", "setup", "doctor")
+SKILLS = ("local-worker", "setup", "doctor")
 LEGACY_RELATIVE = ("evidence", "global-default", "AGENTS.md")
 # sha256 of the historical global AGENTS.md that ships in this package as a migration input.
 # Kept here so a package copy without evidence/ still recognizes (and migrates) the legacy file.
 LEGACY_SHA256 = "cb1192774bb1f358c9df93780c16c3ff2388e5440651bcc98429a0635bb75560"
 LEGACY_HEADER = "# User-wide Codex defaults"
 
-MARKER_BEGIN = "<!-- local-qwen begin -->"
-MARKER_END = "<!-- local-qwen end -->"
+MARKER_BEGIN = "<!-- local-worker begin -->"
+MARKER_END = "<!-- local-worker end -->"
+# The 0.1.0 package owned a block between these pre-rename markers. They are recognized only as a
+# migration input, so an installed old pointer becomes exactly one current block; a mixed,
+# duplicated or unbalanced pair of old and new markers is refused with no write, because two
+# competing routing policies must never be left behind.
+LEGACY_MARKER_BEGIN = "<!-- local-qwen begin -->"
+LEGACY_MARKER_END = "<!-- local-qwen end -->"
+# Same reasoning for the environment: canonical names win, legacy names are fallbacks.
 BACKUP_DIRNAME = "setup-backups"
 CODEX_HOME_ENV = "CODEX_HOME"
-STATE_DIR_ENV = "LOCAL_IMPLEMENT_STATE_DIR"
-CODEX_BIN_ENV = "LOCAL_IMPLEMENT_CODEX_BIN"
+STATE_DIR_ENV = "LOCAL_WORKER_STATE_DIR"
+CODEX_BIN_ENV = "LOCAL_WORKER_CODEX_BIN"
+LEGACY_STATE_DIR_ENV = "LOCAL_IMPLEMENT_STATE_DIR"
+LEGACY_CODEX_BIN_ENV = "LOCAL_IMPLEMENT_CODEX_BIN"
+# Storage compatibility exception, kept identical to 0.1.0 on purpose (see module docstring).
+DEFAULT_STATE_DIR = "~/.local-implement"
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -64,7 +81,7 @@ EXIT_APPLY = 5
 EXIT_PREFLIGHT = 6
 EXIT_OVERRIDE = 7
 
-PREFLIGHT_COMMAND = ("bin", "local-implement")
+PREFLIGHT_COMMAND = ("bin", "local-worker")
 PREFLIGHT_ARGS = ("preflight",)
 DEFAULT_PREFLIGHT_TIMEOUT = 60.0
 RECEIPT_STRING_FIELDS = ("endpoint", "canonical_model", "api_model")
@@ -184,14 +201,14 @@ def managed_block(root):
     setup = link_destination(root, SETUP_RELATIVE)
     lines = [
         MARKER_BEGIN,
-        "## Local Qwen: selected planner, local Qwen implementation",
+        "## Local Worker: selected planner, local worker implementation",
         "",
         "Planning stays on the model selected in the Codex window. Implementation, fixes, refactors",
-        "and test authoring run on the pinned local Qwen worker through the plugin launcher. This",
+        "and test authoring run on the pinned local worker model through the plugin launcher. This",
         "block is the only global text the plugin owns; the authoritative policy stays in the package.",
         "",
         "- Canonical policy: [global-policy.md](<%s>)" % policy,
-        "- Bundled launcher skill: [local-implement/SKILL.md](<%s>)" % skill,
+        "- Bundled launcher skill: [local-worker/SKILL.md](<%s>)" % skill,
         "- Install root: <%s>" % str(root),
         "- Read the canonical policy before implementing. If that file is missing, the plugin was",
         "  moved or uninstalled: run `python3 %s --check` from the current install root and"
@@ -216,6 +233,10 @@ def validate_package(root):
     if manifest.get("name") != PLUGIN_NAME:
         raise SetupError(EXIT_PACKAGE, "manifest",
                          "plugin.json name is %r, expected %r" % (manifest.get("name"), PLUGIN_NAME))
+    if manifest.get("version") != PLUGIN_VERSION:
+        raise SetupError(EXIT_PACKAGE, "manifest",
+                         "plugin.json version is %r, expected %r"
+                         % (manifest.get("version"), PLUGIN_VERSION))
     extensions = manifest.get("extensions")
     client = extensions.get("com.openai") if isinstance(extensions, dict) else None
     onboarding = client.get("onboardingSkill") if isinstance(client, dict) else None
@@ -262,36 +283,68 @@ def validate_package(root):
 
 
 def analyze_block(text, expected):
-    """Classify the managed block: absent, current, drift or malformed (never guess)."""
-    begins, ends = [], []
-    position = 0
-    for line in text.splitlines(keepends=True):
-        stripped = line.strip()
-        if stripped == MARKER_BEGIN:
-            begins.append(position)
-        elif stripped == MARKER_END:
-            ends.append(position)
-        position += len(line)
-    stray = (text.count(MARKER_BEGIN) - len(begins)) + (text.count(MARKER_END) - len(ends))
+    """Classify the managed block: absent, current, drift, legacy_pointer or malformed.
+
+    ``legacy_pointer`` is the 0.1.0 block between the pre-rename markers: it is a migration input,
+    never a second routing policy. Mixed old/new markers, duplicates, unbalanced pairs and markers
+    that are not alone on their own line are all ``malformed`` (nothing is written until they are
+    repaired by hand), so ``--apply`` can never leave two competing policies behind.
+    """
+    def scan(begin_marker, end_marker):
+        begins, ends, position = [], [], 0
+        for line in text.splitlines(keepends=True):
+            stripped = line.strip()
+            if stripped == begin_marker:
+                begins.append(position)
+            elif stripped == end_marker:
+                ends.append(position)
+            position += len(line)
+        stray = ((text.count(begin_marker) - len(begins))
+                 + (text.count(end_marker) - len(ends)))
+        return begins, ends, stray
+
+    begins, ends, stray = scan(MARKER_BEGIN, MARKER_END)
+    old_begins, old_ends, old_stray = scan(LEGACY_MARKER_BEGIN, LEGACY_MARKER_END)
     result = {"marker_begin": MARKER_BEGIN, "marker_end": MARKER_END,
-              "begin_lines": len(begins), "end_lines": len(ends), "stray_markers": stray}
-    if not begins and not ends and not stray:
+              "legacy_marker_begin": LEGACY_MARKER_BEGIN, "legacy_marker_end": LEGACY_MARKER_END,
+              "begin_lines": len(begins), "end_lines": len(ends), "stray_markers": stray + old_stray,
+              "legacy_begin_lines": len(old_begins), "legacy_end_lines": len(old_ends)}
+    if (begins or ends or stray) and (old_begins or old_ends or old_stray):
+        result.update({"state": "malformed", "block_count": 0, "install_root": None, "block": None,
+                       "reason": "current and pre-rename managed markers are mixed in one file; "
+                                 "exactly one routing policy may exist, so nothing is modified "
+                                 "until the file is repaired by hand"})
+        return result
+    if not begins and not ends and not stray and not old_begins and not old_ends and not old_stray:
         result.update({"state": "absent", "block_count": 0, "install_root": None, "block": None,
                        "reason": "no managed block in this file"})
         return result
-    if len(begins) != 1 or len(ends) != 1 or begins[0] >= ends[0] or stray:
-        result.update({"state": "malformed", "block_count": max(len(begins), len(ends)),
+    legacy = not begins and not ends and not stray
+    pair_begin, pair_end = (old_begins, old_ends) if legacy else (begins, ends)
+    if len(pair_begin) != 1 or len(pair_end) != 1 or pair_begin[0] >= pair_end[0] or (
+            old_stray if legacy else stray):
+        result.update({"state": "malformed", "block_count": max(len(pair_begin), len(pair_end)),
                        "install_root": None, "block": None,
                        "reason": "managed markers must appear exactly once, balanced, each on its "
                                  "own line; nothing is modified until they are repaired"})
         return result
-    start = begins[0]
-    newline = text.find("\n", ends[0])
+    start = pair_begin[0]
+    newline = text.find("\n", pair_end[0])
     end = len(text) if newline == -1 else newline + 1
     block = text[start:end]
-    match = re.search(r"\]\(<([^<>]*)/skills/local-implement/references/global-policy\.md>\)", block)
+    # Both the canonical and the pre-rename skill path are recognized, so an old pointer still
+    # reports which install root it points at instead of claiming there is no root to migrate.
+    match = re.search(r"\]\(<([^<>]*)/skills/(?:local-worker|local-implement)/references/"
+                      r"global-policy\.md>\)", block)
     result.update({"block_count": 1, "install_root": match.group(1) if match else None,
                    "block": block})
+    if legacy:
+        result.update({"state": "legacy_pointer",
+                       "reason": "pre-rename managed block between %s / %s is migrated to the "
+                                 "current block; unrelated text is preserved"
+                                 % (LEGACY_MARKER_BEGIN, LEGACY_MARKER_END)})
+        result["span"] = (start, end)
+        return result
     if block == expected:
         result.update({"state": "current", "reason": "managed block already points at this root"})
     else:
@@ -304,14 +357,32 @@ def analyze_block(text, expected):
 # ----------------------------------------------------------------------- environment
 
 
+def environment_value(env_var, legacy_env_var=None):
+    """Canonical environment name first, legacy fallback second; conflicts refuse.
+
+    Two different nonempty values for the same setting are refused rather than resolved by a
+    hidden preference: guessing would point setup at a state root or Codex binary the operator did
+    not choose. Equal values are the documented compatibility case.
+    """
+    canonical = (os.environ.get(env_var) or "").strip()
+    legacy = (os.environ.get(legacy_env_var) or "").strip() if legacy_env_var else ""
+    if canonical and legacy and canonical != legacy:
+        raise SetupError(EXIT_USAGE, "environment",
+                         "%s and legacy %s are both set to different values (%r vs %r); unset one "
+                         "of them or make them equal" % (env_var, legacy_env_var, canonical, legacy))
+    return canonical or legacy or None
+
+
 def codex_home():
     return Path(absolute(os.environ.get(CODEX_HOME_ENV)
                          or os.path.join(os.path.expanduser("~"), ".codex")))
 
 
 def state_dir():
-    return Path(absolute(os.environ.get(STATE_DIR_ENV)
-                         or os.path.join(os.path.expanduser("~"), ".local-implement")))
+    # ``DEFAULT_STATE_DIR`` is the pre-rename path on purpose: one shared pool, one history, one
+    # set of kernel locks. See the module docstring; this is compatibility, not a missed rename.
+    return Path(absolute(os.path.expanduser(environment_value(STATE_DIR_ENV, LEGACY_STATE_DIR_ENV)
+                                            or DEFAULT_STATE_DIR)))
 
 
 def inspect_override(home):
@@ -361,13 +432,13 @@ def inspect_override(home):
     return report
 
 
-def command_availability(name, env_var=None):
+def command_availability(name, env_var=None, legacy_env_var=None):
     """Report how a CLI was found (or why it was not) without executing anything."""
-    override = (os.environ.get(env_var) or "").strip() if env_var else ""
+    override = environment_value(env_var, legacy_env_var) if env_var else ""
     candidate = None
     source = "missing"
     if override:
-        source = env_var
+        source = env_var if (os.environ.get(env_var) or "").strip() else legacy_env_var
         candidate = override if os.path.isabs(override) else shutil.which(override)
         if candidate is None:
             candidate = override
@@ -384,7 +455,7 @@ def environment_report():
         "python": {"executable": sys.executable or None,
                    "version": ".".join(str(part) for part in sys.version_info[:3])},
         "git": command_availability("git"),
-        "codex_cli": command_availability("codex", "LOCAL_IMPLEMENT_CODEX_BIN"),
+        "codex_cli": command_availability("codex", CODEX_BIN_ENV, LEGACY_CODEX_BIN_ENV),
         "omlx": omlx_report(),
         "native": {"optional": True,
                    "required_for": "native Apple jobs only, never for installation",
@@ -533,6 +604,11 @@ def apply_block(root, analysis, agents_path, home, state):
             if text:
                 separator = "\n" if text.endswith("\n") else "\n\n"
             new_text, reason = text + separator + expected, "installed"
+    elif analysis["state"] == "legacy_pointer":
+        # The pre-rename block is replaced in place: its own bytes go away, exactly one current
+        # block remains, and every byte outside the old markers is preserved untouched.
+        start, end = analysis["span"]
+        new_text, reason = text[:start] + expected + text[end:], "migrated_legacy_pointer"
     else:
         start, end = analysis["span"]
         new_text, reason = text[:start] + expected + text[end:], "updated"
@@ -601,7 +677,7 @@ def legacy_fixture(root):
 
 def build_parser():
     parser = argparse.ArgumentParser(prog="plugin_setup.py",
-                                     description="Inspect or install the local-qwen plugin's "
+                                     description="Inspect or install the codex-local-worker plugin's "
                                                  "user-wide routing reference.")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true",

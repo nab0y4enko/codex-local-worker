@@ -1,9 +1,9 @@
 ---
 name: setup
-description: Use when installing, first configuring, or re-pointing the Local Qwen plugin on a machine, including a new Codex home or a legacy hand-installed local-implement policy.
+description: Use when installing, first configuring, or re-pointing the Local Worker plugin on a machine, including a new Codex home or a legacy hand-installed local-worker policy.
 ---
 
-# Local Qwen Setup
+# Local Worker Setup
 
 One-time, per-machine installation of this plugin's user-wide routing default. The model selected
 in the Codex window keeps planning and reviewing; setup only makes every project route
@@ -13,7 +13,7 @@ window model, no global provider, and no app-wide enforcement.
 ## Resolve the plugin root first
 
 This file is `<root>/skills/setup/SKILL.md`, so the plugin root is two directories above it: the
-directory whose `plugin.json` declares `"name": "local-qwen"`. Every command below uses that
+directory whose `plugin.json` declares `"name": "codex-local-worker"`. Every command below uses that
 resolved root; never assume a personal checkout path, because the installed root changes on
 update or reinstall.
 
@@ -40,8 +40,8 @@ and running it writes no bytecode. Read:
 
 - `plugin` — `name`, `version`, `root`, `manifest` and `onboarding_skill` for this install.
 - `codex_home`, `state_dir` — the resolved `$CODEX_HOME` (default `~/.codex`) and
-  `$LOCAL_IMPLEMENT_STATE_DIR` (default `~/.local-implement`).
-- `package` — presence of the launcher `bin/local-implement` and its engine `src/local_worker.py`,
+  `$LOCAL_WORKER_STATE_DIR` (default `~/.local-implement`).
+- `package` — presence of the launcher `bin/local-worker` and its engine `src/local_worker.py`,
   the canonical policy, this helper, every skill and the manifest, plus `legacy`, the shipped
   migration input. A launcher without its engine is a malformed package (exit `3`), never readiness.
 - `managed_block.state` — `absent` (nothing owned yet), `current` (points at this root), `drift`
@@ -53,21 +53,21 @@ and running it writes no bytecode. Read:
   file is read only to decide whether it is empty; the report carries the path and that state, and
   the override's contents are never printed or disclosed.
 - `environment` — `python`, `git`, `codex_cli` (found on `PATH` or through
-  `$LOCAL_IMPLEMENT_CODEX_BIN`), `omlx` (file presence only, contents never read), and `native`
+  `$LOCAL_WORKER_CODEX_BIN`), `omlx` (file presence only, contents never read), and `native`
   (`xcrun`, optional and needed only for native Apple jobs).
 - `preflight` — `requested: false` and `endpoint_passed: false` unless `--preflight` was passed.
 
 ### What `--apply` changes
 
 One small managed block inside `$CODEX_HOME/AGENTS.md`, delimited by the fixed comments
-`<!-- local-qwen begin -->` and `<!-- local-qwen end -->`, pointing at the canonical policy shipped
-with this plugin: `<root>/skills/local-implement/references/global-policy.md`. The tiny block is the
+`<!-- local-worker begin -->` and `<!-- local-worker end -->`, pointing at the canonical policy shipped
+with this plugin: `<root>/skills/local-worker/references/global-policy.md`. The tiny block is the
 only global text the plugin owns; the authoritative policy text stays in the package, so an update
 replaces it in place instead of growing the global file. Installed paths are embedded as Markdown
 links wrapped in `<>`, so an install root containing spaces stays valid.
 
 Everything outside the markers is preserved byte-for-byte. Existing bytes are copied to a
-timestamped, read-only backup under `$LOCAL_IMPLEMENT_STATE_DIR/setup-backups/` before an atomic
+timestamped, read-only backup under `$LOCAL_WORKER_STATE_DIR/setup-backups/` before an atomic
 replacement, so a repeated `--apply` that would change nothing writes nothing and makes no extra
 backup. Malformed, duplicated, unbalanced or inline markers are refused with the file untouched, and
 a missing or unreadable canonical policy is refused too. Setup never rewrites `config.toml`, auth,
@@ -89,7 +89,7 @@ it never saw.
 A legacy `$CODEX_HOME/AGENTS.md` that matches the migrated historical policy byte-for-byte is
 reduced to a short heading plus the managed block instead of being kept as a duplicate; any other
 unrelated instructions are kept exactly as they are. A legacy per-user skill copy such as
-`~/.codex/skills/local-implement/SKILL.md` may be retired only after the plugin install is
+`~/.codex/skills/local-worker/SKILL.md` may be retired only after the plugin install is
 qualified, and never automatically.
 
 Setup starts no worker, runs no model inference, and edits no project code.
@@ -103,7 +103,7 @@ apply; `6` is a failed explicit `--preflight`; `7` is a nonempty or uninspectabl
 
 `--preflight` (bounded by `--preflight-timeout`, default 60 seconds) is the only step that contacts
 the model server, and it is delegated entirely to the packaged launcher
-`<root>/bin/local-implement preflight` instead of issuing a request of its own. `endpoint_passed` is
+`<root>/bin/local-worker preflight` instead of issuing a request of its own. `endpoint_passed` is
 `true` only when that launcher exits 0 inside the timeout with a complete success receipt: a JSON
 object with nonempty `endpoint`, `canonical_model` and `api_model`, `model_fallback` exactly `false`,
 and a `served_models` list that contains `api_model`. Any other output - no JSON, a JSON list or
@@ -137,5 +137,5 @@ contract; the launcher reads what it needs at run time and redacts secrets from 
 ## Verify afterwards
 
 Run [doctor](../doctor/SKILL.md) — `python3 <root>/src/plugin_setup.py --check` — and then
-`<root>/bin/local-implement preflight` for the actual endpoint. Report actual output; a plugin that
+`<root>/bin/local-worker preflight` for the actual endpoint. Report actual output; a plugin that
 installs is not the same claim as a worker that ran.

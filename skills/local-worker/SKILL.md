@@ -1,11 +1,11 @@
 ---
-name: local-implement
-description: Use when implementing, fixing, refactoring, or testing code in a trusted local Git repository under this setup's pinned local-Qwen worker policy.
+name: local-worker
+description: Use when implementing, fixing, refactoring, or testing code in a trusted local Git repository under this setup's pinned local worker policy.
 ---
 
-# Local Implement
+# Local Worker
 
-The model selected in this Codex window plans, scopes, and reviews. The pinned local Qwen
+The model selected in this Codex window plans, scopes, and reviews. The pinned local worker
 model performs every implementation and repair; the launcher then runs the contract's
 verification commands. Both the worker and verification run full-host: the launcher's own
 filesystem permissions, network enabled, no sandbox confinement, no approval prompts, and no
@@ -13,14 +13,14 @@ execpolicy rules. This is a local routing default, never a reason to switch to a
 It does not change the window model, global provider, or app-wide enforcement.
 
 Resolve the plugin root from this skill's own path instead of trusting a remembered checkout.
-This file is `<root>/skills/local-implement/SKILL.md`, so the plugin root is two directories above
-it, `plugin.json` sits directly inside it, and the launcher is `<root>/bin/local-implement`. The
+This file is `<root>/skills/local-worker/SKILL.md`, so the plugin root is two directories above
+it, `plugin.json` sits directly inside it, and the launcher is `<root>/bin/local-worker`. The
 root is wherever the installed package lives; it changes on every update or reinstall, so never
 hardcode a personal checkout path. The user-wide default that routes work here is
 [the canonical global policy](references/global-policy.md).
 
 ```sh
-<root>/bin/local-implement --help
+<root>/bin/local-worker --help
 ```
 
 The default execution backend is `full-host-access`; legacy explicit helpers also exist.
@@ -120,7 +120,7 @@ results.
 While a worker runs, use the live status command and stream available attempt logs:
 
 ```sh
-<launcher> status --state-dir "$LOCAL_IMPLEMENT_STATE_DIR" --job-id <job-id>
+<launcher> status --state-dir "$LOCAL_WORKER_STATE_DIR" --job-id <job-id>
 ```
 
 Status reports elapsed time and token usage only when measured, with its source or an
@@ -146,7 +146,7 @@ circuit-breaker or repair budget.
 This skill is discovered from the installed package, so there is nothing to copy here. The
 installer behind [setup](../setup/SKILL.md) maintains the small managed global instruction block
 that points at this skill and at [the canonical global policy](references/global-policy.md); a
-legacy hand-copied `~/.codex/skills/local-implement/SKILL.md` can be retired once the plugin
+legacy hand-copied `~/.codex/skills/local-worker/SKILL.md` can be retired once the plugin
 install is qualified. A worker never installs a skill or writes global configuration.
 
 ## Failure handling

@@ -1,7 +1,7 @@
 """`src/plugin_setup.py` runs as a subprocess against real temporary homes and state paths.
 
 Every case copies the package to a relocated path containing spaces, invokes the script from a
-different working directory, and points `CODEX_HOME`, `LOCAL_IMPLEMENT_STATE_DIR` and `HOME` at
+different working directory, and points `CODEX_HOME`, `LOCAL_WORKER_STATE_DIR` and `HOME` at
 throwaway directories, so root/config resolution is exercised rather than mirrored. Nothing here
 touches a developer's real `~/.codex` or `~/.local-implement`, and the only launcher involved is
 an explicitly fake one: no server, no model inference, no network.
@@ -19,18 +19,18 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-POLICY_RELATIVE = "skills/local-implement/references/global-policy.md"
-BEGIN = "<!-- local-qwen begin -->"
-END = "<!-- local-qwen end -->"
+POLICY_RELATIVE = "skills/local-worker/references/global-policy.md"
+BEGIN = "<!-- local-worker begin -->"
+END = "<!-- local-worker end -->"
 SENTINEL = "sk-SENTINEL-9f2c41d7b6e4"
 LEGACY_BYTES = (ROOT / "evidence" / "global-default" / "AGENTS.md").read_bytes()
 HEAD = b"# My own Codex defaults\n\n- Always run the focused tests before shipping.\n"
 TAIL = b"\n## Private notes\n- keep \xff\xfe these exact bytes\n"
 PACKAGE_KEYS = ("canonical_policy", "launcher", "launcher_skill", "setup_script",
-                "launcher_engine", "skill_local-implement", "skill_setup", "skill_doctor",
+                "launcher_engine", "skill_local-worker", "skill_setup", "skill_doctor",
                 "onboarding_skill")
 
-# The exact success receipt `bin/local-implement preflight` prints; nothing else may pass.
+# The exact success receipt `bin/local-worker preflight` prints; nothing else may pass.
 RECEIPT = {"endpoint": "http://127.0.0.1:8000/v1",
            "canonical_model": "Qwen3.8-Flash-Next-UD-Q4_K_XL",
            "api_model": "qwen-3.8-nf-splash",
@@ -52,8 +52,8 @@ class SetupCase(unittest.TestCase):
     """One relocated package, one temporary home, one temporary shared state directory."""
 
     def setUp(self):
-        self.temp = Path(tempfile.mkdtemp(prefix="Local Qwen Setup "))
-        self.package = self.copy_package("local-qwen")
+        self.temp = Path(tempfile.mkdtemp(prefix="Local Worker Setup "))
+        self.package = self.copy_package("codex-local-worker")
         self.home = self.temp / "codex home"
         self.state = self.temp / "shared state" / "state dir"
         self.fake_home = self.temp / "user home"
@@ -76,9 +76,9 @@ class SetupCase(unittest.TestCase):
 
     def environment(self, **overrides):
         base = {key: value for key, value in os.environ.items()
-                if not key.startswith("LOCAL_IMPLEMENT_")}
+                if not key.startswith("LOCAL_WORKER_")}
         base.update({"HOME": str(self.fake_home), "CODEX_HOME": str(self.home),
-                     "LOCAL_IMPLEMENT_STATE_DIR": str(self.state)})
+                     "LOCAL_WORKER_STATE_DIR": str(self.state)})
         base.update(overrides)
         for key in [key for key, value in base.items() if value is None]:
             del base[key]
@@ -115,7 +115,7 @@ class SetupCase(unittest.TestCase):
                 for path in sorted(Path(base).rglob("*")) if path.is_file()}
 
     def fake_launcher(self, payload, returncode=0, before="", package=None):
-        launcher = Path(package or self.package) / "bin" / "local-implement"
+        launcher = Path(package or self.package) / "bin" / "local-worker"
         launcher.write_text(launcher_script(payload, returncode, before), encoding="utf-8")
         os.chmod(str(launcher), 0o755)
         return launcher
@@ -133,7 +133,7 @@ class ManagedBlockTextTest(SetupCase):
         return Path(os.path.realpath(target))
 
     def test_generated_repair_command_round_trips_through_a_shell(self):
-        package = self.relocated_copy("local-qwen's copy")
+        package = self.relocated_copy("codex-local-worker's copy")
         code, report, output = self.invoke(["--apply"], package=package)
         self.assertEqual(code, 0, output)
         text = self.agents.read_text(encoding="utf-8")
@@ -153,8 +153,8 @@ class ManagedBlockTextTest(SetupCase):
         text = self.agents.read_text(encoding="utf-8")
         policy = str(Path(package) / POLICY_RELATIVE)
         self.assertIn("[global-policy.md](<%s>)" % policy, text)
-        self.assertIn("[local-implement/SKILL.md](<%s>)" % str(
-            Path(package) / "skills" / "local-implement" / "SKILL.md"), text)
+        self.assertIn("[local-worker/SKILL.md](<%s>)" % str(
+            Path(package) / "skills" / "local-worker" / "SKILL.md"), text)
         self.assertIn("<%s>" % str(package), text)
 
 
@@ -169,9 +169,9 @@ class CheckReportTest(SetupCase):
         self.assertEqual(report["mode"], "check")
         self.assertEqual(report["exit_code"], 0)
         self.assertFalse(report["writes_performed"])
-        self.assertEqual(report["plugin"]["name"], "local-qwen")
+        self.assertEqual(report["plugin"]["name"], "codex-local-worker")
         self.assertEqual(report["plugin"]["root"], str(self.package))
-        self.assertEqual(report["plugin"]["version"], "0.1.0")
+        self.assertEqual(report["plugin"]["version"], "0.2.0")
         self.assertEqual(Path(report["plugin"]["manifest"]).name, "plugin.json")
         self.assertEqual(Path(report["plugin"]["onboarding_skill"]).name, "SKILL.md")
         self.assertEqual(Path(report["codex_home"]).resolve(), self.home.resolve())
@@ -190,7 +190,7 @@ class CheckReportTest(SetupCase):
         self.assertTrue(environment["python"]["version"])
         self.assertIn(environment["git"]["source"], ("PATH", "missing"))
         self.assertIn(report["environment"]["codex_cli"]["source"],
-                      ("PATH", "missing", "LOCAL_IMPLEMENT_CODEX_BIN"))
+                      ("PATH", "missing", "LOCAL_WORKER_CODEX_BIN"))
         self.assertTrue(environment["native"]["optional"])
         self.assertFalse(environment["omlx"]["contents_read"])
         self.assertEqual(report["preflight"]["status"], "not-requested")
@@ -203,7 +203,7 @@ class CheckReportTest(SetupCase):
 
     def test_home_defaults_come_from_home_when_the_env_vars_are_unset(self):
         code, report, output = self.invoke(env=self.environment(CODEX_HOME=None,
-                                                                LOCAL_IMPLEMENT_STATE_DIR=None))
+                                                                LOCAL_WORKER_STATE_DIR=None))
         self.assertEqual(code, 0, output)
         self.assertEqual(report["codex_home"], os.path.normpath(
             os.path.join(str(self.fake_home), ".codex")))
@@ -216,14 +216,14 @@ class CheckReportTest(SetupCase):
         override.parent.mkdir(parents=True, exist_ok=True)
         override.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         os.chmod(str(override), 0o755)
-        code, report, output = self.invoke(env=self.environment(LOCAL_IMPLEMENT_CODEX_BIN=
+        code, report, output = self.invoke(env=self.environment(LOCAL_WORKER_CODEX_BIN=
                                                                 str(override)))
         self.assertEqual(code, 0, output)
         cli = report["environment"]["codex_cli"]
-        self.assertEqual(cli["source"], "LOCAL_IMPLEMENT_CODEX_BIN")
+        self.assertEqual(cli["source"], "LOCAL_WORKER_CODEX_BIN")
         self.assertTrue(cli["available"], cli)
         self.assertEqual(cli["path"], str(override))
-        _, unset, _ = self.invoke(env=self.environment(LOCAL_IMPLEMENT_CODEX_BIN=None))
+        _, unset, _ = self.invoke(env=self.environment(LOCAL_WORKER_CODEX_BIN=None))
         self.assertEqual(unset["environment"]["codex_cli"]["source"],
                          "PATH" if shutil.which("codex") else "missing")
 
@@ -306,7 +306,7 @@ class ApplyTest(SetupCase):
         self.assertLess(len(block), 1500, "global guidance must stay small")
         self.assertIn("[global-policy.md](<" + str(self.package) + "/" + POLICY_RELATIVE + ">)",
                       block)
-        self.assertIn("<" + str(self.package) + "/skills/local-implement/SKILL.md>", block)
+        self.assertIn("<" + str(self.package) + "/skills/local-worker/SKILL.md>", block)
         self.assertIn("<" + str(self.package) + ">", block)
         policy = (self.package / POLICY_RELATIVE).read_text(encoding="utf-8")
         self.assertNotIn(policy[:120], block, "the authoritative policy stays in the package")
@@ -351,7 +351,7 @@ class ApplyTest(SetupCase):
         self.assertEqual(lines[1], "")
         self.assertEqual(lines[2], BEGIN)
         self.assertEqual(text.count(BEGIN), 1)
-        self.assertNotIn("/.codex/skills/local-implement/SKILL.md", text,
+        self.assertNotIn("/.codex/skills/local-worker/SKILL.md", text,
                          "the legacy global file must not be kept as a duplicate policy")
         self.assertIn("<" + str(self.package) + "/" + POLICY_RELATIVE + ">", text)
         self.assertEqual(Path(report["apply"]["backup"]).read_bytes(), LEGACY_BYTES)
@@ -635,7 +635,7 @@ class PreflightTest(SetupCase):
         self.assertTrue(preflight["stdout_parsed"])
         self.assertEqual(preflight["cwd"], str(self.package))
         self.assertEqual(Path(preflight["command"][0]), Path(self.package) / "bin" /
-                         "local-implement")
+                         "local-worker")
         self.assertEqual(preflight["command"][1], "preflight")
         self.assertEqual(preflight["timeout_seconds"], 60.0)
         self.assertNotIn(SENTINEL, output)
@@ -662,7 +662,7 @@ class PreflightTest(SetupCase):
         self.assertNotIn(SENTINEL, output)
 
     def test_zero_exit_without_json_is_not_an_endpoint_pass(self):
-        launcher = Path(self.package) / "bin" / "local-implement"
+        launcher = Path(self.package) / "bin" / "local-worker"
         launcher.write_text("#!/bin/sh\necho \"ready api_key=" + SENTINEL + "\"\n"
                             "echo \"raw Bearer " + SENTINEL + "\" >&2\nexit 0\n", encoding="utf-8")
         os.chmod(str(launcher), 0o755)
@@ -697,13 +697,13 @@ class PreflightTest(SetupCase):
         self.assertIn("timed out", preflight["reason"])
 
     def test_missing_launcher_is_reported_rather_than_claimed(self):
-        launcher = Path(self.package) / "bin" / "local-implement"
+        launcher = Path(self.package) / "bin" / "local-worker"
         launcher.unlink()
         code, report, output = self.invoke()
         self.assertEqual(code, 3, output)
         self.assertEqual(report["error"]["stage"], "package")
         partial = self.copy_package("half a package")
-        os.chmod(str(partial / "bin" / "local-implement"), 0o644)
+        os.chmod(str(partial / "bin" / "local-worker"), 0o644)
         code, report, output = self.invoke(["--check", "--preflight"], package=partial)
         self.assertEqual(code, 6, output)
         self.assertFalse(report["preflight"]["endpoint_passed"])
