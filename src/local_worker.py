@@ -171,6 +171,14 @@ FEATURE_FLAGS = {
     "features.multi_agent": False,
     "features.skip_host_skill_discovery": True,
 }
+# Non-negotiable CLI flags of the worker invocation. The worker never loads the user's config
+# or rules, so these flags plus the ``-c`` pins are the entire policy: full-host access,
+# machine-readable events and no interactive approval can never be inherited by accident.
+REQUIRED_WORKER_FLAGS = ("--ignore-user-config", "--ignore-rules", "--json")
+# Single-valued flags: a second, different value is drift, not a later value quietly winning.
+SANDBOX_FLAGS = ("-s", "--sandbox")
+MODEL_FLAGS = ("-m", "--model")
+REQUIRED_SANDBOX_MODE = "danger-full-access"
 # Never let the local key, or any credential that leaked into the worker env, reach a
 # model-generated shell command.
 SHELL_ENV_EXCLUDES = (
@@ -1119,6 +1127,11 @@ def run_bounded(argv: Sequence[str], *, cwd: Optional[Path], env: Dict[str, str]
         termination = _terminate_group(process)
         with contextlib.suppress(subprocess.TimeoutExpired):
             stdout, stderr = process.communicate(timeout=5)
+    except BaseException:
+        # An interrupt or an internal failure must not leave the worker running: the streaming
+        # runner kills the group before propagating, and this path has to do the same.
+        termination = _terminate_group(process)
+        raise
     return {
         "argv": list(argv), "returncode": process.returncode, "timed_out": timed_out,
         "elapsed_seconds": round(time.monotonic() - started, 2), "stdout": stdout or b"",
@@ -1159,34 +1172,114 @@ def config_overrides(alias: str) -> List[str]:
     return [item for key, value in settings for item in ("-c", f"{key}={value}")]
 
 
-def config_overrides_map(argv: Sequence[str]) -> Dict[str, str]:
-    """Collect the ``-c key=value`` overrides present in an argv."""
-    overrides: Dict[str, str] = {}
+def config_override_pairs(argv: Sequence[str]) -> List[Tuple[str, str]]:
+    """Every ``-c key=value`` occurrence in argv order, so a duplicate cannot hide drift."""
+    pairs: List[Tuple[str, str]] = []
     for index, item in enumerate(argv):
         if item == "-c" and index + 1 < len(argv) and "=" in argv[index + 1]:
             key, _, value = argv[index + 1].partition("=")
-            overrides[key] = value
-    return overrides
+            pairs.append((key, value))
+    return pairs
+
+
+def config_overrides_map(argv: Sequence[str]) -> Dict[str, str]:
+    """Collect the ``-c key=value`` overrides present in an argv (last occurrence wins)."""
+    return dict(config_override_pairs(argv))
+
+
+def flag_values(argv: Sequence[str], flag: str) -> List[str]:
+    """Every value given for *flag* (``-s X`` or ``-s=X``), in argv order."""
+    values: List[str] = []
+    for index, item in enumerate(argv):
+        if not isinstance(item, str):
+            continue
+        if item == flag and index + 1 < len(argv):
+            values.append(str(argv[index + 1]))
+        elif item.startswith(flag + "="):
+            values.append(item.split("=", 1)[1])
+    return values
+
+
+def _single_valued_flag(argv: Sequence[str], flags: Sequence[str], expected: str) -> List[str]:
+    """Problems for a flag that must appear with *expected* as its value across all aliases.
+
+    Aliases are one setting, so every occurrence is collected before anything is validated:
+    returning after the first alias that has a value would let ``-m correct --model wrong``
+    pass while the winning alias silently routes somewhere else.
+    """
+    given: List[Tuple[str, str]] = [(flag, value) for flag in flags
+                                    for value in flag_values(argv, flag)]
+    if not given:
+        return [f"{flags[0]} {expected} is missing"]
+    distinct = sorted({value for _, value in given})
+    if len(distinct) > 1:
+        return [f"{flags[0]} is given more than once with conflicting values {distinct} "
+                f"(given as {' '.join(f'{flag} {value}' for flag, value in given)})"]
+    flag, value = given[0]
+    if value != expected:
+        return [f"{flag} {expected} got {flag} {value}"]
+    return []
+
+
+def shell_env_excludes(value: Optional[str]) -> List[str]:
+    """Member names of the ``shell_environment_policy.exclude`` array, parsed exactly."""
+    if not isinstance(value, str):
+        return []
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        return []
+    return [item for item in parsed if isinstance(item, str)] if isinstance(parsed, list) else []
+
+
+def expected_config_pins(alias: str = EXPECTED_ALIAS) -> Dict[str, str]:
+    """The full pinned ``-c`` policy, derived from the single place that builds it."""
+    return config_overrides_map(config_overrides(alias))
 
 
 def missing_config_pins(argv: Sequence[str]) -> List[str]:
-    """Self-check before launching: any drift from the pinned local policy is a refusal."""
-    overrides = config_overrides_map(argv)
+    """Self-check before launching: any drift from the pinned local policy is a refusal.
+
+    ``--ignore-user-config`` means the argv *is* the whole policy, so routing flags and every
+    pinned override are checked together: a missing pin, a changed value, a conflicting
+    duplicate override or a second model/sandbox flag all refuse the launch instead of letting
+    the last occurrence quietly win.
+    """
+    pairs = config_override_pairs(argv)
+    overrides = dict(pairs)
     problems: List[str] = []
-    for key, expected in sorted(CONFIG_PINS.items()):
+    pinned = expected_config_pins()
+    for key, expected in CONFIG_PINS.items():
+        # The documented floor stays required on its own: deleting a pin from
+        # config_overrides() must not silently delete the requirement for it.
+        pinned.setdefault(key, expected)
+    for key, expected in sorted(pinned.items()):
         actual = overrides.get(key)
         if actual is None:
             problems.append(f"{key}={expected} is missing")
         elif actual != expected:
             problems.append(f"{key}={expected} got {actual}")
-    for key, value in sorted(overrides.items()):
+    duplicated: Dict[str, List[str]] = {}
+    for key, value in pairs:
+        duplicated.setdefault(key, []).append(value)
+    for key, values in sorted(duplicated.items()):
+        if len(set(values)) > 1:
+            problems.append(f"-c {key} is overridden more than once with conflicting values "
+                            f"{sorted(set(values))}")
+    for key, value in pairs:
         if key.endswith(".base_url") and value != f'"{ENDPOINT}"':
             problems.append(f"{key} must stay on the loopback endpoint {ENDPOINT}, got {value}")
+    for flag in REQUIRED_WORKER_FLAGS:
+        if flag not in argv:
+            problems.append(f"{flag} is missing")
+    problems.extend(_single_valued_flag(argv, SANDBOX_FLAGS, REQUIRED_SANDBOX_MODE))
+    problems.extend(_single_valued_flag(argv, MODEL_FLAGS, EXPECTED_ALIAS))
     inherit = overrides.get("shell_environment_policy.inherit")
     if inherit not in ('"none"', '"core"'):
         problems.append('shell_environment_policy.inherit must be "none" or "core", '
                         f"got {inherit!r}")
-    if inherit == '"core"' and API_KEY_ENV not in overrides.get("shell_environment_policy.exclude", ""):
+    if inherit == '"core"' and API_KEY_ENV not in shell_env_excludes(
+            overrides.get("shell_environment_policy.exclude")):
         problems.append(f"shell_environment_policy.exclude must exclude {API_KEY_ENV}")
     return problems
 
@@ -1241,7 +1334,36 @@ APPLE_PROMPT_NOTE = (
 )
 
 
-def _budget_section(task: Task, deadline: Optional[Deadline]) -> List[str]:
+def _attempt_budget_lines(deadline: Optional[Deadline], attempt_timeout: Optional[float],
+                          reserve: Optional[float], attempt_cap: Optional[float]) -> List[str]:
+    """What the worker is actually allowed to spend on *this* attempt, in its own words.
+
+    The total job budget alone is not actionable: the worker is killed much earlier, at
+    ``min(remaining - verification reserve, per-attempt cap)``.
+    """
+    if attempt_timeout is None:
+        return []
+    effective = float(attempt_timeout)
+    parts: List[str] = []
+    if deadline is not None:
+        left = max(0.0, deadline.remaining())
+        if reserve is None:
+            parts.append(f"remaining {left:.1f}s")
+        else:
+            parts.append(f"remaining {left:.1f}s - verification reserve {float(reserve):.1f}s")
+    if attempt_cap is not None:
+        parts.append(f"per-attempt cap {float(attempt_cap):.1f}s")
+    line = (f"- This attempt: the worker and its whole process group are killed at "
+            f"{effective:.1f}s.")
+    if parts:
+        line += f" That effective cutoff is min({', '.join(parts)})."
+    return [line, "- Budget each step against that cutoff, not against the total above."]
+
+
+def _budget_section(task: Task, deadline: Optional[Deadline],
+                    attempt_timeout: Optional[float] = None,
+                    reserve: Optional[float] = None,
+                    attempt_cap: Optional[float] = None) -> List[str]:
     """Total job budget and, when a live Deadline is handed in, what is actually left of it.
 
     The remainder is read from the shared job Deadline at prompt-construction time, so a retry
@@ -1260,16 +1382,21 @@ def _budget_section(task: Task, deadline: Optional[Deadline]) -> List[str]:
     if deadline is None:
         lines.append("- Remaining now: not measured by this render; the launcher tracks the "
                      "shared budget itself.")
+        lines.extend(_attempt_budget_lines(deadline, attempt_timeout, reserve, attempt_cap))
         return lines
     left = max(0.0, deadline.remaining())
     ends_at = (datetime.now(timezone.utc) + timedelta(seconds=left)).strftime("%Y-%m-%dT%H:%M:%SZ")
     lines.append(f"- Remaining now: {left:.1f}s of that total (hard deadline {ends_at} UTC).")
+    lines.extend(_attempt_budget_lines(deadline, attempt_timeout, reserve, attempt_cap))
     return lines
 
 
 def build_prompt(task: Task, worktree: Path, feedback: Optional[str] = None,
                  apple_udid: Optional[str] = None,
-                 deadline: Optional[Deadline] = None) -> str:
+                 deadline: Optional[Deadline] = None,
+                 attempt_timeout: Optional[float] = None,
+                 reserve: Optional[float] = None,
+                 attempt_cap: Optional[float] = None) -> str:
     lines = [
         f"Task {task.task_id} (base commit {task.base_ref}).",
         *PROMPT_RULES,
@@ -1285,7 +1412,8 @@ def build_prompt(task: Task, worktree: Path, feedback: Optional[str] = None,
         "",
         "Verification commands (argv arrays, run from the worktree root):",
         *[f"- {json.dumps(argv)}" for argv in task.test_commands],
-        *_budget_section(task, deadline),
+        *_budget_section(task, deadline, attempt_timeout=attempt_timeout, reserve=reserve,
+                         attempt_cap=attempt_cap),
         "",
         f"Worktree: {worktree}",
     ]
@@ -1406,9 +1534,18 @@ def parse_worker_log(text: str) -> Dict[str, Any]:
 
     Unsupported-tool detection is deliberately narrow: an explicit error/failure event or a
     raw diagnostic line, never successful command output, command text, reasoning or messages.
+    Model, thread, tool and terminal-failure evidence comes only from the documented event
+    locations: a model name, item type or event type that a payload merely quotes is data.
     """
     models: List[str] = []
-    tools = 0
+    started: set = set()
+    completed: set = set()
+    stageless: set = set()
+    anonymous = 0
+    anonymous_started = 0
+    anonymous_completed = 0
+    thread_id: Optional[str] = None
+    terminal: List[str] = []
     unsupported = False
     tokens: Dict[str, Optional[int]] = {"input_tokens": None, "output_tokens": None}
     for line in text.splitlines():
@@ -1423,8 +1560,8 @@ def parse_worker_log(text: str) -> Dict[str, Any]:
             if line and UNSUPPORTED_RE.search(line) and DIAGNOSTIC_RE.search(line):
                 unsupported = True
             continue
-        for value in _walk_key(event, "model"):
-            if isinstance(value, str) and value and value not in models:
+        for value in observation.event_models(event):
+            if value not in models:
                 models.append(value)
         for value in _walk_key(event, "input_tokens") + _walk_key(event, "prompt_tokens"):
             if isinstance(value, int):
@@ -1432,15 +1569,39 @@ def parse_worker_log(text: str) -> Dict[str, Any]:
         for value in _walk_key(event, "output_tokens") + _walk_key(event, "completion_tokens"):
             if isinstance(value, int):
                 tokens["output_tokens"] = value
-        for value in _walk_key(event, "type"):
-            if isinstance(value, str) and value in ("command_execution", "function_call", "exec_command"):
-                tools += 1
+        identified = observation.tool_event(event)
+        if identified is not None:
+            stage, key = identified
+            if key is None:
+                # Without an id nothing can be deduplicated, so each observation counts once.
+                anonymous += 1
+                if stage == "started":
+                    anonymous_started += 1
+                elif stage == "completed":
+                    anonymous_completed += 1
+            elif stage == "started":
+                started.add(key)
+            elif stage == "completed":
+                completed.add(key)
+            else:
+                stageless.add(key)
+        thread = observation.event_thread_id(event)
+        if thread and thread_id is None:
+            thread_id = thread
+        failure_type = observation.terminal_failure(event)
+        if failure_type and failure_type not in terminal:
+            terminal.append(failure_type)
         if any(UNSUPPORTED_RE.search(item) for item in _failure_texts(event)):
             unsupported = True
     return {
         "observed_models": sorted(models),
-        "tool_call_events": tools,
+        "thread_id": thread_id,
+        "tool_call_events": len(started | completed | stageless) + anonymous,
+        "tool_started_count": len(started) + anonymous_started,
+        "tool_completed_count": len(completed) + anonymous_completed,
         "unsupported_tools": unsupported,
+        "terminal_failure": bool(terminal),
+        "terminal_failures": sorted(terminal),
         **observation.parse_usage(text),
     }
 
@@ -1862,7 +2023,10 @@ def progress(report: Dict[str, Any], phase: str) -> None:
                         finished_at=datetime.now(timezone.utc).isoformat(),
                         failure_reason=report.get("failure_reason"),
                         active=False)
-    previous.setdefault("started_at", report.get("started_at"))
+    # The observer rewrites this file per attempt with its own attempt start; the job start
+    # stays authoritative, so a live snapshot still reports job-level elapsed time.
+    previous["started_at"] = report.get("started_at") or previous.get("started_at")
+    previous.setdefault("job_started_at", previous["started_at"])
     previous.update(launcher_pid=report["launcher_pid"],
                     active=phase != report.get("status"),
                     job_id=report["job_id"], status=phase, phase=phase,
@@ -1996,8 +2160,9 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
                 report["status"] = "audit_violation"
             return
 
-    prompt = build_prompt(task, worktree, apple_udid=options.apple_simulator_udid,
-                          deadline=deadline)
+    # The prompt is built per attempt: only here is the effective worker cutoff known, and a
+    # retry must see the budget the earlier attempt and verification actually consumed.
+    feedback: Optional[str] = None
     worker_ok = False
     tests: List[Dict[str, Any]] = []
     audit: Optional[Audit] = None
@@ -2022,9 +2187,15 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         if remaining <= reserve + 1:
             report["failure_reason"] = "worker admission stopped to preserve independent verification time"
             break
+        attempt_cap = (float(options.attempt_timeout_cap)
+                       if options.attempt_timeout_cap is not None else None)
         attempt_timeout = deadline.cap(remaining - reserve)
-        if options.attempt_timeout_cap is not None:
-            attempt_timeout = min(attempt_timeout, float(options.attempt_timeout_cap))
+        if attempt_cap is not None:
+            attempt_timeout = min(attempt_timeout, attempt_cap)
+        prompt = build_prompt(task, worktree, feedback,
+                              apple_udid=options.apple_simulator_udid, deadline=deadline,
+                              attempt_timeout=attempt_timeout, reserve=reserve,
+                              attempt_cap=attempt_cap)
 
         jsonl_path = report_dir / f"attempt-{attempt_number}.jsonl"
         prompt_path = report_dir / f"attempt-{attempt_number}.prompt.txt"
@@ -2035,7 +2206,10 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         _policy_check(argv)
         patch_before = audit_worktree(worktree, base_commit, task.allowed_paths, secrets, scratch_dir=report_dir).patch
         observer = observation.RunObserver(report_dir, secrets=secrets,
-                                           attempt=attempt_number, job_id=report["job_id"])
+                                           attempt=attempt_number, job_id=report["job_id"],
+                                           job={"started_at": report.get("started_at"),
+                                                "workstream": report.get("workstream"),
+                                                "job_kind": report.get("job_kind")})
         context_token = _RUN_OBSERVER.set(observer)
         try:
             if stream is not None:
@@ -2059,11 +2233,13 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         jsonl_path.write_text(stdout_text, encoding="utf-8")
         stderr_path.write_text(stderr_text, encoding="utf-8")
         evidence = parse_worker_log(stdout_text)
+        observer.record_event_evidence(evidence)
         routing = model_routing(evidence, report["api_model"])
         timeline = observer.snapshot()["usage"]
         for field_name in ("started_at", "finished_at", "elapsed_seconds"):
             evidence["usage"][field_name] = timeline[field_name]
-        if result.get("timed_out") or result.get("returncode") != 0:
+        if (result.get("timed_out") or result.get("returncode") != 0
+                or evidence["terminal_failures"]):
             evidence["usage"]["complete"] = False
             if evidence["usage"]["availability"] == "complete":
                 evidence["usage"]["availability"] = "partial"
@@ -2086,7 +2262,11 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
             "observed_models": evidence["observed_models"],
             "model_routing": routing,
             "tool_call_events": evidence["tool_call_events"],
+            "tool_started_count": evidence["tool_started_count"],
+            "tool_completed_count": evidence["tool_completed_count"],
+            "thread_id": evidence["thread_id"],
             "unsupported_tools": evidence["unsupported_tools"],
+            "terminal_failures": evidence["terminal_failures"],
             "token_counts": evidence["token_counts"],
             "stderr_excerpt": _tail(stderr_text),
             "last_message_excerpt": _tail(_read_text(last_path, secrets)),
@@ -2134,14 +2314,13 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         report["changed_paths"] = audit.changed_paths
         report["violations"] = audit.violations
 
-        worker_ok = result["returncode"] == 0 and not result["timed_out"] and routing != "mismatch"
+        worker_ok = (result["returncode"] == 0 and not result["timed_out"]
+                     and routing != "mismatch" and not evidence["terminal_failure"])
         tests_ok = (all(test.get("status") == "passed" for test in tests) if options.verify else True)
         if routing == "mismatch" or (worker_ok and tests_ok and not audit.violations):
             break
         if attempt_number < maximum_attempts:
-            prompt = build_prompt(task, worktree,
-                                  summarize_failure(attempt, tests, audit.violations),
-                                  apple_udid=options.apple_simulator_udid, deadline=deadline)
+            feedback = summarize_failure(attempt, tests, audit.violations)
 
     if audit is None:
         # No attempt reached verification (unsupported tool, exhausted budget, ...). Audit
@@ -2192,6 +2371,11 @@ def decide_status(report: Dict[str, Any], worker_ok: bool) -> str:
         return "model_mismatch"
     if any(item.get("unsupported_tools") for item in attempts):
         return "worker_failed"
+    # A documented terminal event ends the run unsuccessfully even when the process exited 0,
+    # but only the attempt that actually ran last decides the verdict: a failed turn that a
+    # clean retry recovered from stays in the attempt history instead of failing the job.
+    if attempts and attempts[-1].get("terminal_failures"):
+        return "worker_failed"
     if budget_exceeded and not all_passed:
         return "timeout"
     if "blocked" in statuses:
@@ -2240,6 +2424,10 @@ def describe_failure(report: Dict[str, Any]) -> str:
         if attempt.get("unsupported_tools"):
             detail = attempt.get("stderr_excerpt") or "the worker stream reported an unsupported tool"
             parts.append(f"attempt {attempt.get('attempt')} reported unsupported tool(s): {detail}")
+        if attempt.get("terminal_failures"):
+            parts.append(f"attempt {attempt.get('attempt')} ended on terminal event(s) "
+                         f"{attempt.get('terminal_failures')} regardless of exit code "
+                         f"{attempt.get('returncode')}")
         if attempt.get("skipped"):
             parts.append(f"attempt {attempt.get('attempt')} skipped: {attempt['skipped']}")
         elif attempt.get("timed_out"):
@@ -2511,7 +2699,7 @@ def status_snapshot(item):
         return item
     except PermissionError:
         pass  # The process exists, although it belongs to another security context.
-    started = item.get("started_at")
+    started = item.get("job_started_at") or item.get("started_at")
     if started:
         with contextlib.suppress(ValueError, TypeError):
             item["elapsed_seconds"] = round(max(0, (datetime.now(timezone.utc) - datetime.fromisoformat(started)).total_seconds()), 3)

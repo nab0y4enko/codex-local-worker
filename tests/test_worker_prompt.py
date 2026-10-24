@@ -149,9 +149,9 @@ class BudgetReachesTheWorker(unittest.TestCase):
         prompts, deadlines = [], []
         real = lw.build_prompt
 
-        def spy(task, worktree, feedback=None, apple_udid=None, deadline=None):
+        def spy(task, worktree, feedback=None, apple_udid=None, deadline=None, **attempt):
             text = real(task, worktree, feedback=feedback, apple_udid=apple_udid,
-                        deadline=deadline)
+                        deadline=deadline, **attempt)
             prompts.append(text)
             deadlines.append(deadline)
             return text

@@ -1,0 +1,11 @@
+#!/bin/sh
+# Parent-side cleanup entry point: archive one finished worker worktree (committed, dirty,
+# untracked and ignored work included), verify the recovery evidence, then remove the worktree.
+# Stdlib Python only; refuses instead of touching anything it does not own.
+set -eu
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+if [ ! -f "$here/../src/worktree_lifecycle.py" ]; then
+  echo "local-worker-archive: cannot find $here/../src/worktree_lifecycle.py" >&2
+  exit 1
+fi
+exec "${PYTHON:-python3}" "$here/../src/worktree_lifecycle.py" "$@"

@@ -19,6 +19,10 @@ import time
 
 FIELDS = ("input_tokens", "output_tokens", "cached_input_tokens")
 TOOLS = {"command_execution", "function_call", "exec_command", "mcp_tool_call", "web_search"}
+# Documented top-level events that end a run unsuccessfully, whatever the exit code claims.
+TERMINAL_EVENT_TYPES = ("turn.failed", "response.failed", "error")
+# The two documented item lifecycle stages: separate counts that are never merged.
+TOOL_LIFECYCLE = ("item.started", "item.completed")
 
 
 def _now():
@@ -122,6 +126,77 @@ def parse_usage(text):
         except (ValueError, TypeError):
             continue
     return accumulator.result()
+
+
+def _identity(item):
+    """Stable item identity when the event carries one; unknown identity is never invented."""
+    for name in ("id", "call_id"):
+        value = item.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if type(value) is int:
+            return value
+    return None
+
+
+def tool_event(event):
+    """Return ``(lifecycle stage or None, item key or None)`` for a documented tool event.
+
+    ``item.started``/``item.completed`` name a tool in their explicit ``item``; a bare
+    top-level tool event (``function_call``, ``web_search`` ...) names one directly. A nested
+    ``type`` value inside payload data is content the worker quotes, never tool evidence.
+    ``None`` means the event is not about a tool.
+    """
+    if not isinstance(event, dict):
+        return None
+    kind = event.get("type")
+    if kind in TOOL_LIFECYCLE:
+        item = event.get("item")
+        if not isinstance(item, dict) or item.get("type") not in TOOLS:
+            return None
+        return ("started" if kind == "item.started" else "completed"), _identity(item)
+    if isinstance(kind, str) and kind in TOOLS:
+        return None, _identity(event)
+    return None
+
+
+def terminal_failure(event):
+    """Event type of a documented terminal failure event, else ``None``.
+
+    A tool command that failed and was recovered from is an ``item.*`` event and stays
+    non-terminal; only the CLI's own ``turn.failed``/``response.failed``/``error`` events end
+    the run, and only when they are the event itself rather than quoted payload content.
+    """
+    if not isinstance(event, dict):
+        return None
+    kind = event.get("type")
+    return kind if isinstance(kind, str) and kind in TERMINAL_EVENT_TYPES else None
+
+
+def event_thread_id(event):
+    """Thread identity of the documented top-level ``thread.started`` event, else ``None``."""
+    if not isinstance(event, dict) or event.get("type") != "thread.started":
+        return None
+    value = event.get("thread_id")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def event_models(event):
+    """Model identity from explicit event metadata only: top level and response metadata.
+
+    Tool output, file content, reasoning and message payloads routinely quote model names;
+    recursively scanning for a ``model`` key would turn that data into routing evidence.
+    """
+    if not isinstance(event, dict):
+        return []
+    models = []
+    for node in (event, event.get("response")):
+        if not isinstance(node, dict):
+            continue
+        value = node.get("model")
+        if isinstance(value, str) and value.strip() and value.strip() not in models:
+            models.append(value.strip())
+    return models
 
 
 def sum_usage(evidence):
@@ -332,11 +407,19 @@ def _atomic_json(path, value):
 
 class RunObserver:
     """Persist sanitized output immediately and replace an atomic progress snapshot."""
-    def __init__(self, report_dir, secrets=(), attempt=1, job_id=None):
+    def __init__(self, report_dir, secrets=(), attempt=1, job_id=None, job=None):
         self.report_dir = Path(report_dir)
         self.report_dir.mkdir(parents=True, exist_ok=True)
         self.started = time.monotonic()
         self.started_at = _now()
+        # ``progress.json`` is shared with the launcher: it owns job state, this observer owns
+        # attempt state. Job facts are carried into every snapshot the observer writes, so a
+        # quiet worker cannot make a live job look finished.
+        self.job = dict(job or {})
+        if not all(self.job.get(name) for name in ("started_at", "workstream", "job_kind")):
+            for name in ("started_at", "workstream", "job_kind"):
+                if not self.job.get(name):
+                    self.job[name] = self._inherited().get(name)
         secrets = tuple(secrets)
         self.redactors = {name: _Redactor(secrets) for name in ("stdout", "stderr")}
         redactor = _Redactor(secrets)
@@ -354,7 +437,12 @@ class RunObserver:
         self.finished_elapsed = None
         self.last_activity_at = None
         self.activity_count = 0
-        self.counts = {"tool_started_count": 0, "tool_completed_count": 0}
+        self.thread_id = None
+        self.terminal_failures = []
+        # Separate identity sets per stage: a duplicate ``item.started`` is one tool, and a
+        # payload that merely contains a ``type`` value is never counted at all.
+        self.tool_ids = {"tool_started": set(), "tool_completed": set()}
+        self.tool_anonymous = {"tool_started": 0, "tool_completed": 0}
         self.line = ""
         self.usage = _UsageAccumulator()
         self.closed = False
@@ -365,15 +453,71 @@ class RunObserver:
         self.worker_pid = pid
         self._write_progress()
 
+    def _inherited(self):
+        """Job metadata the launcher already wrote into this attempt's progress file."""
+        try:
+            value = json.loads((self.report_dir / "progress.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def _job_metadata(self):
+        """The job-level keys a snapshot must never drop.
+
+        A finished worker is not a finished job: only the launcher's final progress record marks
+        the job inactive, so ``status`` can still check launcher liveness on a quiet snapshot.
+        """
+        return dict(active=True, workstream=self.job.get("workstream"),
+                    job_kind=self.job.get("job_kind"),
+                    job_started_at=self.job.get("started_at") or self.started_at)
+
     def _event(self, event):
         self.usage.add(event)
         if not isinstance(event, dict):
             return
-        kind = event.get("type")
-        item = event.get("item")
-        if kind in {"item.started", "item.completed"} and isinstance(item, dict) and item.get("type") in TOOLS:
-            self.status = "tool_started" if kind == "item.started" else "tool_completed"
-            self.counts[self.status + "_count"] += 1
+        thread = event_thread_id(event)
+        if thread and self.thread_id is None:
+            self.thread_id = thread
+        failure = terminal_failure(event)
+        if failure and failure not in self.terminal_failures:
+            self.terminal_failures.append(failure)
+        detected = tool_event(event)
+        if detected is None:
+            return
+        stage, key = detected
+        if stage is None:
+            # A bare top-level tool event names a tool but has no lifecycle stage of its own.
+            return
+        name = "tool_started" if stage == "started" else "tool_completed"
+        if key is None:
+            # Without an id there is nothing to deduplicate against, so it stays an observation.
+            self.tool_anonymous[name] += 1
+        else:
+            self.tool_ids[name].add(key)
+        self.status = name
+
+    def _tool_counts(self):
+        return dict((name + "_count", len(self.tool_ids[name]) + self.tool_anonymous[name])
+                    for name in self.tool_ids)
+
+    def record_event_evidence(self, evidence):
+        """Reconcile the snapshot with what the persisted JSONL actually contains.
+
+        The live callback only sees chunks the reader delivered while the worker ran, so thread
+        identity and terminal events are adopted from the parsed stream before the final snapshot
+        is written. Tool counts stay what the live stream showed: they are a progress signal.
+        """
+        if not isinstance(evidence, dict):
+            return
+        thread = evidence.get("thread_id")
+        if thread and self.thread_id is None:
+            self.thread_id = thread
+        for failure in evidence.get("terminal_failures") or []:
+            if failure not in self.terminal_failures:
+                self.terminal_failures.append(failure)
+        if self.terminal_failures and self.status not in ("failed", "timed_out"):
+            self.status = "failed"
+        self._write_progress()
 
     def _persist(self, name, text):
         if not text:
@@ -408,10 +552,12 @@ class RunObserver:
                      elapsed_seconds=(self.finished_elapsed if self.finished_elapsed is not None else
                                       round(time.monotonic() - self.started, 3)))
         return dict(job_id=self.job_id, attempt=self.attempt, status=self.status,
+                    thread_id=self.thread_id, terminal_failures=list(self.terminal_failures),
                     launcher_pid=self.launcher_pid, worker_pid=self.worker_pid,
                     started_at=self.started_at, finished_at=self.finished_at,
                     last_activity_at=self.last_activity_at, activity_count=self.activity_count,
-                    elapsed_seconds=usage["elapsed_seconds"], usage=usage, **self.counts)
+                    elapsed_seconds=usage["elapsed_seconds"], usage=usage,
+                    **self._tool_counts(), **self._job_metadata())
 
     def _write_progress(self):
         _atomic_json(self.report_dir / "progress.json", self.snapshot())
@@ -429,6 +575,9 @@ class RunObserver:
         if result and result.get("timed_out"):
             status = "timed_out"
         elif result and result.get("returncode") not in (None, 0) and status == "completed":
+            status = "failed"
+        if self.terminal_failures and status not in ("failed", "timed_out"):
+            # A documented terminal event outranks a zero exit code: the run never ended well.
             status = "failed"
         self.status = status
         self.finished_at = _now()

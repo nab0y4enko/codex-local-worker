@@ -258,6 +258,42 @@ Exit codes: `0 ok`, `1 contract_invalid`, `2 preflight_failed`, `3 blocked`,
 `4 worker_failed`, `5 audit_violation`, `6 tests_failed`, `7 verification_blocked`,
 `8 timeout`, `9 model_mismatch`. Non-zero is never a success.
 
+### Finishing a job: integrate, push, then archive
+
+A worker never commits, merges, pushes or deletes anything: the reviewed parent owns
+integration, and a linked worktree is disposable only once every byte of it is recoverable
+somewhere else. Complete a job in this order:
+
+1. Review `report.json`, `changes.patch`, the audit and every acceptance criterion, and
+   integrate the reviewed commits on the task branch. Never apply an unreviewed patch to the
+   primary checkout.
+2. Resolve conflicts or gaps with a narrowly scoped repair job on the same workstream
+   (`--job-kind repair`) rather than by hand-editing an unreviewed worktree.
+3. Commit and push the task branch, then verify the remote really has it:
+   `git log --oneline origin/<branch>..HEAD` must be empty.
+4. Archive the completed, failed or superseded worktrees:
+
+```sh
+<root>/bin/local-worker-archive archive --repo /absolute/path/repo \
+  --state-dir "$LOCAL_WORKER_STATE_DIR" --job-id <job-id>
+```
+
+The helper takes the exclusive `worker.lock`, refuses anything it does not own, and preserves
+committed, dirty, untracked, ignored **and staged-index** content on a recovery ref
+(`refs/local-worker/archive/<job-id>`) plus a verified `git bundle` and a hash-verified copy
+under `<state-dir>/archives/<job-id>/` before it runs `git worktree remove` for that one path.
+Its receipt is written as `prepared` before removal and only becomes `archived` afterwards, so
+an interrupted run leaves verifiable evidence and refuses instead of archiving twice. Nothing
+is force-removed before verification, an existing ref, bundle or archive is never overwritten,
+and a failure keeps every artifact and the worktree itself. Exit codes: `0` archived (or an
+idempotent replay of a verified receipt), `2` refused, `3` blocked by a live job or lease,
+`4` failed.
+
+Never discard unrelated active work: the helper removes exactly the one worktree named by that
+job's terminal report, and every other worktree, branch, stash or state directory is left
+untouched. A finished task leaves no linked task worktree behind — the recovery refs, bundles
+and archive copies stay.
+
 ### Task contract
 
 Exactly these nine fields; unknown keys are refused, not ignored:
@@ -335,6 +371,26 @@ Any drift is a refusal (`blocked`), not a degraded run:
 Environment isolation: proxy variables are stripped, cloud credential variables
 (`OPENAI_*`, `ANTHROPIC_*`, `AWS_*`, …) are removed, the child gets a minimal base
 environment plus the loopback key only, and the key is redacted from all report text.
+
+### Worker JSONL output versus the app-server protocol
+
+These are two different interfaces and the launcher uses only the first:
+
+- **Worker output (`codex exec --json`)** is a one-way JSONL stream: one event per line, e.g.
+  `thread.started`, `turn.started`/`turn.completed`/`turn.failed`, `item.started`/
+  `item.completed`, `token_count`, `response.failed` and `error`. Nothing is written back to the
+  worker; the launcher reads evidence only from the documented location inside each event —
+  `thread_id` on `thread.started`, `model` at the top level or under `response`, the tool in the
+  explicit `item` of a lifecycle event. A model name, item type or event type that tool output,
+  file content or a message merely *quotes* is payload data, never routing, tool or failure
+  evidence. `item.started` and `item.completed` are counted separately and deduplicated by item
+  id; a documented terminal event makes the run `worker_failed` even when the exit code is `0`.
+- **The app-server protocol** is a separate JSON-RPC session (`initialize`, `thread/start`,
+  `turn/start`, `turn/steer`, server-initiated notifications) that can drive and steer a live
+  turn. The launcher never speaks it: there is no mid-turn steer, no approval round-trip and no
+  reconnection, which is exactly why `max_attempts` restarts a fresh `codex exec` process
+  instead of steering one, and why an interrupted stream is reported from the persisted JSONL
+  rather than resumed.
 
 ## Trust limits, audit, secrets
 
