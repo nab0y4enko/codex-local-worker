@@ -51,6 +51,8 @@ import worker_pool as pool
 import native_readiness as native
 import worker_observability as observation
 import run_policy as policy
+import worker_tools as tools
+from worker_tool_probe import ToolProbeError, probe_tools
 
 _RUN_OBSERVER = contextvars.ContextVar("local_worker_observer", default=None)
 
@@ -1167,9 +1169,52 @@ def config_overrides(alias: str) -> List[str]:
     for key, value in sorted(FEATURE_FLAGS.items()):
         settings.append((key, "true" if value else "false"))
     settings.append(("shell_environment_policy.inherit", '"core"'))
-    excludes = ",".join(f'"{name}"' for name in SHELL_ENV_EXCLUDES)
-    settings.append(("shell_environment_policy.exclude", f"[{excludes}]"))
+    settings.append(shell_env_override())
     return [item for key, value in settings for item in ("-c", f"{key}={value}")]
+
+
+SHELL_ENV_EXCLUDES_KEY = "shell_environment_policy.exclude"
+
+
+def shell_env_exclude_names(extras: Sequence[str] = ()) -> List[str]:
+    """Baseline exclusions first, then every added name, each exactly once."""
+    names: List[str] = []
+    for name in [*SHELL_ENV_EXCLUDES, *extras]:
+        if isinstance(name, str) and name and name not in names:
+            names.append(name)
+    return names
+
+
+def shell_env_override(extras: Sequence[str] = ()) -> Tuple[str, str]:
+    """The one ``shell_environment_policy.exclude`` override for the baseline plus *extras*."""
+    members = ",".join(json.dumps(name) for name in shell_env_exclude_names(extras))
+    return (SHELL_ENV_EXCLUDES_KEY, f"[{members}]")
+
+
+def with_shell_env_excludes(argv: Sequence[str], extras: Sequence[str] = ()) -> List[str]:
+    """Replace the exclude pin with the union of the baseline and *extras*.
+
+    One override replaces the baseline rather than adding a second ``-c``: two conflicting
+    values for the same key would be a self-check refusal, and the last one winning by accident
+    is exactly the drift this check exists to prevent. With nothing to add the argv is returned
+    untouched, so a job without a tools manifest keeps its exact policy.
+    """
+    items = list(argv)
+    additions = [name for name in extras if isinstance(name, str) and name]
+    if not [name for name in additions if name not in SHELL_ENV_EXCLUDES]:
+        return items
+    key, value = shell_env_override(additions)
+    kept: List[str] = []
+    index = 0
+    while index < len(items):
+        if str(items[index]) == "-c" and index + 1 < len(items) \
+                and str(items[index + 1]).startswith(key + "="):
+            index += 2
+            continue
+        kept.append(items[index])
+        index += 1
+    kept.extend(["-c", f"{key}={value}"])
+    return kept
 
 
 def config_override_pairs(argv: Sequence[str]) -> List[Tuple[str, str]]:
@@ -1257,6 +1302,14 @@ def missing_config_pins(argv: Sequence[str]) -> List[str]:
         actual = overrides.get(key)
         if actual is None:
             problems.append(f"{key}={expected} is missing")
+        elif key == SHELL_ENV_EXCLUDES_KEY:
+            # Task tools may only *add* their own credential names to the exclusions: removing
+            # or replacing a baseline name is drift, and every routing pin stays exact.
+            removed = [name for name in shell_env_excludes(expected)
+                       if name not in shell_env_excludes(actual)]
+            if removed:
+                problems.append(f"{key} may only add names to the baseline exclusions; "
+                                f"{', '.join(removed)} were removed")
         elif actual != expected:
             problems.append(f"{key}={expected} got {actual}")
     duplicated: Dict[str, List[str]] = {}
@@ -1284,8 +1337,10 @@ def missing_config_pins(argv: Sequence[str]) -> List[str]:
     return problems
 
 
-def worker_argv(codex_bin: str, worktree: Path, alias: str, last_message: Path) -> List[str]:
-    return [
+def worker_argv(codex_bin: str, worktree: Path, alias: str, last_message: Path,
+                tool_overrides: Sequence[str] = (),
+                shell_excludes: Sequence[str] = ()) -> List[str]:
+    argv = [
         codex_bin, "exec",
         "--ignore-user-config",
         "--ignore-rules",
@@ -1295,8 +1350,11 @@ def worker_argv(codex_bin: str, worktree: Path, alias: str, last_message: Path) 
         "-o", str(last_message),
         "-m", alias,
         *config_overrides(alias),
-        "--", "-",
     ]
+    argv = with_shell_env_excludes(argv, shell_excludes)
+    argv.extend(str(item) for item in tool_overrides)
+    argv.extend(["--", "-"])
+    return argv
 
 
 def worker_env(api_key: str) -> Tuple[Dict[str, str], List[str], List[str]]:
@@ -1868,6 +1926,7 @@ class JobOptions:
     preflight_only: bool = False
     workstream: str = "default"
     job_kind: str = "implementation"
+    tool_config: Optional[Path] = None
 
 
 def new_report(options: JobOptions) -> Dict[str, Any]:
@@ -2070,7 +2129,8 @@ def native_gate(options, report, worktree, sandbox, verify_env, secrets, deadlin
 
 
 def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
-             lease: Optional["pool.Lease"] = None) -> None:
+             lease: Optional["pool.Lease"] = None,
+             secrets: Optional[Sequence[str]] = None) -> None:
     task = options.task
     state_dir = options.state_dir
     if _inside(state_dir, task.repo_path):
@@ -2093,7 +2153,12 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     )
     report["api_model"] = report["preflight"]["api_model"]
     api_key = read_api_key(options.settings_path)
-    secrets = [api_key]
+    # The caller's list already holds the credentials selected by the tools manifest: it grows
+    # here instead of being reset, so nothing collected before the first failure is forgotten.
+    if secrets is None:
+        secrets = []
+    if api_key not in secrets:
+        secrets.append(api_key)
 
     if options.native_preflight_plan is not None and options.apple_simulator_udid is None:
         raise BlockedError("native preflight plan requires --apple-simulator-udid; plan cannot be ignored")
@@ -2122,6 +2187,23 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         # Native toolchain pin for the worker itself: ibtool/actool run in-process. HOME and
         # CODEX_HOME stay exactly as the job had them, so the real simctl/Xcode state is used.
         env["IBToolNeverDeque"] = "1"
+
+    # Task tools are opt-in. The loader only ever sees the credentials the manifest names, and
+    # only the ones the caller actually has; a refused manifest blocks the job rather than
+    # quietly running without the tools the task asked for.
+    selected = [name for name in tools.selected_env_names(options.tool_config) if name in os.environ]
+    loader_env = dict(env)
+    for name in selected:
+        loader_env[name] = os.environ[name]
+    try:
+        loaded = tools.load_tool_config(options.tool_config, loader_env, worktree)
+    except tools.ToolConfigError as error:
+        raise BlockedError(f"tools configuration refused: {error}") from error
+    # Every credential the loader resolved joins the caller's list before the first tool log,
+    # so the shared list redacts the report, the JSONL, stderr and the patch alike.
+    secrets.extend(value for value in loaded["secrets"].values() if value not in secrets)
+    report["tooling"] = loaded["evidence"]
+    env.update(loaded["environment"])
     report["environment"] = {
         "proxies_stripped": stripped_proxies,
         "cloud_credential_vars_removed": cloud_names,
@@ -2135,11 +2217,26 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
             "apple_simulator_udid": str(options.apple_simulator_udid),
         }
 
-    verify_env = {name: value for name, value in env.items() if name != API_KEY_ENV}
+    credentials = set(selected) | set(loaded["environment"])
+    verify_env = {name: value for name, value in env.items()
+                  if name != API_KEY_ENV and name not in credentials}
+    # Required tools are confirmed before any inference, with the installed Codex MCP client and
+    # no model turn: the probe sends only initialize, initialized and mcpServerStatus/list. A
+    # server that cannot list a configured tool blocks the job instead of spending tokens on a
+    # worker that would silently improvise the missing capability.
+    try:
+        report["tooling"] = probe_tools(
+            loaded, codex_bin=options.codex_bin,
+            env={name: value for name, value in env.items() if name != API_KEY_ENV},
+            overrides=config_overrides(report["api_model"]), deadline=deadline,
+            report_dir=report_dir)
+    except ToolProbeError as error:
+        raise BlockedError(f"required MCP tools could not be probed: {error}") from error
     # Self-check the pinned policy before the first subprocess: drift is a refusal, not a
     # degraded run. The sandbox probe runs on the same total budget as everything else.
     _policy_check(worker_argv(options.codex_bin, worktree, report["api_model"],
-                              report_dir / "policy-check.last-message.txt"))
+                              report_dir / "policy-check.last-message.txt",
+                              loaded["overrides"], list(loaded["environment"])))
     sandbox = probe_sandbox(options.codex_bin, worktree, verify_env, secrets, deadline)
     if not options.verify:
         sandbox = dict(sandbox)
@@ -2196,13 +2293,16 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
                               apple_udid=options.apple_simulator_udid, deadline=deadline,
                               attempt_timeout=attempt_timeout, reserve=reserve,
                               attempt_cap=attempt_cap)
+        if loaded["prompt"]:
+            prompt += "\n" + loaded["prompt"] + "\n"
 
         jsonl_path = report_dir / f"attempt-{attempt_number}.jsonl"
         prompt_path = report_dir / f"attempt-{attempt_number}.prompt.txt"
         stderr_path = report_dir / f"attempt-{attempt_number}.stderr.txt"
         last_path = report_dir / f"attempt-{attempt_number}.last-message.txt"
         prompt_path.write_text(redact(prompt, secrets), encoding="utf-8")
-        argv = worker_argv(options.codex_bin, worktree, report["api_model"], last_path)
+        argv = worker_argv(options.codex_bin, worktree, report["api_model"], last_path,
+                           loaded["overrides"], list(loaded["environment"]))
         _policy_check(argv)
         patch_before = audit_worktree(worktree, base_commit, task.allowed_paths, secrets, scratch_dir=report_dir).patch
         observer = observation.RunObserver(report_dir, secrets=secrets,
@@ -2233,6 +2333,7 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         jsonl_path.write_text(stdout_text, encoding="utf-8")
         stderr_path.write_text(stderr_text, encoding="utf-8")
         evidence = parse_worker_log(stdout_text)
+        report["tooling"] = tools.mark_observations(report.get("tooling"), stdout_text)
         observer.record_event_evidence(evidence)
         routing = model_routing(evidence, report["api_model"])
         timeline = observer.snapshot()["usage"]
@@ -2472,6 +2573,9 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
     # job resets it, so ``timeout_seconds`` is a real upper bound.
     deadline = Deadline(float(options.task.timeout_seconds))
     secrets: List[str] = []
+    # Collected before anything can fail: a credential the tools manifest names is redacted even
+    # when the job is refused by preflight, policy or the manifest itself.
+    secrets.extend(tools.redaction_secrets(options.tool_config, os.environ))
     stream = None
     claimed = False
     try:
@@ -2493,7 +2597,9 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
         report["_policy"] = stream if claimed else None
         key_error: Optional[Exception] = None
         try:
-            secrets = [read_api_key(options.settings_path)]
+            model_key = read_api_key(options.settings_path)
+            if model_key not in secrets:
+                secrets.append(model_key)
         except PreflightError as error:
             key_error = error
         # Every lock wait is inside the single job budget: it is measured, never reset.
@@ -2503,7 +2609,7 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
         with job_lease(options, report, lock_timeout, job_deadline=deadline.end) as lease:
             if key_error is not None:
                 raise key_error
-            _execute(options, report, deadline, lease)
+            _execute(options, report, deadline, lease, secrets=secrets)
     except LauncherError as error:
         report["status"] = error.status
         report["failure_reason"] = redact(str(error), secrets)
@@ -2626,6 +2732,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--preflight-only", action="store_true", help="qualify native baseline without starting a worker")
     run.add_argument("--workstream", default="default", help="stable scope name shared across retries and repair jobs")
     run.add_argument("--job-kind", choices=("implementation", "repair"), default="implementation")
+    run.add_argument("--tool-config", type=Path, default=None,
+                     help="optional MCP tools manifest for this task: the manifest names the "
+                          "credentials it needs and their values never reach argv, evidence or "
+                          "the prompt")
     run.add_argument("--settings", default=str(OMLX_SETTINGS))
     run.add_argument("--model-settings", default=str(OMLX_MODEL_SETTINGS))
     run.add_argument("--json", action="store_true", help="print the full report JSON")
@@ -2755,6 +2865,7 @@ def main(argv: Optional[Sequence[str]] = None, *,
             preflight_only=args.preflight_only,
             workstream=args.workstream,
             job_kind=args.job_kind,
+            tool_config=args.tool_config,
         )
         report = run_job(options)
     except LauncherError as error:
