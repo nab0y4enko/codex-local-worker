@@ -3,14 +3,16 @@
 Six narrow claims, each aimed at the exact reviewed hole: aliased model/sandbox flags are one
 setting, the verdict follows the attempt that actually ran last, a terminal failure makes usage
 partial even at exit 0, a live snapshot keeps job metadata so a dead launcher is still visible,
-an interrupted non-streaming run kills its process group, and the prompt states the effective
+an interrupted run kills its process group through the shared runner, and the prompt states the effective
 attempt cutoff rather than only the total budget. Nothing here calls a model, a server or a
 native tool.
 """
 import json
 import os
 import re
+import selectors
 import sys
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -199,22 +201,67 @@ class LiveSnapshotKeepsJobMetadata(unittest.TestCase):
         self.assertLess(result["elapsed_seconds"], 45, result["elapsed_seconds"])
 
 
+REAL_SELECTOR = selectors.DefaultSelector
+
+
 class InterruptedRunCleansItsChild(unittest.TestCase):
+    """An interrupt inside the shared drain loop still has to clean the group it started."""
+
+    def setUp(self):
+        self.root = sp.tmpdir()
+        self.addCleanup(sp.cleanup, self.root)
+        self.script = self.root / "term-ignoring-pair.py"
+        # A real leader that traps SIGTERM and a real descendant that inherits both pipes: an
+        # interrupt that only abandoned the drain loop would leave the pair running with the
+        # output still open, and neither of them dies on the signal the group is sent first.
+        self.script.write_text(
+            "import os, signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "if os.fork() == 0:\n"
+            "    time.sleep(60)\n"
+            "    os._exit(0)\n"
+            "time.sleep(60)\n")
+
     def test_base_exception_terminates_the_group_and_reraises(self):
-        class FakeProcess:
-            pid = 4242
-            returncode = None
+        seen = []
+        real_kill_group = lw._terminate_group
 
-            def communicate(self, input=None, timeout=None):
-                raise KeyboardInterrupt
+        def kill_group(process):
+            seen.append(process.pid)
+            return real_kill_group(process)
 
-        process = FakeProcess()
-        with mock.patch.object(lw.subprocess, "Popen", return_value=process), \
-                mock.patch.object(lw, "_terminate_group") as killed:
-            killed.return_value = {"terminated": True, "force_killed": False, "survivors": False}
+        class InterruptingSelector:
+            """The real selector, interrupted once the loop has registered both output pipes."""
+
+            def __init__(self):
+                self.inner = REAL_SELECTOR()
+                self.registered = 0
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+            def register(self, *args, **kwargs):
+                self.registered += 1
+                return self.inner.register(*args, **kwargs)
+
+            def select(self, timeout=None):
+                if self.registered >= 2:
+                    raise KeyboardInterrupt
+                return self.inner.select(timeout)
+
+        with mock.patch.object(observation.selectors, "DefaultSelector", InterruptingSelector), \
+                mock.patch.object(lw, "_terminate_group", side_effect=kill_group) as killed:
             with self.assertRaises(KeyboardInterrupt):
-                lw.run_bounded(["codex"], cwd=None, env={}, timeout=5, stdin_data=b"task")
-        killed.assert_called_once_with(process)
+                lw.run_bounded([sys.executable, "-u", str(self.script)], cwd=None,
+                               env=dict(os.environ), timeout=60, stdin_data=b"")
+
+        self.assertTrue(killed.called, "the runner must clean up with the wrapper's group killer")
+        pid = seen[0]
+        until = time.monotonic() + 10
+        while time.monotonic() < until and observation._group_exists(pid):
+            time.sleep(0.02)
+        self.assertFalse(observation._group_exists(pid),
+                         "the SIGTERM-ignoring leader and its descendant must both be gone")
 
 
 CUTOFF_LINE = re.compile(r"- This attempt: .*?killed at (\d+\.\d)s")

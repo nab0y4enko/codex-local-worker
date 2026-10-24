@@ -18,6 +18,9 @@ import time
 
 
 FIELDS = ("input_tokens", "output_tokens", "cached_input_tokens")
+# A worker or a test command can flood its pipes. Memory stays bounded by retaining at
+# most this many bytes per stream; the caller treats the truncation as a failure.
+CAPTURE_LIMIT_BYTES = 16 * 1024 * 1024
 TOOLS = {"command_execution", "function_call", "exec_command", "mcp_tool_call", "web_search"}
 # Documented top-level events that end a run unsuccessfully, whatever the exit code claims.
 TERMINAL_EVENT_TYPES = ("turn.failed", "response.failed", "error")
@@ -272,12 +275,20 @@ def _terminate(process):
     return outcome
 
 
-def run_streaming(argv, *, cwd, env, timeout, stdin_data=None, observer=None, terminate_group=None):
+def run_streaming(argv, *, cwd, env, timeout, stdin_data=None, observer=None,
+                  terminate_group=None, capture_limit_bytes=None):
     """Drain both pipes and feed stdin concurrently, bounded even with orphaned pipes.
 
     The callback receives raw bytes and must sanitize before persistence. Returned
     byte buffers retain run_bounded compatibility; callers redact final reports.
+
+    Retention is capped per stream: past ``CAPTURE_LIMIT_BYTES`` the process group is
+    terminated, the extra bytes are dropped without reaching the buffers or the observer,
+    and the pipes are drained only for the existing half-second cleanup window.
+    ``output_limit_exceeded`` reports that truncation so no caller can read success out of
+    output it never saw.
     """
+    limit = CAPTURE_LIMIT_BYTES if capture_limit_bytes is None else max(0, int(capture_limit_bytes))
     started = time.monotonic()
     deadline = started + max(0, timeout)
     process = subprocess.Popen(list(argv), cwd=str(cwd) if cwd else None, env=env,
@@ -287,6 +298,8 @@ def run_streaming(argv, *, cwd, env, timeout, stdin_data=None, observer=None, te
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     termination = {"terminated": False, "force_killed": False, "survivors": False}
     timed_out = False
+    output_limit_exceeded = False
+    drain_deadline = None
     pending = memoryview(stdin_data or b"")
 
     def stop():
@@ -326,7 +339,12 @@ def run_streaming(argv, *, cwd, env, timeout, stdin_data=None, observer=None, te
                     deadline = time.monotonic() + .5
                 else:
                     break
-            for key, _ in selector.select(min(.05, max(0, deadline - time.monotonic()))):
+            wait = min(.05, max(0, deadline - time.monotonic()))
+            if drain_deadline is not None:
+                if time.monotonic() >= drain_deadline:
+                    break
+                wait = min(wait, max(0, drain_deadline - time.monotonic()))
+            for key, _ in selector.select(wait):
                 pipe, name = key.fileobj, key.data
                 if name == "stdin":
                     try:
@@ -344,10 +362,23 @@ def run_streaming(argv, *, cwd, env, timeout, stdin_data=None, observer=None, te
                 if not chunk:
                     close(pipe)
                     continue
-                buffers[name].extend(chunk)
-                if observer:
-                    observer(name, chunk)
-        if process.poll() is None:
+                retained = limit - len(buffers[name])
+                if retained > 0:
+                    buffers[name].extend(chunk[:retained])
+                    if observer:
+                        observer(name, chunk[:retained])
+                if len(chunk) > retained and not output_limit_exceeded:
+                    # Everything past the cap is dropped unseen: kill the group, stop feeding
+                    # stdin, and keep draining only until the cleanup window closes.
+                    output_limit_exceeded = True
+                    termination = stop()
+                    drain_deadline = time.monotonic() + .5
+                    pending = pending[:0]
+                    if process.stdin is not None and process.stdin in selector.get_map():
+                        close(process.stdin)
+        # The output-limit path already stopped the group: stopping again would replace the
+        # record of what the first kill actually did.
+        if process.poll() is None and not output_limit_exceeded:
             termination = stop()
     except BaseException:
         stop()
@@ -361,7 +392,7 @@ def run_streaming(argv, *, cwd, env, timeout, stdin_data=None, observer=None, te
     return {"argv": list(argv), "returncode": process.returncode, "timed_out": timed_out,
             "elapsed_seconds": round(time.monotonic() - started, 2),
             "stdout": bytes(buffers["stdout"]), "stderr": bytes(buffers["stderr"]),
-            "termination": termination}
+            "termination": termination, "output_limit_exceeded": output_limit_exceeded}
 
 
 class _Redactor:

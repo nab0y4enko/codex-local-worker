@@ -1107,38 +1107,20 @@ def _terminate_group(process: subprocess.Popen) -> Dict[str, Any]:
 
 def run_bounded(argv: Sequence[str], *, cwd: Optional[Path], env: Dict[str, str],
                 timeout: float, stdin_data: Optional[bytes] = None) -> Dict[str, Any]:
-    """Run argv in its own process group and kill the whole group on deadline."""
-    observer = _RUN_OBSERVER.get()
-    if observer is not None and stdin_data is not None:
-        return observation.run_streaming(argv, cwd=cwd, env=env, timeout=timeout,
-                                         stdin_data=stdin_data, observer=observer,
-                                         terminate_group=_terminate_group)
-    started = time.monotonic()
-    process = subprocess.Popen(
-        list(argv), cwd=str(cwd) if cwd else None, env=env,
-        stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
-    )
-    timed_out = False
-    stdout = stderr = b""
-    termination: Dict[str, Any] = {"terminated": False, "force_killed": False, "survivors": False}
-    try:
-        stdout, stderr = process.communicate(input=stdin_data, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        termination = _terminate_group(process)
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            stdout, stderr = process.communicate(timeout=5)
-    except BaseException:
-        # An interrupt or an internal failure must not leave the worker running: the streaming
-        # runner kills the group before propagating, and this path has to do the same.
-        termination = _terminate_group(process)
-        raise
-    return {
-        "argv": list(argv), "returncode": process.returncode, "timed_out": timed_out,
-        "elapsed_seconds": round(time.monotonic() - started, 2), "stdout": stdout or b"",
-        "stderr": stderr or b"", "termination": termination,
-    }
+    """Run argv in its own process group and kill the whole group on deadline.
+
+    One runner does all of it. ``observation.run_streaming`` drains both pipes concurrently so
+    output stays bounded by ``CAPTURE_LIMIT_BYTES`` per stream, terminates the whole group on a
+    deadline, an interrupt or an over-cap flood, and reports the real exit status together with
+    the ``output_limit_exceeded`` flag. The file-backed variant this replaces was a second
+    implementation of the same promise *and* a weaker one: an interrupt propagated while a
+    descendant still held the redirected temporary file, so an orphaned writer kept growing it
+    after ``run_bounded`` returned.
+    """
+    return observation.run_streaming(
+        argv, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data,
+        observer=_RUN_OBSERVER.get() if stdin_data is not None else None,
+        terminate_group=_terminate_group)
 
 
 # --------------------------------------------------------------------------------------
@@ -1373,7 +1355,9 @@ PROMPT_RULES = (
     "Create or modify files ONLY under the allowed paths listed below.",
     "Do not run git commit, git merge, git push, or git worktree commands.",
     "Do not read or print credentials, tokens, or environment secrets.",
-    "Run the verification commands listed below and keep iterating until they pass.",
+    "The launcher, not you, owns the verification commands listed below: it runs that full "
+    "suite itself after you return. Run only the focused checks the goal asks for, then "
+    "return with the verification time reserved for the launcher.",
     "Implement the ordered contract with the assessment you were given plus targeted reads of "
     "the files it names; do not repeat whole-repository discovery that is already settled.",
     "If your context is compacted, resume the current task from your own git diff in this "
@@ -1434,8 +1418,8 @@ def _budget_section(task: Task, deadline: Optional[Deadline],
         f"- Total for this whole task: {float(task.timeout_seconds):.0f}s, shared by setup, "
         "every model attempt and the launcher's independent verification. It never resets "
         "between attempts.",
-        "- Budget the steps that are still ahead, including the verification commands above, "
-        "to fit what is left.",
+        "- Budget the steps that are still ahead to fit what is left, and return early enough "
+        "that the launcher can run the verification commands above itself.",
     ]
     if deadline is None:
         lines.append("- Remaining now: not measured by this render; the launcher tracks the "
@@ -1468,7 +1452,8 @@ def build_prompt(task: Task, worktree: Path, feedback: Optional[str] = None,
         "Allowed paths:",
         *[f"- {item}" for item in task.allowed_paths],
         "",
-        "Verification commands (argv arrays, run from the worktree root):",
+        "Launcher-owned verification commands (argv arrays, run from the worktree root by the "
+        "launcher after you return):",
         *[f"- {json.dumps(argv)}" for argv in task.test_commands],
         *_budget_section(task, deadline, attempt_timeout=attempt_timeout, reserve=reserve,
                          attempt_cap=attempt_cap),
@@ -1883,7 +1868,8 @@ def run_verification(task: Task, worktree: Path, env: Dict[str, str], codex_bin:
             continue
         result = run_bounded(wrapped, cwd=worktree, env=command_env, timeout=timeout)
         output = redact((result["stdout"] + b"\n" + result["stderr"]).decode("utf-8", "replace"), secrets)
-        passed = result["returncode"] == 0 and not result["timed_out"]
+        over_limit = bool(result.get("output_limit_exceeded"))
+        passed = result["returncode"] == 0 and not result["timed_out"] and not over_limit
         entry: Dict[str, Any] = {
             "command": argv, "sandboxed": not full_host, "log": str(index),
             "backend": backend,
@@ -1891,6 +1877,7 @@ def run_verification(task: Task, worktree: Path, env: Dict[str, str], codex_bin:
                             else str(sandbox.get("apple_argv_prefix") or backend)),
             "status": "passed" if passed else "failed",
             "returncode": result["returncode"], "timed_out": result["timed_out"],
+            "output_limit_exceeded": over_limit,
             "elapsed_seconds": result["elapsed_seconds"], "stdout_tail": output[-1000:],
             "output_bytes": len(output.encode("utf-8")), "output_text": output,
             "termination": result["termination"],
@@ -1898,6 +1885,12 @@ def run_verification(task: Task, worktree: Path, env: Dict[str, str], codex_bin:
         if result["timed_out"]:
             entry["reason"] = (f"verification command timed out after {timeout:.1f}s of the "
                                "shared job budget")
+        elif over_limit:
+            entry["reason"] = (
+                f"verification command output exceeded the {observation.CAPTURE_LIMIT_BYTES} "
+                "byte capture limit, so the retained output is incomplete and cannot show "
+                "that the command passed; see the separate termination evidence for what "
+                "happened to the process group")
         elif not passed:
             entry["reason"] = (f"verification command exited {result['returncode']} with "
                                "full-host execution (sandboxed=false)" if full_host else
@@ -2340,7 +2333,7 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         for field_name in ("started_at", "finished_at", "elapsed_seconds"):
             evidence["usage"][field_name] = timeline[field_name]
         if (result.get("timed_out") or result.get("returncode") != 0
-                or evidence["terminal_failures"]):
+                or result.get("output_limit_exceeded") or evidence["terminal_failures"]):
             evidence["usage"]["complete"] = False
             if evidence["usage"]["availability"] == "complete":
                 evidence["usage"]["availability"] = "partial"
@@ -2354,6 +2347,7 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
             "attempt": attempt_number,
             "returncode": result["returncode"],
             "timed_out": result["timed_out"],
+            "output_limit_exceeded": bool(result.get("output_limit_exceeded")),
             "elapsed_seconds": result["elapsed_seconds"],
             "verification_reserve_seconds": reserve,
             "worker_timeout_seconds": attempt_timeout,
@@ -2376,6 +2370,15 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         report["logs"].extend(attempt["logs"])
         if evidence["unsupported_tools"]:
             attempt["failure_hint"] = "worker reported an unsupported tool; stopping without any model switch"
+            report["attempts"].append(attempt)
+            report["failure_reason"] = attempt["failure_hint"]
+            break
+        if result.get("output_limit_exceeded"):
+            attempt["failure_hint"] = (
+                f"worker output exceeded the {observation.CAPTURE_LIMIT_BYTES} byte capture "
+                "limit, so only an incomplete prefix of stdout and stderr was ever seen and "
+                "the run cannot be judged from truncated output; the termination record "
+                "separately states what was done to the process group")
             report["attempts"].append(attempt)
             report["failure_reason"] = attempt["failure_hint"]
             break
@@ -2416,6 +2419,7 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         report["violations"] = audit.violations
 
         worker_ok = (result["returncode"] == 0 and not result["timed_out"]
+                     and not result.get("output_limit_exceeded")
                      and routing != "mismatch" and not evidence["terminal_failure"])
         tests_ok = (all(test.get("status") == "passed" for test in tests) if options.verify else True)
         if routing == "mismatch" or (worker_ok and tests_ok and not audit.violations):
@@ -2529,6 +2533,10 @@ def describe_failure(report: Dict[str, Any]) -> str:
             parts.append(f"attempt {attempt.get('attempt')} ended on terminal event(s) "
                          f"{attempt.get('terminal_failures')} regardless of exit code "
                          f"{attempt.get('returncode')}")
+        if attempt.get("output_limit_exceeded"):
+            parts.append(f"attempt {attempt.get('attempt')} produced more than "
+                         f"{observation.CAPTURE_LIMIT_BYTES} bytes of output: the process group "
+                         "was killed and the truncated output cannot prove success")
         if attempt.get("skipped"):
             parts.append(f"attempt {attempt.get('attempt')} skipped: {attempt['skipped']}")
         elif attempt.get("timed_out"):
@@ -2540,6 +2548,10 @@ def describe_failure(report: Dict[str, Any]) -> str:
             parts.append(f"attempt {attempt.get('attempt')} exited "
                          f"{attempt.get('returncode')}{detail}")
     for test in report.get("tests", []):
+        if test.get("output_limit_exceeded"):
+            parts.append(f"verification output for {json.dumps(test.get('command'))} exceeded "
+                         f"the {observation.CAPTURE_LIMIT_BYTES} byte capture limit and was "
+                         "truncated, so it cannot count as passing")
         if test.get("status") in ("blocked", "failed"):
             reason = test.get("reason") or (f"exit {test.get('returncode')}"
                                             if test.get("returncode") is not None
