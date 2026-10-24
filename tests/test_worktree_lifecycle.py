@@ -378,5 +378,89 @@ class Lifecycle(unittest.TestCase):
                 self.assert_preserved(worktree, job, before)
 
 
+class DirectoryLinkInventory(unittest.TestCase):
+    """Directory symlinks are payload: recorded as links, never traversed, always verified."""
+
+    def setUp(self):
+        self.root = sp.tmpdir()
+        self.addCleanup(sp.cleanup, self.root)
+        self.repo = sp.make_repo(self.root)
+        self.worktree = self.root / "state" / "worktrees" / "links"
+        lw.add_worktree(self.repo, lw.rev_parse(self.repo, "main"), self.worktree)
+        self.external = self.root / "external"
+        (self.external / "nested").mkdir(parents=True)
+        (self.external / "payload.txt").write_text("outside\n", encoding="utf-8")
+        (self.external / "nested" / "deep.txt").write_text("deeper\n", encoding="utf-8")
+        os.symlink(str(self.external), str(self.worktree / "linked-dir"))
+        self.archive = self.root / "archive"
+
+    def test_directory_link_is_archived_and_verified(self):
+        inventory = wl.walk_files(self.worktree)
+        self.assertEqual(inventory.get("linked-dir"), "link")
+        wl.copy_worktree(self.worktree, self.archive)
+        digest, count = wl.verify_archive(self.worktree, self.archive)
+        self.assertTrue(os.path.islink(str(self.archive / "linked-dir")))
+        self.assertEqual(wl.recompute_archive(self.archive), (digest, count))
+
+    def test_nested_directory_link_is_recorded_and_verified(self):
+        (self.worktree / "pack").mkdir()
+        os.symlink(str(self.external), str(self.worktree / "pack" / "inner"))
+        wl.copy_worktree(self.worktree, self.archive)
+        self.assertEqual(wl.verify_archive(self.worktree, self.archive),
+                         wl.recompute_archive(self.archive))
+        self.assertEqual(wl.walk_files(self.archive).get("pack/inner"), "link")
+        self.assertTrue(os.path.islink(str(self.archive / "pack" / "inner")))
+
+    def test_walk_does_not_traverse_the_link_target(self):
+        wl.copy_worktree(self.worktree, self.archive)
+        for inventory in (wl.walk_files(self.worktree), wl.walk_files(self.archive)):
+            self.assertIn("linked-dir", inventory)
+            self.assertEqual({name for name in inventory if name.startswith("linked-dir/")},
+                             set())
+            self.assertNotIn("payload.txt", inventory)
+            self.assertNotIn("nested/deep.txt", inventory)
+
+    def test_missing_directory_link_is_detected(self):
+        wl.copy_worktree(self.worktree, self.archive)
+        digest, count = wl.recompute_archive(self.archive)
+        os.unlink(str(self.archive / "linked-dir"))
+        with self.assertRaises(wl.LifecycleError) as caught:
+            wl.verify_archive(self.worktree, self.archive)
+        self.assertIn("linked-dir", str(caught.exception))
+        after, total = wl.recompute_archive(self.archive)
+        self.assertNotEqual(after, digest)
+        self.assertEqual(total, count - 1)
+
+    def test_retargeted_directory_link_is_detected(self):
+        other = self.root / "other"
+        other.mkdir()
+        (other / "impostor.txt").write_text("nope\n", encoding="utf-8")
+        wl.copy_worktree(self.worktree, self.archive)
+        digest, count = wl.recompute_archive(self.archive)
+        os.unlink(str(self.archive / "linked-dir"))
+        os.symlink(str(other), str(self.archive / "linked-dir"))
+        with self.assertRaises(wl.LifecycleError) as caught:
+            wl.verify_archive(self.worktree, self.archive)
+        self.assertIn("linked-dir", str(caught.exception))
+        self.assertEqual(wl.recompute_archive(self.archive)[1], count)
+        self.assertNotEqual(wl.recompute_archive(self.archive)[0], digest)
+
+    def test_only_the_root_git_metadata_is_excluded(self):
+        inventory = wl.walk_files(self.worktree)
+        self.assertFalse(any(name == ".git" or name.startswith(".git/") for name in inventory))
+        (self.worktree / "fixture-repo").mkdir()
+        (self.worktree / "fixture-repo" / ".git").write_text("gitdir: /somewhere/.git\n",
+                                                            encoding="utf-8")
+        self.assertEqual(wl.walk_files(self.worktree).get("fixture-repo/.git"), "file")
+        wl.copy_worktree(self.worktree, self.archive)
+        digest, _ = wl.verify_archive(self.worktree, self.archive)
+        (self.archive / "fixture-repo" / ".git").write_text("gitdir: /elsewhere/.git\n",
+                                                           encoding="utf-8")
+        with self.assertRaises(wl.LifecycleError) as caught:
+            wl.verify_archive(self.worktree, self.archive)
+        self.assertIn("fixture-repo/.git", str(caught.exception))
+        self.assertNotEqual(wl.recompute_archive(self.archive)[0], digest)
+
+
 if __name__ == "__main__":
     unittest.main()

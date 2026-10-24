@@ -211,9 +211,10 @@ same way it covers a clean tree; without that verification, keep the worktree. N
 primary checkout, an active or claimed worktree, or the only copy of unarchived work.
 
 Reuse the current checkout for routine planner work instead of adding planner or app worktrees;
-the launcher's per-job worktrees stay, because they are what isolates and evidences worker
-scope. Keep primary and unrelated active work intact, and report any push or safe-cleanup
-blocker explicitly instead of claiming completion.
+the launcher's per-job worktrees remain required during execution, because they are what isolates
+and evidences worker scope, and they too are archived and removed at completion once the parent
+has reviewed the work. Keep primary and unrelated active work intact, and report any push or
+safe-cleanup blocker explicitly instead of claiming completion.
 
 ## Usage
 

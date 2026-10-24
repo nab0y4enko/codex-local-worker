@@ -305,10 +305,26 @@ def create_bundle(repo: Path, ref: str, destination: Path) -> Path:
 
 
 def walk_files(root: Path) -> Dict[str, str]:
-    """Relative path -> kind, skipping the ``.git`` pointer of a linked worktree."""
+    """Relative path -> kind.
+
+    Only the ``.git`` metadata at the root is skipped (the pointer file or directory of a
+    linked worktree); a nested ``.git`` is payload and gets verified like any other entry.
+    Symlinks to directories are recorded as ``link`` and never traversed, so a link target
+    outside the tree cannot smuggle entries into the inventory.
+    """
     found: Dict[str, str] = {}
     for base, directories, files in os.walk(str(root)):
-        directories[:] = [name for name in directories if name != ".git"]
+        kept: List[str] = []
+        for name in directories:
+            full = Path(base) / name
+            relative = os.path.relpath(str(full), str(root)).replace(os.sep, "/")
+            if relative == ".git":
+                continue
+            if os.path.islink(str(full)):
+                found[relative] = "link"
+            else:
+                kept.append(name)
+        directories[:] = kept
         for name in files:
             full = Path(base) / name
             relative = os.path.relpath(str(full), str(root))

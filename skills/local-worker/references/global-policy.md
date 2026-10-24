@@ -47,7 +47,9 @@ Completion is not a separate request and not an optional courtesy. On every task
 parent reuses the current checkout for routine planner work instead of adding new planner or app
 worktrees, commits and pushes the reviewed task changes, then archives and removes completed
 temporary or linked worktrees, dirty drafts included once their archive verified, before the
-final response. Launcher-internal per-job worktree isolation stays required: it is what scopes
-and audits a worker, so it is not one of the worktrees this rule removes. Verify the archive and
-recovery ref before removal, keep that evidence outside the tree being removed, and never treat
-an unverified or active tree as removable.
+final response. Launcher-internal per-job worktree isolation stays required during execution: it
+is what scopes and audits a worker. Those temporary per-job worktrees are not exempt from
+completion either: once the parent has reviewed the patch, every launcher worktree is archived
+and removed as well, so a finished task leaves none behind. Verify the archive and recovery ref
+before removal, keep that evidence outside the tree being removed, and never treat an unverified
+or active tree as removable.
