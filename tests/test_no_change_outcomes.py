@@ -185,7 +185,7 @@ class RunJobOutcome(unittest.TestCase):
 
     def task_options(self, tag, allowed=("add.py",), max_attempts=1):
         """Options for a contract that also allows the file verification itself writes."""
-        settings, model_settings = sp.write_settings(self.root / ("omlx-" + tag))
+        settings, model_settings = sp.write_legacy_settings(self.root / ("omlx-" + tag))
         task = lw.Task.from_payload(sp.task_payload(self.repo, allowed_paths=list(allowed),
                                                     max_attempts=max_attempts))
         return lw.JobOptions(task=task, state_dir=self.root / ("state-" + tag),

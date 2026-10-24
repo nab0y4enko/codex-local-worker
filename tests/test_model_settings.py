@@ -35,7 +35,7 @@ def parse(*argv):
 
 def write_unaliased(root, model=OTHER, entry=True):
     """oMLX settings for a model with no alias, as oMLX writes them for a plain download."""
-    settings, model_settings = sp.write_settings(root)
+    settings, model_settings = sp.write_legacy_settings(root)
     models = {model: {"temperature": 1.0}} if entry else {}
     model_settings.write_text(json.dumps({"version": 1, "models": models}))
     return settings, model_settings

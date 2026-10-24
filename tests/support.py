@@ -1,14 +1,18 @@
 """Shared helpers for the suite: real disposable git repos, mocked worker subprocess."""
+import copy
 import json
 import os
 import re
 import shutil
 import sys
 import tempfile
+import urllib.parse
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import local_worker as lw  # noqa: E402
+import omlx_discovery  # noqa: E402
 
 SECRET = "local-key-super-secret-0123456789"
 GIT_ID = {"GIT_AUTHOR_NAME": "Tester", "GIT_AUTHOR_EMAIL": "t@example.invalid",
@@ -69,7 +73,9 @@ def make_repo(parent, files=None):
     return repo
 
 
-def write_settings(root):
+def write_legacy_settings(root):
+    """Pre-discovery fixture: a directory holding ``settings.json`` and ``model_settings.json``
+    for the hardcoded-model launcher. Returns ``(settings, model_settings)``; Task 4 retires it."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     settings = root / "settings.json"
@@ -80,6 +86,89 @@ def write_settings(root):
     model_settings.write_text(json.dumps(
         {"models": {lw.CANONICAL_MODEL: {"model_alias": lw.EXPECTED_ALIAS}}}), encoding="utf-8")
     return settings, model_settings
+
+
+def write_settings(path, *, host="127.0.0.1", port=8000, model_fallback=False):
+    """oMLX ``settings.json`` at ``path`` (parent directories created); ``port=None`` omits the
+    key, as a default install does. The key is ``SECRET``. Returns ``path``."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    server = {"host": host}
+    if port is not None:
+        server["port"] = port
+    path.write_text(json.dumps({"auth": {"api_key": SECRET}, "server": server,
+                                "model": {"model_fallback": model_fallback}}), encoding="utf-8")
+    return path
+
+
+class FakeOmlx:
+    """A recorded oMLX server with the ``HttpFetch`` signature: ``fake(settings, path, auth)``.
+
+    Serves ``/health``, ``/v1/models/status`` and ``/api/status`` from the fixtures under
+    ``tests/fixtures/omlx`` for one of four variants (``one``, ``two_loaded``, ``none_loaded``,
+    ``helper_and_embedding``) and the blocking model-load POST. ``/api/status`` always starts
+    from ``api_status.json`` with its loaded/discovered/loading counts rebuilt from the variant.
+    Like the real server, the protected endpoints need the right bearer key. ``.calls`` records
+    every request path.
+
+    ``overrides``: ``{"_health": "loading"}`` serves the 503 loading answer;
+    ``{"_api_status": {...}}`` is merged over the ``/api/status`` body; ``{"model_alias": "x"}``
+    sets the alias on the loaded chat model(s); any other key replaces that field on them.
+    """
+
+    VARIANTS = ("one", "two_loaded", "none_loaded", "helper_and_embedding")
+    _LOAD = re.compile(r"/v1/models/([^/]+)/load")
+
+    def __init__(self, variant: str = "one", overrides: Optional[Dict[str, Any]] = None):
+        if variant not in self.VARIANTS:
+            raise ValueError("unknown FakeOmlx variant %r" % variant)
+        self.variant, self.overrides, self.calls = variant, dict(overrides or {}), []
+        self.models_status = self._body("omlx/models_status_%s.json" % variant)[1]
+        for model in self.models_status["models"]:
+            if model["loaded"] and not model["is_helper"] and model["model_type"] in ("llm", "vlm"):
+                for key, value in self.overrides.items():
+                    if not key.startswith("_"):
+                        model[key] = value
+
+    @staticmethod
+    def _body(relative):
+        """``(status, body)`` of a fixture: ``_http_status`` is the status code, default 200."""
+        body = load_fixture(relative)
+        return body.pop("_http_status", 200), body
+
+    def __call__(self, settings, path, auth):
+        self.calls.append(path)
+        if path == "/health":
+            status, health = self._body("omlx/health_%s.json" % (
+                "loading" if self.overrides.get("_health") == "loading" else "ok"))
+            return status, health
+        if path in ("/v1/models/status", "/api/status") or self._LOAD.fullmatch(path):
+            if not auth or settings.api_key != SECRET:
+                raise omlx_discovery.DiscoveryError("auth_failed", "FakeOmlx: bad or missing key")
+            if path == "/v1/models/status":
+                return 200, copy.deepcopy(self.models_status)
+            if path == "/api/status":
+                return 200, self._api_status()
+            return self._load(urllib.parse.unquote(self._LOAD.fullmatch(path).group(1)))
+        return 404, {"detail": "Not Found"}
+
+    def _api_status(self):
+        models = self.models_status["models"]
+        body = self._body("omlx/api_status.json")[1]
+        body.update({"loaded_models": [m["id"] for m in models if m["loaded"]],
+                     "models_loaded": sum(1 for m in models if m["loaded"]),
+                     "models_discovered": len(models),
+                     "models_loading": sum(1 for m in models if m["is_loading"])})
+        body.update(self.overrides.get("_api_status", {}))
+        return body
+
+    def _load(self, model_id):
+        for model in self.models_status["models"]:
+            if model["id"] == model_id:
+                model["loaded"], model["is_loading"] = True, False
+                return 200, {"status": "ok", "model_id": model_id,
+                             "message": "Loaded " + model_id}
+        return 404, {"detail": "Model not found: " + model_id}
 
 
 def models_available(endpoint, api_key):
@@ -115,7 +204,7 @@ def apple_home(parent, udid=APPLE_UDID, name="home"):
 
 def job_options(root, repo, verify=True, list_models=models_available, max_attempts=1,
                 apple_udid=None):
-    settings, model_settings = write_settings(Path(root) / "omlx")
+    settings, model_settings = write_legacy_settings(Path(root) / "omlx")
     task = lw.Task.from_payload(task_payload(repo, max_attempts=max_attempts))
     return lw.JobOptions(task=task, state_dir=Path(root) / "state", codex_bin="codex-mock",
                          settings_path=settings, model_settings_path=model_settings,

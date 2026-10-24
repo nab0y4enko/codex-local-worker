@@ -111,7 +111,7 @@ class ModelPinning(unittest.TestCase):
     def setUp(self):
         self.root = sp.tmpdir()
         self.addCleanup(sp.cleanup, self.root)
-        self.settings, self.model_settings = sp.write_settings(self.root)
+        self.settings, self.model_settings = sp.write_legacy_settings(self.root)
 
     def preflight(self, list_models=sp.models_available):
         return lw.run_preflight(settings_path=self.settings,
@@ -151,7 +151,7 @@ class ModelPinning(unittest.TestCase):
             with self.subTest(rule=index):
                 with self.assertRaises(lw.PreflightError):
                     self.preflight()
-            sp.write_settings(self.root)
+            sp.write_legacy_settings(self.root)
 
 
 class EnvironmentAndArgv(unittest.TestCase):
