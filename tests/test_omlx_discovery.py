@@ -632,6 +632,32 @@ class FakeOmlxBehaviour(unittest.TestCase):
             self.assertEqual(models[other]["max_context_window"], 8192)
             self.assertNotIn("model_alias", models[other])
 
+    def test_after_calls_swaps_the_variant_from_the_next_request_on(self):
+        fake = sp.FakeOmlx("one").after_calls(2, variant="none_loaded")
+
+        def loaded():
+            models = fake(self.settings, "/v1/models/status", True)[1]["models"]
+            return [m["id"] for m in models if m["loaded"]]
+
+        self.assertEqual(loaded(), [QWEN])                    # request 1
+        self.assertEqual(fake(self.settings, "/health", False)[0], 200)  # request 2
+        self.assertEqual(loaded(), [])                        # request 3: swapped
+        self.assertEqual(loaded(), [])                        # and it stays swapped
+        self.assertEqual(fake.variant, "none_loaded")
+
+    def test_after_calls_can_replace_the_overrides_and_keeps_what_it_is_not_given(self):
+        fake = sp.FakeOmlx("one", overrides={"model_alias": "nine-b"}).after_calls(
+            1, overrides={"max_context_window": 4096})
+        before = fake(self.settings, "/v1/models/status", True)[1]["models"][0]
+        after = fake(self.settings, "/v1/models/status", True)[1]["models"][0]
+        self.assertEqual((before["model_alias"], before["max_context_window"]), ("nine-b", 262144))
+        self.assertNotIn("model_alias", after)
+        self.assertEqual((fake.variant, after["max_context_window"]), ("one", 4096))
+
+    def test_after_calls_rejects_an_unknown_variant(self):
+        with self.assertRaises(ValueError):
+            sp.FakeOmlx("one").after_calls(3, variant="nonsense")
+
     def test_instances_do_not_share_state(self):
         first, second = sp.FakeOmlx("none_loaded"), sp.FakeOmlx("none_loaded")
         first(self.settings, "/v1/models/%s/load" % QWEN, True)

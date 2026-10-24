@@ -461,6 +461,164 @@ class JobReport(LauncherCase):
                       omlx_discovery.http_fetch)
 
 
+def refusing_after(fake, count):
+    """``fake`` for its first ``count`` requests, then a server that refuses every connection."""
+    def fetch(settings, path, auth):
+        if len(fake.calls) >= count:
+            raise omlx_discovery.DiscoveryError(
+                "server_unreachable", "cannot reach oMLX at %s (ConnectionRefusedError); is it "
+                "running?" % settings.base_url)
+        return fake(settings, path, auth)
+    return fetch
+
+
+class AttemptRecheck(LauncherCase):
+    """Before every attempt the launcher re-reads oMLX; a swapped model never mixes results.
+
+    Preflight discovery makes three requests (``/health``, ``/v1/models/status``,
+    ``/api/status``) and each recheck one, so ``after_calls(3, ...)`` swaps the server right
+    after preflight and ``after_calls(4, ...)`` right after the recheck before attempt 1.
+    """
+
+    def unfixed_run(self, **kwargs):
+        """A worker that edits nothing and a verification that fails, so a retry follows."""
+        return sp.FakeRun(worker_edit=lambda cwd, attempt: None, test_rc=1, **kwargs)
+
+    def test_a_model_unloaded_before_attempt_one_blocks_it(self):
+        fake = sp.FakeOmlx("one").after_calls(3, variant="none_loaded")
+        run = sp.FakeRun(worker_edit=sp.fix_add)
+        report = self.run_job(omlx=fake, fake_run=run)
+        self.assertEqual(run.exec_calls, 0)
+        self.assertEqual(run.calls_of("exec"), [])
+        self.assertEqual(len(report["attempts"]), 1)
+        self.assertEqual(report["attempts"][0]["attempt"], 1)
+        self.assertEqual(report["attempts"][0]["skipped_reason"], "model_changed")
+        self.assertEqual(report["status"], "blocked")
+        self.assertEqual(report["exit_code"], lw.EXIT_CODES["blocked"])
+        self.assertIn(MODEL, report["failure_reason"])
+        self.assertIn("no chat model is loaded", report["failure_reason"])
+        self.assertEqual(report["failure_reason"], report["attempts"][0]["skipped"])
+        self.assertEqual(report["patch_bytes"], 0)
+        self.assertIs(report["primary_unchanged"], True)
+
+    def test_a_swapped_in_model_is_named_next_to_the_pinned_one(self):
+        fake = sp.FakeOmlx("two_loaded").after_calls(3, variant="one")
+        options = sp.job_options(self.root / "named", self.repo, omlx=fake)
+        options.requested_model = "Example-Text-7B-4bit"
+        run = sp.FakeRun(worker_edit=sp.fix_add)
+        with mock.patch.object(lw, "run_bounded", run):
+            report = lw.run_job(options)
+        self.assertEqual(report["api_model"], "Example-Text-7B-4bit")
+        self.assertEqual(run.exec_calls, 0)
+        self.assertEqual(report["attempts"][0]["skipped_reason"], "model_changed")
+        self.assertEqual(report["status"], "blocked")
+        self.assertIn("Example-Text-7B-4bit", report["failure_reason"])
+        self.assertIn(MODEL, report["failure_reason"])
+
+    def test_a_context_window_that_shrinks_blocks_the_attempt_and_says_so(self):
+        fake = sp.FakeOmlx("one").after_calls(3, overrides={"max_context_window": 32768})
+        run = sp.FakeRun(worker_edit=sp.fix_add)
+        report = self.run_job(omlx=fake, fake_run=run)
+        self.assertEqual(run.exec_calls, 0)
+        self.assertEqual(report["attempts"][0]["skipped_reason"], "model_changed")
+        self.assertEqual(report["status"], "blocked")
+        self.assertIn(MODEL, report["failure_reason"])
+        self.assertIn("262144", report["failure_reason"])
+        self.assertIn("32768", report["failure_reason"])
+
+    def test_what_the_server_reports_now_is_put_in_words(self):
+        pinned = sp.discovered_profile("one")
+        for variant, expected in (("none_loaded", "no chat model is loaded"),
+                                  ("two_loaded", "several chat models are loaded")):
+            with self.subTest(variant=variant):
+                words = lw.describe_model_change(pinned, self.settings, sp.FakeOmlx(variant))
+                self.assertIn(expected, words)
+        listed = lw.describe_model_change(pinned, self.settings, sp.FakeOmlx("two_loaded"))
+        self.assertIn(MODEL, listed)
+        self.assertIn("Example-Text-7B-4bit", listed)
+        on_the_small_model = sp.discovered_profile("two_loaded", requested="Example-Text-7B-4bit")
+        swapped = lw.describe_model_change(on_the_small_model, self.settings, sp.FakeOmlx("one"))
+        self.assertIn("now serves %s" % MODEL, swapped)
+
+    def test_a_server_that_refuses_discovery_is_described_by_its_code(self):
+        pinned = sp.discovered_profile("one")
+        sp.write_settings(self.settings, model_fallback=True)
+        words = lw.describe_model_change(pinned, self.settings, sp.FakeOmlx("one"))
+        self.assertIn("model_fallback_enabled", words)
+
+    def test_a_name_the_server_reports_is_quoted_safely(self):
+        self.assertEqual(lw.model_label(MODEL), MODEL)
+        shown = lw.model_label("evil\nmodel " + "x" * 200)
+        self.assertNotIn("\n", shown)
+        self.assertLess(len(shown), 100)
+
+    def test_an_unreachable_server_blocks_the_attempt(self):
+        fetch = refusing_after(sp.FakeOmlx("one"), 3)
+        run = sp.FakeRun(worker_edit=sp.fix_add)
+        report = self.run_job(omlx=fetch, fake_run=run)
+        self.assertEqual(run.exec_calls, 0)
+        self.assertEqual(report["attempts"][0]["skipped_reason"], "server_unreachable")
+        self.assertEqual(report["status"], "blocked")
+        self.assertEqual(report["exit_code"], lw.EXIT_CODES["blocked"])
+        self.assertIn(MODEL, report["failure_reason"])
+        self.assertIn("unreachable", report["failure_reason"])
+        self.assertIn("http://127.0.0.1:8000", report["failure_reason"])
+        self.assertNotIn(sp.SECRET, json.dumps(report))
+
+    def test_a_swap_before_attempt_two_skips_only_the_second_attempt(self):
+        # Preflight (3 requests) + the recheck before attempt 1 = 4: attempt 2 sees the swap.
+        fake = sp.FakeOmlx("one").after_calls(4, variant="none_loaded")
+        run = sp.FakeRun(worker_edit=sp.fix_add, test_rc=1)
+        report, _ = self.run_clean_job(omlx=fake, fake_run=run, max_attempts=2)
+        self.assertEqual(run.exec_calls, 1)
+        first, second = report["attempts"]
+        self.assertEqual(first["attempt"], 1)
+        self.assertNotIn("skipped_reason", first)
+        self.assertEqual(first["returncode"], 0)
+        self.assertEqual(second["attempt"], 2)
+        self.assertEqual(second["skipped_reason"], "model_changed")
+        self.assertEqual(report["status"], "blocked")
+        self.assertIn(MODEL, report["failure_reason"])
+        # What attempt 1 left behind is still audited and preserved, not thrown away.
+        self.assertEqual(report["changed_paths"], ["add.py"])
+        self.assertGreater(report["patch_bytes"], 0)
+        self.assertTrue(Path(report["patch_path"]).is_file())
+        self.assertIs(report["primary_unchanged"], True)
+
+    def test_an_unreachable_server_before_attempt_two_skips_only_the_second_attempt(self):
+        fetch = refusing_after(sp.FakeOmlx("one"), 4)
+        run = sp.FakeRun(worker_edit=sp.fix_add, test_rc=1)
+        report, _ = self.run_clean_job(omlx=fetch, fake_run=run, max_attempts=2)
+        self.assertEqual(run.exec_calls, 1)
+        self.assertEqual(report["attempts"][1]["skipped_reason"], "server_unreachable")
+        self.assertEqual(report["status"], "blocked")
+
+    def test_a_steady_server_is_rechecked_once_per_attempt_and_nothing_is_skipped(self):
+        one = sp.FakeOmlx("one")
+        report = self.run_job(omlx=one)
+        self.assertEqual(report["status"], "ok", report.get("failure_reason"))
+        self.assertEqual(one.calls, ["/health", "/v1/models/status", "/api/status",
+                                     "/v1/models/status"])
+        two = sp.FakeOmlx("one")
+        report, run = self.run_clean_job(omlx=two, fake_run=self.unfixed_run(), max_attempts=2)
+        self.assertEqual(report["status"], "tests_failed")
+        self.assertEqual(run.exec_calls, 2)
+        self.assertEqual(two.calls, ["/health", "/v1/models/status", "/api/status",
+                                     "/v1/models/status", "/v1/models/status"])
+        for attempt in report["attempts"]:
+            self.assertNotIn("skipped_reason", attempt)
+
+    def test_the_blocked_report_is_persisted_with_the_skip_and_never_holds_the_key(self):
+        fake = sp.FakeOmlx("one").after_calls(3, variant="none_loaded")
+        report = self.run_job(omlx=fake)
+        persisted = Path(report["report_dir"], "report.json").read_text(encoding="utf-8")
+        self.assertNotIn(sp.SECRET, persisted)
+        saved = json.loads(persisted)
+        self.assertEqual(saved["status"], "blocked")
+        self.assertEqual(saved["attempts"][0]["skipped_reason"], "model_changed")
+        self.assertEqual(saved["failure_reason"], report["failure_reason"])
+
+
 class Cli(LauncherCase):
     def test_preflight_failure_prints_the_error_with_its_code_and_exits_2(self):
         code, out = self.cli(["preflight", "--settings", str(self.settings)],

@@ -6,7 +6,8 @@ Standard library only. Design rules:
 * Nothing about the model is hardcoded: every job asks the live oMLX server which chat model
   is loaded and what its limits are (``omlx_discovery``), then pins exactly that model, its
   endpoint and its context window. The endpoint is loopback only; proxies and redirects are
-  refused, and the server must have model fallback disabled.
+  refused, and the server must have model fallback disabled. The server is re-read before every
+  attempt: if the pinned model is gone or changed, that attempt does not start.
 * The oMLX key is loaded into the child environment only; it is excluded from the
   model's shell environment via shell_environment_policy and redacted from all logs.
 * Every job runs in its own detached ``git worktree``. The primary checkout is never
@@ -590,6 +591,62 @@ def run_preflight(settings_path: Path, requested_model: Optional[str],
     profile, context_window = discover_job_profile(settings_path, requested_model, context_cap,
                                                    fetch)
     return preflight_receipt(profile, context_window)
+
+
+def model_label(name: str) -> str:
+    """A model name the server reported, made safe to quote in a report line."""
+    if omlx_discovery.SAFE_MODEL_NAME.fullmatch(name):
+        return name
+    return repr(name if len(name) <= 80 else name[:80] + "...")
+
+
+def describe_model_change(profile: omlx_discovery.ServerProfile, settings_path: Path,
+                          fetch: omlx_discovery.HttpFetch) -> str:
+    """What oMLX reports now, in words, once a recheck found the pinned model gone or changed.
+
+    One more discovery, made only on the way to a refusal: the recheck already reached the
+    verdict, so this only words the report and a failure here is described, never raised.
+    """
+    pinned = profile.model
+    try:
+        now = omlx_discovery.discover(Path(settings_path), None, fetch=fetch).model
+    except omlx_discovery.DiscoveryError as error:
+        if error.code == "model_not_loaded":
+            return "no chat model is loaded"
+        if error.code == "model_ambiguous":
+            return "several chat models are loaded (%s)" % ", ".join(
+                model_label(name) for name in error.candidates)
+        return "oMLX now refuses discovery (%s): %s" % (error.code, str(error)[:200])
+    if (now.canonical_id, now.api_model) == (pinned.canonical_id, pinned.api_model):
+        if now.context_window < pinned.context_window:
+            return "its context window shrank from %d to %d tokens" % (
+                pinned.context_window, now.context_window)
+        return "it answers with the pinned model again"
+    named = model_label(now.api_model)
+    if now.canonical_id != now.api_model:
+        named += " (%s)" % model_label(now.canonical_id)
+    return "it now serves %s" % named
+
+
+def recheck_pinned_model(profile: omlx_discovery.ServerProfile, settings_path: Path,
+                         fetch: omlx_discovery.HttpFetch, attempt_number: int
+                         ) -> Optional[Tuple[str, str]]:
+    """``None`` while oMLX still serves the model this job pinned, else ``(reason, message)``
+    for an attempt that must not start: ``model_changed`` or ``server_unreachable``, with a
+    message naming the pinned model and what the server reports now."""
+    reason = omlx_discovery.recheck(profile, Path(settings_path), fetch)
+    if reason is None:
+        return None
+    pinned = model_label(profile.model.api_model)
+    if reason == "server_unreachable":
+        return reason, (
+            "before attempt %d oMLX at %s could not be re-read, so the pinned model %s cannot "
+            "be confirmed (server unreachable, or settings.json no longer points at it); the "
+            "attempt did not start (%s)" % (attempt_number, profile.base_url, pinned, reason))
+    return reason, (
+        "before attempt %d oMLX no longer serves the model pinned for this job, %s: %s; the "
+        "attempt did not start (%s)" % (
+            attempt_number, pinned, describe_model_change(profile, settings_path, fetch), reason))
 
 
 # --------------------------------------------------------------------------------------
@@ -2274,6 +2331,7 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     # retry must see the budget the earlier attempt and verification actually consumed.
     feedback: Optional[str] = None
     worker_ok = False
+    model_blocked = False
     tests: List[Dict[str, Any]] = []
     audit: Optional[Audit] = None
     stream = report.get("_policy")
@@ -2297,6 +2355,21 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
                 f"the {deadline.total_seconds:.0f}s total job budget was exhausted before "
                 f"attempt {attempt_number}")
             break
+        # The job is pinned to one model, so every attempt must still find it served as pinned:
+        # a model swapped in oMLX mid-job would otherwise mix results from two models. This is
+        # after the cheap local admission checks and before the attempt's budget is computed,
+        # because the request itself spends some of it. A non-``None`` answer ends the job
+        # as blocked; the attempts that already ran stay audited and preserved below.
+        changed = recheck_pinned_model(profile, options.settings_path, options.omlx_fetch,
+                                       attempt_number)
+        if changed is not None:
+            reason, message = changed
+            report["attempts"].append({"attempt": attempt_number, "skipped": message,
+                                       "skipped_reason": reason})
+            report["failure_reason"] = message
+            model_blocked = True
+            break
+        remaining = deadline.remaining()
         reserve = min(60.0, max(5.0, deadline.total_seconds * .20)) if options.verify else 0.0
         if remaining <= reserve + 1:
             report["failure_reason"] = "worker admission stopped to preserve independent verification time"
@@ -2508,7 +2581,8 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     attempts = [item for item in report["attempts"] if "returncode" in item]
     report.update(observation.sum_usage(attempts))
 
-    report["status"] = "blocked" if report.get("policy_stop") else decide_status(report, worker_ok)
+    report["status"] = ("blocked" if report.get("policy_stop") or model_blocked
+                        else decide_status(report, worker_ok))
 
 
 def decide_status(report: Dict[str, Any], worker_ok: bool) -> str:

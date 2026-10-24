@@ -104,6 +104,9 @@ class FakeOmlx:
     ``overrides``: ``{"_health": "loading"}`` serves the 503 loading answer;
     ``{"_api_status": {...}}`` is merged over the ``/api/status`` body; ``{"model_alias": "x"}``
     sets the alias on the loaded chat model(s); any other key replaces that field on them.
+
+    ``after_calls(n, ...)`` swaps what the server reports once ``n`` requests have been served,
+    which is a model swapped in oMLX while a job is running.
     """
 
     VARIANTS = ("one", "two_loaded", "none_loaded", "helper_and_embedding")
@@ -112,13 +115,30 @@ class FakeOmlx:
     def __init__(self, variant: str = "one", overrides: Optional[Dict[str, Any]] = None):
         if variant not in self.VARIANTS:
             raise ValueError("unknown FakeOmlx variant %r" % variant)
-        self.variant, self.overrides, self.calls = variant, dict(overrides or {}), []
+        self.overrides, self.calls, self._swap = dict(overrides or {}), [], None
+        self._serve(variant)
+
+    def _serve(self, variant):
+        """Report ``variant`` (with the current overrides) from the next request on."""
+        self.variant = variant
         self.models_status = self._body("omlx/models_status_%s.json" % variant)[1]
         for model in self.models_status["models"]:
             if model["loaded"] and not model["is_helper"] and model["model_type"] in ("llm", "vlm"):
                 for key, value in self.overrides.items():
                     if not key.startswith("_"):
                         model[key] = value
+
+    def after_calls(self, count: int, variant: Optional[str] = None,
+                    overrides: Optional[Dict[str, Any]] = None) -> "FakeOmlx":
+        """Once ``count`` requests have been served, serve ``variant`` and/or ``overrides`` (each
+        defaults to the current one) from request ``count + 1`` on. A discovery makes three
+        requests and a recheck one, so ``after_calls(3, ...)`` swaps right after a job's preflight
+        and the recheck before attempt 1 is the first to see it. The swap happens once; state the
+        old server had (a model loaded through the load POST) does not carry over."""
+        if variant is not None and variant not in self.VARIANTS:
+            raise ValueError("unknown FakeOmlx variant %r" % variant)
+        self._swap = (count, variant, overrides)
+        return self
 
     @staticmethod
     def _body(relative):
@@ -128,6 +148,12 @@ class FakeOmlx:
 
     def __call__(self, settings, path, auth):
         self.calls.append(path)
+        if self._swap is not None and len(self.calls) > self._swap[0]:
+            _, variant, overrides = self._swap
+            self._swap = None
+            if overrides is not None:
+                self.overrides = dict(overrides)
+            self._serve(variant or self.variant)
         if path == "/health":
             status, health = self._body("omlx/health_%s.json" % (
                 "loading" if self.overrides.get("_health") == "loading" else "ok"))
