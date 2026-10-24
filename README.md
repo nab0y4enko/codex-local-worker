@@ -44,8 +44,10 @@ the tests pass.
   endpoint is rejected before a request is made.
 - `~/.omlx/settings.json` containing `auth.api_key`, `server.host`/`server.port` matching
   loopback `8000`, and `model.model_fallback: false`.
-- `~/.omlx/model_settings.json` mapping the canonical model
-  `Qwen3.8-Flash-Next-UD-Q4_K_XL` to the alias `qwen-3.8-nf-splash`.
+- `~/.omlx/model_settings.json` mapping the canonical model to its API alias. The defaults are
+  `Qwen3.8-Flash-Next-UD-Q4_K_XL` and `qwen-3.8-nf-splash`; another model is selected with
+  `--canonical-model`/`--api-model` (see [Choosing the model](#choosing-the-model)). A model
+  with no alias in oMLX is used by passing its own id as both values.
 
 ## Installation
 
@@ -260,7 +262,29 @@ The versioned plan format and required evidence are in
 | `--job-kind` | `implementation` for initial work or `repair` for a follow-up |
 | `status` | read live or completed progress and measured usage for a state directory/job |
 | `--settings`, `--model-settings` | oMLX settings paths |
+| `--canonical-model` | oMLX model id to pin (`run`, `preflight`); env `LOCAL_WORKER_CANONICAL_MODEL`, default `Qwen3.8-Flash-Next-UD-Q4_K_XL` |
+| `--api-model` | id oMLX serves that model under; the model's own id when it has no alias (`run`, `preflight`); env `LOCAL_WORKER_API_MODEL`, default `qwen-3.8-nf-splash` |
+| `--context-window` | `model_context_window` pinned for the worker, 4096-1048576 (`run`, `preflight`); env `LOCAL_WORKER_CONTEXT_WINDOW`, default `65536` |
+| `--attempt-timeout` | per-attempt worker cap in seconds, 5-3600, still bounded by the job budget (`run`); env `LOCAL_WORKER_ATTEMPT_SECONDS`, default `300` |
 | `--json` | print the full report instead of the summary |
+
+### Choosing the model
+
+The model settings resolve as CLI flag, then environment variable, then default. Whatever is
+chosen is pinned and self-checked exactly like the defaults: the worker argv must carry that
+alias and context window, and any other value is refused as drift. Example for a model that oMLX
+serves under its own id, on a server capped at 32K tokens:
+
+```sh
+export LOCAL_WORKER_CANONICAL_MODEL=Qwen3.5-9B-OptiQ-4bit
+export LOCAL_WORKER_API_MODEL=Qwen3.5-9B-OptiQ-4bit
+export LOCAL_WORKER_CONTEXT_WINDOW=32768
+export LOCAL_WORKER_ATTEMPT_SECONDS=600
+bin/local-worker preflight
+```
+
+An alias is never guessed: when oMLX has an alias for the model, `--api-model` must be that
+alias, and the bare id is accepted only when the model has none.
 
 Exit codes: `0 ok`, `1 contract_invalid`, `2 preflight_failed`, `3 blocked`,
 `4 worker_failed`, `5 audit_violation`, `6 tests_failed`, `7 verification_blocked`,
@@ -416,13 +440,13 @@ The launcher never loads your interactive `~/.codex/config.toml`; it pins everyt
 explicit `-c` overrides and then **self-checks its own argv** before the first subprocess.
 Any drift is a refusal (`blocked`), not a degraded run:
 
-- `model=qwen-3.8-nf-splash`, `model_provider=local-omlx` with
+- `model=<api model>` (default `qwen-3.8-nf-splash`), `model_provider=local-omlx` with
   `base_url="http://127.0.0.1:8000/v1"`, `env_key=LOCAL_OMLX_API_KEY`, `wire_api=responses`,
   `requires_openai_auth=false`, and **zero** request/stream retries (a retry could be served
   by something else). Zero retries exist so a failure stays **bounded and visible** — one
   attempt, one honest status — rather than being silently retried onto a different backend.
 - `approval_policy=never`, `web_search=disabled`, `sandbox_mode=danger-full-access`,
-  `model_context_window=65536`, and `shell_environment_policy` restricted with
+  `model_context_window=<context window>` (default `65536`), and `shell_environment_policy` restricted with
   `LOCAL_OMLX_API_KEY` excluded from the shell.
 - Worker argv also carries `--ignore-user-config --ignore-rules -C <worktree>
   -s danger-full-access --json -o <last-message> -m <alias>`. `--ignore-rules` means the

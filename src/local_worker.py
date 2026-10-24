@@ -63,6 +63,9 @@ HOST = "127.0.0.1"
 PORT = 8000
 API_PREFIX = "/v1"
 ENDPOINT = "http://127.0.0.1:8000/v1"
+# Defaults for the model a job is pinned to. ``--canonical-model``/``--api-model`` (or the
+# ``LOCAL_WORKER_*`` variables below) select another one; the chosen pair is then pinned and
+# self-checked exactly like these defaults are.
 CANONICAL_MODEL = "Qwen3.8-Flash-Next-UD-Q4_K_XL"
 EXPECTED_ALIAS = "qwen-3.8-nf-splash"
 PROVIDER_ID = "local-omlx"
@@ -78,6 +81,11 @@ STATE_ENV = "LOCAL_WORKER_STATE_DIR"
 CODEX_BIN_ENV = "LOCAL_WORKER_CODEX_BIN"
 LEGACY_STATE_ENV = "LOCAL_IMPLEMENT_STATE_DIR"
 LEGACY_CODEX_BIN_ENV = "LOCAL_IMPLEMENT_CODEX_BIN"
+# Model routing settings. Resolution order is CLI flag, then this variable, then the default.
+CANONICAL_MODEL_ENV = "LOCAL_WORKER_CANONICAL_MODEL"
+API_MODEL_ENV = "LOCAL_WORKER_API_MODEL"
+CONTEXT_WINDOW_ENV = "LOCAL_WORKER_CONTEXT_WINDOW"
+ATTEMPT_SECONDS_ENV = "LOCAL_WORKER_ATTEMPT_SECONDS"
 # Deliberate legacy storage-compatibility exception, not an oversight: the state root keeps the
 # historical ``~/.local-implement`` path on purpose. That directory IS the shared pool - the
 # worker/coordinator locks, ``slots/``, ``leases/``, ``reports/`` history and preserved
@@ -112,6 +120,11 @@ PROBE_TIMEOUT_SECONDS = 60.0
 # Reported with every job so a reviewer always knows what confined the verification run.
 WORKSPACE_SANDBOX_BACKEND = "codex-workspace-write"
 MODEL_CONTEXT_WINDOW = 65536
+MIN_CONTEXT_WINDOW = 4096
+MAX_CONTEXT_WINDOW = 1048576
+# Model ids are rendered inside a quoted TOML ``-c`` value, so quotes, backslashes and
+# whitespace are refused rather than escaped: a model id never needs them.
+MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
 
 # Every launcher-driven git subprocess disables inherited hooks/fsmonitor and refuses
 # interactive editors, so a cloned repository cannot run host-side hook executables.
@@ -452,6 +465,65 @@ class Task:
 
 
 # --------------------------------------------------------------------------------------
+# Model routing settings (CLI flag > environment variable > default)
+# --------------------------------------------------------------------------------------
+def validate_model_name(value: Any, label: str) -> str:
+    """A model id that is safe inside a quoted TOML override; anything else is refused."""
+    if not isinstance(value, str) or not MODEL_NAME_RE.match(value):
+        raise ContractError(f"{label} must match {MODEL_NAME_RE.pattern}, got {value!r}")
+    return value
+
+
+def validate_context_window(value: Any) -> int:
+    """An integer token count the worker's Codex config can be pinned to."""
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+        value = int(value.strip())
+    if isinstance(value, bool) or not isinstance(value, int) \
+            or not MIN_CONTEXT_WINDOW <= value <= MAX_CONTEXT_WINDOW:
+        raise ContractError(f"context window must be an integer between {MIN_CONTEXT_WINDOW} "
+                            f"and {MAX_CONTEXT_WINDOW} tokens, got {value!r}")
+    return value
+
+
+def validate_attempt_seconds(value: Any) -> float:
+    """Per-attempt worker cap in seconds, bounded like the job budget it is carved from."""
+    try:
+        seconds = float("nan") if isinstance(value, bool) else float(value)
+    except (TypeError, ValueError):
+        raise ContractError(f"attempt timeout must be a number of seconds, got {value!r}") from None
+    # NaN fails both comparisons, so a bool, "nan" or "inf" is refused here as well.
+    if not MIN_ATTEMPT_BUDGET_SECONDS <= seconds <= MAX_TIMEOUT_SECONDS:
+        raise ContractError(f"attempt timeout must be between {MIN_ATTEMPT_BUDGET_SECONDS:.0f} "
+                            f"and {MAX_TIMEOUT_SECONDS} seconds, got {value!r}")
+    return seconds
+
+
+def resolve_setting(explicit: Optional[str], env_name: str, default: Any) -> Any:
+    """The CLI value when given, else the environment variable when set, else the default."""
+    if explicit is not None and str(explicit).strip():
+        return str(explicit).strip()
+    from_env = (os.environ.get(env_name) or "").strip()
+    return from_env or default
+
+
+def resolve_model_settings(args: argparse.Namespace) -> Dict[str, Any]:
+    """Validated model routing for one invocation; every field falls back to its default."""
+    settings: Dict[str, Any] = {
+        "canonical_model": validate_model_name(
+            resolve_setting(args.canonical_model, CANONICAL_MODEL_ENV, CANONICAL_MODEL),
+            "canonical model"),
+        "api_model": validate_model_name(
+            resolve_setting(args.api_model, API_MODEL_ENV, EXPECTED_ALIAS), "API model"),
+        "context_window": validate_context_window(
+            resolve_setting(args.context_window, CONTEXT_WINDOW_ENV, MODEL_CONTEXT_WINDOW)),
+    }
+    if hasattr(args, "attempt_timeout"):
+        settings["attempt_seconds"] = validate_attempt_seconds(
+            resolve_setting(args.attempt_timeout, ATTEMPT_SECONDS_ENV, policy.ATTEMPT_SECONDS))
+    return settings
+
+
+# --------------------------------------------------------------------------------------
 # Loopback endpoint + local provider validation
 # --------------------------------------------------------------------------------------
 ENDPOINT_RE = re.compile(r"^http://127\.0\.0\.1:8000/v1/?$")
@@ -567,17 +639,30 @@ def read_model_alias(
     canonical_model: str = CANONICAL_MODEL,
     expected_alias: str = EXPECTED_ALIAS,
 ) -> str:
+    """Return the API model id oMLX serves for ``canonical_model``; refuse anything ambiguous.
+
+    A model with no alias in oMLX is served under its own id. That is accepted only when the
+    caller asked for exactly that id (``expected_alias == canonical_model``), so the unaliased
+    case is an explicit choice, never a guess.
+    """
     data = _read_json_object(model_settings_path, "oMLX model settings")
     models = data.get("models") if isinstance(data.get("models"), dict) else {}
     entry = models.get(canonical_model)
+    alias = entry.get("model_alias") if isinstance(entry, dict) else None
+    if expected_alias == canonical_model and (entry is None or (
+            isinstance(entry, dict) and alias in (None, ""))):
+        return canonical_model
+    hint = ("; set an alias for it in oMLX, or pass --api-model equal to --canonical-model to "
+            "use the model under its own id")
     if not isinstance(entry, dict):
         raise PreflightError(
-            f"{model_settings_path} has no saved settings for canonical model {canonical_model!r}"
+            f"{model_settings_path} has no saved settings for canonical model "
+            f"{canonical_model!r}{hint}"
         )
-    alias = entry.get("model_alias")
     if not isinstance(alias, str) or not alias.strip():
         raise PreflightError(
-            f"canonical model {canonical_model!r} has no model_alias; refusing to guess an API model"
+            f"canonical model {canonical_model!r} has no model_alias; refusing to guess an API "
+            f"model{hint}"
         )
     if alias != expected_alias:
         raise PreflightError(
@@ -594,10 +679,14 @@ def run_preflight(
     endpoint: str = ENDPOINT,
     canonical_model: str = CANONICAL_MODEL,
     expected_alias: str = EXPECTED_ALIAS,
+    context_window: int = MODEL_CONTEXT_WINDOW,
     list_models: Callable[[str, str], List[str]] = fetch_model_ids,
 ) -> Dict[str, Any]:
     """Validate server settings, alias mapping and model availability. Never returns the key."""
     endpoint = validate_endpoint(endpoint)
+    canonical_model = validate_model_name(canonical_model, "canonical model")
+    expected_alias = validate_model_name(expected_alias, "API model")
+    context_window = validate_context_window(context_window)
     api_key = read_api_key(settings_path)
     read_model_fallback(settings_path)
     alias = read_model_alias(model_settings_path, canonical_model, expected_alias)
@@ -610,7 +699,7 @@ def run_preflight(
             f"API model list at {endpoint}/models does not contain {alias!r}; the exact "
             "model is not loaded and fallback is disabled, so no launch will be attempted"
         )
-    return {
+    evidence = {
         "endpoint": endpoint,
         "canonical_model": canonical_model,
         "api_model": alias,
@@ -620,7 +709,9 @@ def run_preflight(
         "served_models": sorted(served),
         "proxies": "disabled",
         "redirects": "refused",
+        "model_context_window": context_window,
     }
+    return evidence
 
 
 # --------------------------------------------------------------------------------------
@@ -1140,7 +1231,7 @@ def run_bounded(argv: Sequence[str], *, cwd: Optional[Path], env: Dict[str, str]
 # --------------------------------------------------------------------------------------
 # Worker invocation
 # --------------------------------------------------------------------------------------
-def config_overrides(alias: str) -> List[str]:
+def config_overrides(alias: str, context_window: int = MODEL_CONTEXT_WINDOW) -> List[str]:
     """Explicit local provider/model overrides; the user's config is never loaded."""
     provider = f"model_providers.{PROVIDER_ID}"
     settings = [
@@ -1160,7 +1251,7 @@ def config_overrides(alias: str) -> List[str]:
         ("approval_policy", '"never"'),
         ("web_search", '"disabled"'),
         ("sandbox_mode", '"danger-full-access"'),
-        ("model_context_window", str(MODEL_CONTEXT_WINDOW)),
+        ("model_context_window", str(context_window)),
     ]
     for key, value in sorted(FEATURE_FLAGS.items()):
         settings.append((key, "true" if value else "false"))
@@ -1273,23 +1364,27 @@ def shell_env_excludes(value: Optional[str]) -> List[str]:
     return [item for item in parsed if isinstance(item, str)] if isinstance(parsed, list) else []
 
 
-def expected_config_pins(alias: str = EXPECTED_ALIAS) -> Dict[str, str]:
+def expected_config_pins(alias: str = EXPECTED_ALIAS,
+                         context_window: int = MODEL_CONTEXT_WINDOW) -> Dict[str, str]:
     """The full pinned ``-c`` policy, derived from the single place that builds it."""
-    return config_overrides_map(config_overrides(alias))
+    return config_overrides_map(config_overrides(alias, context_window))
 
 
-def missing_config_pins(argv: Sequence[str]) -> List[str]:
+def missing_config_pins(argv: Sequence[str], alias: str = EXPECTED_ALIAS,
+                        context_window: int = MODEL_CONTEXT_WINDOW) -> List[str]:
     """Self-check before launching: any drift from the pinned local policy is a refusal.
 
     ``--ignore-user-config`` means the argv *is* the whole policy, so routing flags and every
     pinned override are checked together: a missing pin, a changed value, a conflicting
     duplicate override or a second model/sandbox flag all refuse the launch instead of letting
-    the last occurrence quietly win.
+    the last occurrence quietly win. ``alias`` and ``context_window`` are the job's configured
+    values: the argv must carry exactly those, so a configured model is pinned as strictly as
+    the default one.
     """
     pairs = config_override_pairs(argv)
     overrides = dict(pairs)
     problems: List[str] = []
-    pinned = expected_config_pins()
+    pinned = expected_config_pins(alias, context_window)
     for key, expected in CONFIG_PINS.items():
         # The documented floor stays required on its own: deleting a pin from
         # config_overrides() must not silently delete the requirement for it.
@@ -1322,7 +1417,7 @@ def missing_config_pins(argv: Sequence[str]) -> List[str]:
         if flag not in argv:
             problems.append(f"{flag} is missing")
     problems.extend(_single_valued_flag(argv, SANDBOX_FLAGS, REQUIRED_SANDBOX_MODE))
-    problems.extend(_single_valued_flag(argv, MODEL_FLAGS, EXPECTED_ALIAS))
+    problems.extend(_single_valued_flag(argv, MODEL_FLAGS, alias))
     inherit = overrides.get("shell_environment_policy.inherit")
     if inherit not in ('"none"', '"core"'):
         problems.append('shell_environment_policy.inherit must be "none" or "core", '
@@ -1335,7 +1430,8 @@ def missing_config_pins(argv: Sequence[str]) -> List[str]:
 
 def worker_argv(codex_bin: str, worktree: Path, alias: str, last_message: Path,
                 tool_overrides: Sequence[str] = (),
-                shell_excludes: Sequence[str] = ()) -> List[str]:
+                shell_excludes: Sequence[str] = (),
+                context_window: int = MODEL_CONTEXT_WINDOW) -> List[str]:
     argv = [
         codex_bin, "exec",
         "--ignore-user-config",
@@ -1345,7 +1441,7 @@ def worker_argv(codex_bin: str, worktree: Path, alias: str, last_message: Path,
         "--json",
         "-o", str(last_message),
         "-m", alias,
-        *config_overrides(alias),
+        *config_overrides(alias, context_window),
     ]
     argv = with_shell_env_excludes(argv, shell_excludes)
     argv.extend(str(item) for item in tool_overrides)
@@ -1934,6 +2030,9 @@ class JobOptions:
     workstream: str = "default"
     job_kind: str = "implementation"
     tool_config: Optional[Path] = None
+    canonical_model: str = CANONICAL_MODEL
+    api_model: str = EXPECTED_ALIAS
+    context_window: int = MODEL_CONTEXT_WINDOW
 
 
 def new_report(options: JobOptions) -> Dict[str, Any]:
@@ -1947,8 +2046,10 @@ def new_report(options: JobOptions) -> Dict[str, Any]:
         "status": "worker_failed",
         "failure_reason": None,
         "endpoint": ENDPOINT,
-        "canonical_model": CANONICAL_MODEL,
-        "api_model": EXPECTED_ALIAS,
+        "canonical_model": options.canonical_model,
+        "api_model": options.api_model,
+        "model_context_window": options.context_window,
+        "attempt_timeout_cap_seconds": options.attempt_timeout_cap,
         "model_fallback": False,
         "provider": PROVIDER_ID,
         "sandbox_mode": "danger-full-access",
@@ -2029,9 +2130,10 @@ def ensure_report_dir(options: JobOptions, report: Dict[str, Any]) -> Optional[P
     return report_dir
 
 
-def _policy_check(argv: Sequence[str]) -> None:
+def _policy_check(argv: Sequence[str], alias: str = EXPECTED_ALIAS,
+                  context_window: int = MODEL_CONTEXT_WINDOW) -> None:
     """Refuse to launch a worker whose pinned local policy drifted in any way."""
-    problems = missing_config_pins(argv)
+    problems = missing_config_pins(argv, alias, context_window)
     if problems:
         raise BlockedError("worker policy self-check refused the launch: " + "; ".join(problems))
 
@@ -2159,7 +2261,8 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     deadline.require("preflight")
     report["preflight"] = run_preflight(
         settings_path=options.settings_path, model_settings_path=options.model_settings_path,
-        list_models=options.list_models,
+        canonical_model=options.canonical_model, expected_alias=options.api_model,
+        context_window=options.context_window, list_models=options.list_models,
     )
     report["api_model"] = report["preflight"]["api_model"]
     api_key = read_api_key(options.settings_path)
@@ -2238,15 +2341,17 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         report["tooling"] = probe_tools(
             loaded, codex_bin=options.codex_bin,
             env={name: value for name, value in env.items() if name != API_KEY_ENV},
-            overrides=config_overrides(report["api_model"]), deadline=deadline,
-            report_dir=report_dir)
+            overrides=config_overrides(report["api_model"], options.context_window),
+            deadline=deadline, report_dir=report_dir)
     except ToolProbeError as error:
         raise BlockedError(f"required MCP tools could not be probed: {error}") from error
     # Self-check the pinned policy before the first subprocess: drift is a refusal, not a
     # degraded run. The sandbox probe runs on the same total budget as everything else.
     _policy_check(worker_argv(options.codex_bin, worktree, report["api_model"],
                               report_dir / "policy-check.last-message.txt",
-                              loaded["overrides"], list(loaded["environment"])))
+                              loaded["overrides"], list(loaded["environment"]),
+                              context_window=options.context_window),
+                  report["api_model"], options.context_window)
     sandbox = probe_sandbox(options.codex_bin, worktree, verify_env, secrets, deadline)
     if not options.verify:
         sandbox = dict(sandbox)
@@ -2316,8 +2421,9 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         last_path = report_dir / f"attempt-{attempt_number}.last-message.txt"
         prompt_path.write_text(redact(prompt, secrets), encoding="utf-8")
         argv = worker_argv(options.codex_bin, worktree, report["api_model"], last_path,
-                           loaded["overrides"], list(loaded["environment"]))
-        _policy_check(argv)
+                           loaded["overrides"], list(loaded["environment"]),
+                           context_window=options.context_window)
+        _policy_check(argv, report["api_model"], options.context_window)
         before_worker = audit_worktree(worktree, base_commit, task.allowed_paths, secrets, scratch_dir=report_dir)
         patch_before = before_worker.patch
         # Snapshot every changed-from-base path *before* the worker runs, so whatever state a
@@ -2782,6 +2888,26 @@ def resolve_state_dir(explicit: Optional[str] = None) -> Path:
     return Path(os.path.expanduser(raw)).absolute()
 
 
+def add_model_arguments(parser: argparse.ArgumentParser, *, attempt: bool) -> None:
+    """Model routing flags shared by ``run`` and ``preflight``; unset means env, then default."""
+    parser.add_argument("--canonical-model", metavar="NAME",
+                        help=f"oMLX model id to pin (env {CANONICAL_MODEL_ENV}; "
+                             f"default {CANONICAL_MODEL})")
+    parser.add_argument("--api-model", metavar="NAME",
+                        help=f"alias oMLX serves that model under; equal to --canonical-model "
+                             f"for an unaliased model (env {API_MODEL_ENV}; default "
+                             f"{EXPECTED_ALIAS})")
+    parser.add_argument("--context-window", metavar="TOKENS",
+                        help=f"model_context_window pinned for the worker, "
+                             f"{MIN_CONTEXT_WINDOW}-{MAX_CONTEXT_WINDOW} (env "
+                             f"{CONTEXT_WINDOW_ENV}; default {MODEL_CONTEXT_WINDOW})")
+    if attempt:
+        parser.add_argument("--attempt-timeout", metavar="SECONDS",
+                            help=f"per-attempt worker cap inside the job budget, "
+                                 f"{MIN_ATTEMPT_BUDGET_SECONDS:.0f}-{MAX_TIMEOUT_SECONDS} (env "
+                                 f"{ATTEMPT_SECONDS_ENV}; default {policy.ATTEMPT_SECONDS:.0f})")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="local-worker",
@@ -2818,6 +2944,7 @@ def build_parser() -> argparse.ArgumentParser:
                           "the prompt")
     run.add_argument("--settings", default=str(OMLX_SETTINGS))
     run.add_argument("--model-settings", default=str(OMLX_MODEL_SETTINGS))
+    add_model_arguments(run, attempt=True)
     run.add_argument("--json", action="store_true", help="print the full report JSON")
 
     status = sub.add_parser("status", help="read progress and actual usage without starting a worker")
@@ -2826,13 +2953,16 @@ def build_parser() -> argparse.ArgumentParser:
     check = sub.add_parser("preflight", help="model metadata only; does not qualify native execution")
     check.add_argument("--settings", default=str(OMLX_SETTINGS))
     check.add_argument("--model-settings", default=str(OMLX_MODEL_SETTINGS))
+    add_model_arguments(check, attempt=False)
     return parser
 
 
 def summary_lines(report: Dict[str, Any]) -> List[str]:
     lines = [
         f"status: {report['status']} (exit {report.get('exit_code')})",
-        f"model: {report.get('canonical_model')} -> {report.get('api_model')} @ {report.get('endpoint')}",
+        f"model: {report.get('canonical_model')} -> {report.get('api_model')} @ {report.get('endpoint')} "
+        f"(context {report.get('model_context_window')}, attempt cap "
+        f"{report.get('attempt_timeout_cap_seconds')}s)",
         f"worktree: {report.get('worktree') or 'not created'}",
         f"report: {report.get('report_dir') or report.get('report_path') or 'not written'}",
         f"changed paths: {len(report.get('changed_paths', []))}",
@@ -2915,9 +3045,11 @@ def main(argv: Optional[Sequence[str]] = None, *,
             print(json.dumps(result, indent=2))
             return 0
         if args.command == "preflight":
+            model = resolve_model_settings(args)
             evidence = run_preflight(
                 settings_path=Path(args.settings), model_settings_path=Path(args.model_settings),
-                list_models=list_models,
+                canonical_model=model["canonical_model"], expected_alias=model["api_model"],
+                context_window=model["context_window"], list_models=list_models,
             )
             print(json.dumps(evidence, indent=2))
             return 0
@@ -2930,6 +3062,7 @@ def main(argv: Optional[Sequence[str]] = None, *,
             except apple.ApplePolicyError as error:
                 raise ContractError(str(error)) from error
         maximum = parse_max_workers(args.max_workers)
+        model = resolve_model_settings(args)
         options = JobOptions(
             task=task,
             state_dir=resolve_state_dir(args.state_dir),
@@ -2946,6 +3079,10 @@ def main(argv: Optional[Sequence[str]] = None, *,
             workstream=args.workstream,
             job_kind=args.job_kind,
             tool_config=args.tool_config,
+            canonical_model=model["canonical_model"],
+            api_model=model["api_model"],
+            context_window=model["context_window"],
+            attempt_timeout_cap=model["attempt_seconds"],
         )
         report = run_job(options)
     except LauncherError as error:

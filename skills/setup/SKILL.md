@@ -119,8 +119,11 @@ does not re-issue a request. Never report a passing endpoint without that field 
 - oMLX serving an OpenAI-compatible endpoint on `http://127.0.0.1:8000/v1` only, with
   `~/.omlx/settings.json` carrying `auth.api_key`, loopback `server.host`/`server.port` on `8000`,
   and `model.model_fallback: false`.
-- `~/.omlx/model_settings.json` mapping `Qwen3.8-Flash-Next-UD-Q4_K_XL` to the alias
-  `qwen-3.8-nf-splash`.
+- `~/.omlx/model_settings.json` mapping the canonical model to its alias: by default
+  `Qwen3.8-Flash-Next-UD-Q4_K_XL` to `qwen-3.8-nf-splash`. For another model, set
+  `LOCAL_WORKER_CANONICAL_MODEL` and `LOCAL_WORKER_API_MODEL` (the model's own id for both
+  when oMLX has no alias for it) and, when the server caps context lower,
+  `LOCAL_WORKER_CONTEXT_WINDOW`; `--preflight` inherits them.
 - Xcode and a booted simulator only for native Apple jobs; nothing in this plugin needs them to
   install.
 
