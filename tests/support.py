@@ -20,6 +20,20 @@ SHORT_APPLE_RUNTIME = "tvOS-18.0"
 IOS_RUNTIME = "com.apple.CoreSimulator.SimRuntime.iOS-18-0"
 BASE_FILES = {".gitignore": "__pycache__/\n*.pyc\n",
               "add.py": "def add(a, b):\n    return a - b\n", "notes.md": "base notes\n"}
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def load_fixture_text(relative):
+    """Raw text of a recorded fixture under ``tests/fixtures`` (``omlx/...`` or ``codex/...``)."""
+    return (FIXTURES / relative).read_text(encoding="utf-8")
+
+
+def load_fixture(relative):
+    """A recorded fixture decoded: JSON for ``.json``, a list of parsed lines for ``.jsonl``."""
+    text = load_fixture_text(relative)
+    if relative.endswith(".jsonl"):
+        return [json.loads(line) for line in text.splitlines() if line.strip()]
+    return json.loads(text)
 
 
 def git(repo, *args):

@@ -1,0 +1,11 @@
+{
+  "status": "healthy",
+  "default_model": null,
+  "engine_pool": {
+    "model_count": 1,
+    "loaded_count": 1,
+    "final_ceiling": 12173335968,
+    "current_model_memory": 8413408051
+  },
+  "mcp": null
+}

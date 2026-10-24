@@ -1,0 +1,12 @@
+{
+  "_http_status": 503,
+  "status": "loading",
+  "default_model": null,
+  "engine_pool": {
+    "model_count": 1,
+    "loaded_count": 0,
+    "final_ceiling": 12173335968,
+    "current_model_memory": 0
+  },
+  "mcp": null
+}
