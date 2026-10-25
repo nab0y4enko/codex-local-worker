@@ -120,3 +120,88 @@ cited at lines 13 and 41 of an 11-line file. Everything was invented; the launch
 - Cloud inference, the dashboard and a second Mac were not exercised.
 - Artifacts are retained under `~/.local/share/codex-local-worker/live-2026-10-25b/` outside the
   repository: `qualification/live-report.md`, `live.log`, `jobs/`.
+
+## Read-job investigation
+
+Follow-up to the read failures above (Qwen3.5-9B-OptiQ-4bit, thinking on, Codex 0.164.0). Artifacts
+under `~/.local/share/codex-local-worker/live-2026-10-25c/` (`proxy1.jsonl`, `proxy2.jsonl`,
+`state-proxy/`, `state-manual/`, `qualification/`, `suite.log`).
+
+### Evidence
+
+1. The failing read job already offered tools: the retained prompt and event streams of the
+   `-b` run show the same Codex setup for read and write jobs, and the captured request (below)
+   lists `exec_command`, `write_stdin`, `request_user_input` and `view_image`. So the read
+   profile, tool set and prompt template were not the cause. The prompt asks to `cat` the scoped
+   files first.
+2. Request capture. A throwaway loopback proxy (`live-2026-10-25c/proxy.py`, port 18000) sat
+   between the unchanged launcher (`--settings` pointing at a throwaway settings file naming
+   the proxy) and oMLX. It forwarded with the real credential added in-process and wrote
+   request bodies with the Authorization header recorded as REDACTED. The read job's
+   `POST /v1/responses` body contained
+   `text.format = {"type": "json_schema", "strict": true, "name": "codex_output_schema", ...}`
+   with the full envelope schema, on top of `tools` and `tool_choice: auto`. Codex turns
+   `--output-schema` into this strict response format on every request, and there is no
+   system-prompt-level tool filtering involved.
+3. Minimal experiment. The same launcher, same task, same repo, same model, with the proxy
+   deleting only the `text` key from the request (run `c-read-2`): the model made a `cat
+   textutil.py` tool call, then answered from the file contents. Two requests instead of one,
+   7673 input tokens instead of 3727. Identical run with the constraint intact (`c-read-1`): zero
+   tool calls, invented line numbers, answer withheld (`unverified_answer`).
+
+### Root cause
+
+`--output-schema` makes Codex send a strict `json_schema` response format on every turn, and
+with this model/server the constrained turn is the final answer: the model emits the JSON
+immediately (the reasoning item and the message carried the same JSON) and never reaches a tool
+call. Writes were unaffected because they send no schema. This supersedes the earlier ruling in
+`2026-10-25-decisions.md` to restore `--output-schema` for all read tiers, which was made with a
+different model that passed with it.
+
+In the unconstrained run the model's final message was prose plus a fenced JSON block, with one
+wrong line number (cited line 8 for `def word_count`, which is line 9). The launcher's strict
+`json.loads` rejected it as "not valid JSON", so removing the flag alone would have turned the
+failure into a different one.
+
+### Fix (commit `e717013`)
+
+- Local read jobs no longer pass `--output-schema` (`read_output_schema`); cloud reads keep the
+  native contract. The self-check now refuses a stray `--output-schema` when none is expected.
+- The schema stays in the prompt, which now ends the instruction with "Your final message must be
+  only the JSON object, with no other text."
+- `read_answers.extract_json_text` locates the JSON: the whole message if it parses, otherwise
+  the last fenced block that parses. Schema validation, the answer-size limit and citation
+  verification are unchanged and still gate release; a fenced answer with an invented quote is
+  withheld (tested). Read jobs still run under the native read-only profile.
+- Tests written first (failing against the old source: 4 failures and 1 error in
+  `test_read_jobs`): local argv has no `--output-schema`, cloud keeps it, the self-check
+  refusal, the prompt sentence, fenced and prose-only final messages, extraction cases.
+  `docs/qualification/README.md` updated.
+
+### Results
+
+Offline suite after the change: 1032 tests, OK (skipped=8 live opt-ins), 412.7 s.
+
+| Case | Before (b run) | After |
+|---|---|---|
+| Live `read_pilot_citations_verified` | FAIL (1 of 1) | PASS 3 of 3 (22.2 s, 22.6 s, 16.8 s) |
+| Live `write_pilot_ok_inside_wrapper` | PASS | PASS 2 of 2 (27.5 s, 20.0 s) |
+| Manual read, `slugify`/`word_count` question | `answer_invalid` (1 of 1) | `ok` 3 of 3, 4/4, 4/4, 2/2 citations verified, 20.5 to 28.8 s |
+| Manual read, "which test checks `word_count`" | not run | `ok` 3 of 3, 2/2, 1/1, 2/2 verified, 17.1 to 25.0 s |
+
+I read the released answers: all six were correct (hyphen join after `split()`, `word_count`,
+`test_word_count` with input `a b  c` and expected 3). The live read pilot also checks the event
+stream for a successful `cat` of the cited file. The model now calls tools in every read job;
+read-job input tokens rose from about 3.7k to 12k to 17k, as expected from reading files.
+
+### Limits
+
+- Six manual runs and three pilot runs on tiny fixtures; this shows the cause and that the fix
+  works for this model, not reliability on larger repositories.
+- The model can still produce wrong line numbers (seen once, in the unconstrained experiment);
+  citation verification is what catches that, and no wrong answer was released in these runs.
+- The fix is by tier, not by model: another local model that handles `--output-schema` plus
+  tools still gets the prompt-only path. Cloud reads were not run (cloud inference not
+  authorized); their argv self-check is covered offline.
+- oMLX's structured-output handling itself was not inspected; the cause is established from the
+  request body and the with/without-constraint comparison.
