@@ -79,3 +79,47 @@ bundle/install paths did not match the retargeting contract. Job
 export the XCTest attachment because Xcode 27 uses a lowercase manifest filename. These fixture /
 export issues were corrected; the final native job passed XCTest 1/1 and captured before, after,
 and reference images through simctl and the named XCTest attachment.
+
+## Review follow-up: assert the requested native output
+
+The prior full 8/8 live run predates this hardening and is not evidence for the new `After`
+assertion. The native fixture now has two separate tests: the readiness/capture test asserts the
+label exists and is used for both baseline/reference capture, while the contract's independent
+verification selects only `NativePilotUITests/testAppShowsAfter`, which asserts
+`label.label == "After"`. The generated native plan keeps its selector on the readiness test;
+the generated task selects the After assertion. The live harness checks the exact task selector
+and passing verification record before qualifying screenshots.
+
+The targeted hardened local-worker job passed: `20261025T093743Z-task26-native-write-913ffa`,
+status `ok`, total launcher time 110.49s, one local worker attempt 16.21s with 23,280 input,
+18,496 cached input, and 1,216 output tokens. The independent `xcodebuild` verification selected
+`NativePilotUITests/NativePilotUITests/testAppShowsAfter`, passed with return code 0 in 12.86s.
+The full log contains `-[NativePilotUITests.NativePilotUITests testAppShowsAfter] passed
+(6.248 seconds)`. `xcresulttool get test-results tests` on the retained result reports
+`NativePilotUITests/testAppShowsAfter()` Passed on iPhone 17 Simulator, iOS 27.0. Its result bundle
+is copied and hash-verified at
+`/Users/oleksii.naboichenko/.local/share/codex-local-worker/task26-live-2026-10-25/native-after-assert-v2-qual/state/reports/20261025T093743Z-task26-native-write-913ffa/verification-artifacts/strict-after.xcresult`.
+The original bundle also remains inside the job worktree until parent archival. The base-gate
+result bundle separately shows `testAppShowsQualificationLabel` Passed 1/1; before/after/reference
+screenshots and simctl/XCTest attachments were captured as before.
+
+An initial focused attempt, `20261025T093723Z-task26-native-write-8fb9fd`, stopped before model
+execution because native-plan action parsing consumed `test` after an inline `-only-testing:`
+selector. The parser now recognizes inline `-only-testing:` and `-skip-testing:` flags without
+consuming the following action. A regression preserves the scheme-named-`test` safeguard while
+accepting selectors before the real action. The generated fixture puts selectors after `test`,
+and the real hardened job passed with that command form.
+
+An actual no-inference `codex sandbox` probe verified the generated native profile using a worktree
+path containing spaces, a double quote, non-ASCII `ü`, and a literal `[literal]` directory. It
+allowed the worktree read, denied a configured secret read and launcher-state read, and denied a
+worktree write; the source remained unchanged. This exposed that direct absolute `read` entries
+are parsed as globs when a path has brackets. The launcher now reopens the task worktree via the
+exact Codex `:workspace_roots` scope beneath the denied state root while keeping the filesystem
+read-only profile and explicit state/secret denials. The CLI smoke record is
+`/Users/oleksii.naboichenko/.local/share/codex-local-worker/task26-live-2026-10-25/native-profile-awkward-root/profile-cli-smoke.json`.
+
+Focused offline validation after both fixes: 70 tests across worker isolation, read jobs, native
+readiness, and the native fixture contract passed in 5.473s. The full 8-case live suite was not
+repeated; the targeted hardened native case and no-inference profile checks provide the added
+evidence.

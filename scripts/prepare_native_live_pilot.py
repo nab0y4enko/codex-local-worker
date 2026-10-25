@@ -107,6 +107,14 @@ final class NativePilotUITests: XCTestCase {
         image.lifetime = .keepAlways
         add(image)
     }
+
+    func testAppShowsAfter() {
+        let app = XCUIApplication()
+        app.launch()
+        let label = app.staticTexts["qualification-label"]
+        XCTAssertTrue(label.waitForExistence(timeout: 10))
+        XCTAssertEqual(label.label, "After")
+    }
 }
 '''
 INFO = '''<?xml version="1.0" encoding="UTF-8"?>
@@ -147,10 +155,11 @@ def main():
     task = {
         "task_id": "task26-native-write", "kind": "write", "repo_path": str(repo),
         "base_ref": "main", "goal": "Change the app's qualification label text from Before to After in SceneDelegate.swift only.",
-        "acceptance_criteria": ["The label text is After", "The NativePilotUITests test passes"],
+        "acceptance_criteria": ["The qualification label text is After",
+                                "NativePilotUITests/testAppShowsAfter passes"],
         "allowed_paths": ["SceneDelegate.swift"],
         "timeout_seconds": 1800, "max_attempts": 1, "workstream": "task26-native",
-        "test_commands": [["/usr/bin/xcodebuild", "-project", "NativePilot.xcodeproj", "-scheme", "NativePilot", "-sdk", "iphonesimulator", "-destination", "id=" + args.simulator_udid, "-derivedDataPath", "DerivedData", "test"]],
+        "test_commands": [["/usr/bin/xcodebuild", "-project", "NativePilot.xcodeproj", "-scheme", "NativePilot", "-sdk", "iphonesimulator", "-destination", "id=" + args.simulator_udid, "-derivedDataPath", "DerivedData", "test", "-only-testing:NativePilotUITests/NativePilotUITests/testAppShowsAfter"]],
         "native_plan": str(root / "native-plan.json"), "ui_review": True,
     }
     (root / "task.json").write_text(json.dumps(task, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -162,7 +171,7 @@ def main():
         "build": ["/usr/bin/xcodebuild", "-project", "{worktree}/NativePilot.xcodeproj", "-scheme", "NativePilot", "-configuration", "Debug", "-sdk", "iphonesimulator", "-derivedDataPath", derived, "-destination", "id={simulator_udid}", "build"],
         "install": ["/usr/bin/xcrun", "simctl", "install", "{simulator_udid}", app],
         "launch": ["/usr/bin/xcrun", "simctl", "launch", "{simulator_udid}", APP_ID],
-        "test": ["/usr/bin/xcodebuild", "-project", "{worktree}/NativePilot.xcodeproj", "-scheme", "NativePilot", "-configuration", "Debug", "-sdk", "iphonesimulator", "-derivedDataPath", derived, "-destination", "id={simulator_udid}", "-resultBundlePath", result, "test"],
+        "test": ["/usr/bin/xcodebuild", "-project", "{worktree}/NativePilot.xcodeproj", "-scheme", "NativePilot", "-configuration", "Debug", "-sdk", "iphonesimulator", "-derivedDataPath", derived, "-destination", "id={simulator_udid}", "-resultBundlePath", result, "test", "-only-testing:NativePilotUITests/NativePilotUITests/testAppShowsQualificationLabel"],
         "app_bundle": app, "result_bundle": result, "bundle_id": APP_ID,
         "screenshots": [
             {"name": "main-screen", "settle_seconds": 2},

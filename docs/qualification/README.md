@@ -21,7 +21,10 @@ citation. The live read pilot also checks the retained Codex event stream for a 
 `cat widget.py` tool call whose output contains the cited source line; a schema-valid answer alone
 does not qualify as evidence of file inspection. On macOS the model tools use the strict named Codex profile `local_worker_readonly`
 with `--strict-config` and a filesystem deny map; read argv omits `sandbox_mode` so the CLI does
-not nest Seatbelt sandboxes. Reports distinguish the native profile from the outer deny wrapper.
+not nest Seatbelt sandboxes. The selected worktree is reopened under Codex's `:workspace_roots`
+scope beneath the denied launcher-state root, so absolute paths containing glob characters remain
+exact workspace roots instead of invalid read globs. Reports distinguish the native profile from
+the outer deny wrapper.
 Configured stdio MCP servers and their metadata probe run under a read-only Seatbelt profile;
 remote HTTP MCP servers are explicitly trusted through the task manifest. Before releasing an
 answer, the launcher audits the worktree and withholds the answer if any path changed.
@@ -45,7 +48,11 @@ python3 scripts/prepare_native_live_pilot.py --root /absolute/path/native-pilot 
 
 Do not use an already booted simulator owned by another job. The helper commits the baseline app
 whose label says `Before`; the live write task asks the local worker to change that label to
-`After`. The launcher performs the gate, verification and before/after screenshot capture.
+`After`. The readiness plan selects only `testAppShowsQualificationLabel`, which establishes the
+app can launch and captures its screen at baseline and after the change. The separate contract
+verification selects only `testAppShowsAfter`, which asserts the accessibility label is exactly
+`After`; a successful launch or screenshot cannot substitute for that acceptance assertion. The
+launcher performs the gate, verification and before/after screenshot capture.
 
 ## Second Mac
 

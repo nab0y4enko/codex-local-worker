@@ -266,6 +266,28 @@ class NativeReadinessTests(unittest.TestCase):
         self.rejected('build')
         self.assertEqual(self.calls, [])
 
+    def test_scheme_named_test_cannot_replace_real_test_action(self):
+        self.plan['test'] = ['/usr/bin/xcodebuild', '-scheme', 'test',
+                             '-destination', 'id=' + UDID,
+                             '-resultBundlePath', '{result_bundle}']
+        self.rejected('test')
+        self.assertEqual(self.calls, [])
+
+    def test_inline_test_selectors_before_action_do_not_hide_test_action(self):
+        selectors = ['-only-testing:ProbeUITests/ProbeUITests/testExpectedValue',
+                     '-skip-testing:ProbeUITests/ProbeUITests/testUnrelated']
+        self.plan['test'] = ['/usr/bin/xcodebuild', '-project', '{worktree}/Probe.xcodeproj',
+                             '-scheme', 'Probe', '-destination', 'id={simulator_udid}',
+                             '-resultBundlePath', '{result_bundle}', *selectors, 'test']
+
+        evidence = self.qualify()
+
+        self.assertTrue(evidence['qualified'])
+        test_call = next(argv for argv in self.calls if argv[0].endswith('xcodebuild') and
+                         'test' in argv and '-resultBundlePath' in argv)
+        for selector in selectors:
+            self.assertIn(selector, test_call)
+
     def test_callback_exception_records_failure_and_stops(self):
         def unavailable(argv):
             raise OSError('sandbox unavailable')

@@ -70,6 +70,9 @@ class LiveQualification(unittest.TestCase):
 
     @classmethod
     def record_path(cls):
+        requested = os.environ.get("LOCAL_WORKER_QUALIFICATION_RECORD")
+        if requested:
+            return Path(requested).expanduser().resolve()
         date = _datetime.date.today().isoformat()
         host = re.sub(r"[^A-Za-z0-9._-]+", "-", socket.gethostname()).strip("-") or "host"
         return ROOT / "docs" / "qualification" / (date + "-" + host + ".md")
@@ -318,6 +321,13 @@ class LiveQualification(unittest.TestCase):
         completed, compact, report = self.run_job(fixture, "--simulator-udid", simulator,
             "--native-preflight-plan", plan, "--workstream", "task26-native", timeout=3600)
         self.assertEqual(compact.get("status"), "ok", report.get("failure_reason"))
+        expected_test = "-only-testing:NativePilotUITests/NativePilotUITests/testAppShowsAfter"
+        verification = report.get("tests", [])
+        after_tests = [item for item in verification
+                       if expected_test in item.get("command", [])]
+        self.assertTrue(after_tests, "native verification must select the After assertion test")
+        self.assertTrue(all(item.get("status") == "passed" and item.get("returncode") == 0
+                            for item in after_tests), json.dumps(after_tests))
         source_names = set((report.get("screenshots", {}).get("sources") or {}).keys())
         self.assertTrue({"before", "after", "reference"}.issubset(source_names), str(source_names))
         entries = report.get("screenshots", {}).get("sources", {})
@@ -326,7 +336,8 @@ class LiveQualification(unittest.TestCase):
                         json.dumps(entries))
         methods = {item.get("method") for results in entries.values() for item in results}
         self.assertTrue({"simctl", "xcresult"}.issubset(methods), json.dumps(entries))
-        self.current_metrics["evidence"] = "native xctest, before/after/reference screenshots via simctl and named XCTest attachment in %s" % (
+        self.current_metrics["evidence"] = "native XCTest verification selected %s and passed; before/after/reference screenshots via simctl and named XCTest attachment in %s" % (
+            expected_test.rsplit("/", 1)[-1],
             report.get("screenshots", {}).get("index"))
 
     def test_summary_written(self):

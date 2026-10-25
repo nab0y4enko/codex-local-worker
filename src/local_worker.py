@@ -1718,12 +1718,22 @@ def native_read_profile_overrides(perms: permissions.Permissions, state_dir: Pat
         if path == tree or tree.startswith(path.rstrip(os.sep) + os.sep):
             raise BlockedError("read permission profile cannot deny a path containing its task worktree")
         filesystem[path] = "deny"
-    filesystem[tree] = "read"
     prefix = "permissions." + READ_PERMISSION_PROFILE
+    # Use Codex's workspace-root scope to reopen the worktree beneath the denied state root.
+    # Direct absolute read entries are interpreted as globs when a path contains glob metacharacters
+    # such as '[' and rejected by Codex; the workspace_roots form remains an exact path. Keep the
+    # special filesystem key nested in the same inline table because dotted -c overrides parse its
+    # colon as part of a path instead of a TOML table key.
+    workspace_roots = "{ " + json.dumps(tree, ensure_ascii=False) + " = true }"
+    filesystem_members = [json.dumps(path, ensure_ascii=False) + " = " + json.dumps(action)
+                          for path, action in sorted(filesystem.items())]
+    filesystem_members.append('":workspace_roots" = { "." = "read" }')
+    filesystem_config = "{ " + ", ".join(filesystem_members) + " }"
     return [
         ("default_permissions", json.dumps(READ_PERMISSION_PROFILE)),
         (prefix + ".extends", json.dumps(":read-only")),
-        (prefix + ".filesystem", _toml_inline_table(filesystem)),
+        (prefix + ".filesystem", filesystem_config),
+        (prefix + ".workspace_roots", workspace_roots),
     ]
 
 

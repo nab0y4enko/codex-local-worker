@@ -40,6 +40,7 @@ _PATH_SETTINGS = {'SYMROOT', 'OBJROOT', 'DSTROOT', 'CONFIGURATION_BUILD_DIR',
                   'SHARED_PRECOMPS_DIR', 'CLANG_MODULE_CACHE_PATH', 'SWIFT_MODULE_CACHE_PATH'}
 _ACTIONS = {'build', 'build-for-testing', 'test', 'test-without-building', 'clean',
             'archive', 'analyze', 'install', 'installsrc', 'installhdrs', 'exportArchive'}
+_INLINE_TEST_SELECTORS = ('-only-testing:', '-skip-testing:')
 
 
 def platform_for_udid(udid: str, devices: dict) -> str:
@@ -110,6 +111,12 @@ def _xcode(argv: list[str], stage: str, destination: dict, worktree: Path,
     index = 1
     while index < len(argv):
         token = argv[index]
+        # These xcodebuild selectors carry their value in the same argv token.
+        # Treat them as valueless here so a following action (commonly `test`)
+        # cannot be consumed as though it were the selector's separate value.
+        if token.startswith(_INLINE_TEST_SELECTORS):
+            index += 1
+            continue
         if token in _PATH_FLAGS:
             value = _option(argv, token, stage)
             argv[index + 1] = str(_path(value, worktree, roots, stage + ' ' + token))
