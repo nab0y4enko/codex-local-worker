@@ -66,6 +66,7 @@ import contract
 import codex_catalog
 import omlx_discovery
 import permissions
+import read_answers
 import worker_pool as pool
 import native_readiness as native
 import worker_observability as observation
@@ -260,6 +261,7 @@ EXIT_CODES = {
     "model_mismatch": 9,
     "no_changes": 10,
     "interrupted": 11,
+    "answer_invalid": 12,
 }
 
 LIMITATIONS = (
@@ -1441,7 +1443,8 @@ def catalog_pin(catalog_path: Path) -> str:
 
 
 def config_overrides(profile: omlx_discovery.ServerProfile, context_window: int,
-                     catalog_path: Optional[Path] = None) -> List[str]:
+                     catalog_path: Optional[Path] = None,
+                     sandbox_mode: str = REQUIRED_SANDBOX_MODE) -> List[str]:
     """Explicit local provider/model overrides for the job's discovered model; the user's
     config is never loaded. ``catalog_path`` is the job's generated model catalog: when given,
     ``model_catalog_json`` points Codex at it, so the model runs on its own metadata instead of
@@ -1464,7 +1467,7 @@ def config_overrides(profile: omlx_discovery.ServerProfile, context_window: int,
         # full-host access that -s selects (pinned so config drift cannot silently change it).
         ("approval_policy", '"never"'),
         ("web_search", '"disabled"'),
-        ("sandbox_mode", '"danger-full-access"'),
+        ("sandbox_mode", json.dumps(sandbox_mode)),
         ("model_context_window", pins["model_context_window"]),
         ("model_auto_compact_token_limit", pins["model_auto_compact_token_limit"]),
     ]
@@ -1583,14 +1586,18 @@ def shell_env_excludes(value: Optional[str]) -> List[str]:
 
 
 def expected_config_pins(profile: omlx_discovery.ServerProfile,
-                         context_window: int) -> Dict[str, str]:
+                         context_window: int,
+                         sandbox_mode: str = REQUIRED_SANDBOX_MODE) -> Dict[str, str]:
     """The full pinned ``-c`` policy, derived from the single place that builds it."""
-    return config_overrides_map(config_overrides(profile, context_window))
+    return config_overrides_map(config_overrides(profile, context_window,
+                                                 sandbox_mode=sandbox_mode))
 
 
 def missing_config_pins(argv: Sequence[str], profile: omlx_discovery.ServerProfile,
                         context_window: int,
-                        catalog: Optional[Tuple[Path, str]] = None) -> List[str]:
+                        catalog: Optional[Tuple[Path, str]] = None,
+                        sandbox_mode: str = REQUIRED_SANDBOX_MODE,
+                        output_schema: Optional[Path] = None) -> List[str]:
     """Self-check before launching: any drift from the pinned local policy is a refusal.
 
     ``--ignore-user-config`` means the argv *is* the whole policy, so routing flags and every
@@ -1609,7 +1616,7 @@ def missing_config_pins(argv: Sequence[str], profile: omlx_discovery.ServerProfi
     pairs = config_override_pairs(argv)
     overrides = dict(pairs)
     problems: List[str] = []
-    pinned = expected_config_pins(profile, context_window)
+    pinned = expected_config_pins(profile, context_window, sandbox_mode=sandbox_mode)
     # The documented floor stays required on its own: deleting a pin from config_overrides()
     # must not silently delete the requirement for it.
     for key, expected in {**CONFIG_PINS, **SKILL_PINS,
@@ -1656,8 +1663,14 @@ def missing_config_pins(argv: Sequence[str], profile: omlx_discovery.ServerProfi
     for flag in REQUIRED_WORKER_FLAGS:
         if flag not in argv:
             problems.append(f"{flag} is missing")
-    problems.extend(_single_valued_flag(argv, SANDBOX_FLAGS, REQUIRED_SANDBOX_MODE))
+    problems.extend(_single_valued_flag(argv, SANDBOX_FLAGS, sandbox_mode))
     problems.extend(_single_valued_flag(argv, MODEL_FLAGS, alias))
+    if output_schema is not None:
+        if argv.count("--output-schema") != 1:
+            problems.append("--output-schema must appear exactly once")
+        elif argv[argv.index("--output-schema") + 1:
+                  argv.index("--output-schema") + 2] != [str(output_schema)]:
+            problems.append("--output-schema must name the generated answer schema")
     inherit = overrides.get("shell_environment_policy.inherit")
     if inherit not in ('"none"', '"core"'):
         problems.append('shell_environment_policy.inherit must be "none" or "core", '
@@ -1672,22 +1685,26 @@ def worker_argv(codex_bin: str, worktree: Path, profile: omlx_discovery.ServerPr
                 context_window: int, last_message: Path,
                 tool_overrides: Sequence[str] = (),
                 shell_excludes: Sequence[str] = (),
-                catalog_path: Optional[Path] = None) -> List[str]:
+                catalog_path: Optional[Path] = None,
+                sandbox_mode: str = REQUIRED_SANDBOX_MODE,
+                output_schema: Optional[Path] = None) -> List[str]:
     """The whole worker command for the job's pinned ``profile`` and ``context_window``."""
     argv = [
         codex_bin, "exec",
         "--ignore-user-config",
         "--ignore-rules",
         "-C", str(worktree),
-        "-s", "danger-full-access",
+        "-s", sandbox_mode,
         "--json",
         "--ephemeral",
         "-o", str(last_message),
         "-m", profile.model.api_model,
-        *config_overrides(profile, context_window, catalog_path),
+        *config_overrides(profile, context_window, catalog_path, sandbox_mode=sandbox_mode),
     ]
     argv = with_shell_env_excludes(argv, shell_excludes)
     argv.extend(str(item) for item in tool_overrides)
+    if output_schema is not None:
+        argv.extend(["--output-schema", str(output_schema)])
     argv.extend(["--", "-"])
     return argv
 
@@ -2475,7 +2492,7 @@ def new_report(options: JobOptions) -> Dict[str, Any]:
         "codex_compat": None,
         "codex_home": None,
         "catalog_sha256": None,
-        "sandbox_mode": "danger-full-access",
+        "sandbox_mode": "read-only" if task.kind == "read" else "danger-full-access",
         "repo_path": str(task.repo_path),
         "base_ref": task.base_ref,
         "base_commit": None,
@@ -2557,9 +2574,12 @@ def ensure_report_dir(options: JobOptions, report: Dict[str, Any]) -> Optional[P
 
 
 def _policy_check(argv: Sequence[str], profile: omlx_discovery.ServerProfile,
-                  context_window: int, catalog: Optional[Tuple[Path, str]] = None) -> None:
+                  context_window: int, catalog: Optional[Tuple[Path, str]] = None,
+                  sandbox_mode: str = REQUIRED_SANDBOX_MODE,
+                  output_schema: Optional[Path] = None) -> None:
     """Refuse to launch a worker whose pinned local policy drifted in any way."""
-    problems = missing_config_pins(argv, profile, context_window, catalog)
+    problems = missing_config_pins(argv, profile, context_window, catalog,
+                                   sandbox_mode=sandbox_mode, output_schema=output_schema)
     if problems:
         raise BlockedError("worker policy self-check refused the launch: " + "; ".join(problems))
 
@@ -2603,6 +2623,167 @@ def _apple_opt_in(options: JobOptions, report: Dict[str, Any], report_dir: Path,
         }
     report["sandbox"] = updated
     return updated
+
+
+def _read_prompt(task: Task, worktree: Path) -> str:
+    return "\n".join([
+        f"Read task {task.task_id} (base commit {task.base_ref}).",
+        "Answer the question using only the current worktree. Do not modify any files.",
+        "Return the answer as JSON matching the supplied output schema, with citations that "
+        "quote the cited source lines exactly apart from whitespace normalization.",
+        "Question:", task.question or "",
+        "Scope paths:", *["- " + path for path in task.scope_paths],
+        "Worktree:", str(worktree),
+    ]) + "\n"
+
+
+def _execute_read_job(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
+                      profile: omlx_discovery.ServerProfile, context_window: int,
+                      worktree: Path, report_dir: Path, env: Dict[str, str],
+                      loaded: Dict[str, Any], catalog_path: Path,
+                      catalog: Tuple[Path, str], wrapper: DenyWrapper,
+                      secrets: Sequence[str], stream: Any) -> None:
+    """Run one structured, read-only turn and release only schema/citation checked data."""
+    task = options.task
+    schema_path = report_dir / "answer.schema.json"
+    schema = read_answers.envelope_schema(task.answer_schema or {})
+    schema_path.write_text(json.dumps(schema, indent=2) + "\n", encoding="utf-8")
+    if recheck_pinned_model(profile, options.settings_path, options.omlx_fetch, 1) is not None:
+        report["status"] = "answer_invalid"
+        report["failure_reason"] = "the pinned model changed before the read attempt"
+        return
+    remaining = deadline.require("read attempt")
+    stall = stall_limit(profile, context_window)
+    last_path = last_message_path(report_dir, 1)
+    prompt_path = report_dir / "attempt-1.prompt.txt"
+    stderr_path = report_dir / "worker-attempt-1.stderr.log"
+    jsonl_path = report_dir / "worker-attempt-1.jsonl"
+    prompt = _read_prompt(task, worktree)
+    prompt_path.write_text(redact(prompt, secrets), encoding="utf-8")
+    argv = worker_argv(options.codex_bin, worktree, profile, context_window, last_path,
+                       loaded["overrides"], list(loaded["environment"]), catalog_path,
+                       sandbox_mode="read-only", output_schema=schema_path)
+    _policy_check(argv, profile, context_window, catalog,
+                  sandbox_mode="read-only", output_schema=schema_path)
+    if stream is not None:
+        stream.start_attempt(report["job_id"])
+    report["_active_attempt"] = {"before_patch": ""}
+    observer = observation.RunObserver(
+        Path(report["report_dir"]), secrets=secrets, attempt=1, job_id=report["job_id"],
+        active_dir=options.state_dir / "active", worker_command=options.codex_bin,
+        job={"started_at": report.get("started_at"), "workstream": report.get("workstream"),
+             "job_kind": report.get("job_kind")})
+    token = _RUN_OBSERVER.set(observer)
+    timeout = deadline.cap(remaining)
+    try:
+        result = run_bounded(
+            wrapper.wrap(argv), cwd=worktree, env=env, timeout=timeout,
+            stdin_data=prompt.encode("utf-8"), stall_seconds=stall["seconds"],
+            on_stall=lambda: server_busy(options.settings_path, options.omlx_fetch,
+                                         min(deadline.end, time.monotonic() + timeout)))
+    except BaseException:
+        observer.finish(status="failed")
+        snapshot = observer.snapshot()
+        report["attempts"].append({"attempt": 1, "returncode": None, "timed_out": False,
+                                   "interrupted": True,
+                                   "elapsed_seconds": snapshot["usage"]["elapsed_seconds"],
+                                   "usage": snapshot["usage"]})
+        raise
+    finally:
+        _RUN_OBSERVER.reset(token)
+
+    stdout_text = redact(result["stdout"].decode("utf-8", "replace"), secrets)
+    stderr_text = redact(result["stderr"].decode("utf-8", "replace"), secrets)
+    if observer.activity_count == 0:
+        if result.get("stdout"):
+            observer("stdout", result["stdout"])
+        if result.get("stderr"):
+            observer("stderr", result["stderr"])
+    observer.finish(result=result)
+    evidence = parse_worker_log(stdout_text)
+    report["tooling"] = tools.mark_observations(report.get("tooling"), stdout_text)
+    routing = model_routing(evidence, report["api_model"])
+    usage = observer.snapshot()["usage"]
+    for key in ("started_at", "finished_at", "elapsed_seconds"):
+        evidence["usage"][key] = usage[key]
+    attempt = {"attempt": 1, "returncode": result["returncode"],
+               "timed_out": result["timed_out"], "stalled": bool(result.get("stalled")),
+               "elapsed_seconds": result["elapsed_seconds"],
+               "verification_reserve_seconds": 0.0,
+               "worker_timeout_seconds": timeout, "limits": {"stall": stall,
+                                                                  "budget_seconds": timeout},
+               "has_scoped_patch": False, "usage": evidence["usage"],
+               "termination": result["termination"],
+               "observed_models": evidence["observed_models"], "model_routing": routing,
+               "tool_call_events": evidence["tool_call_events"],
+               "tool_started_count": evidence["tool_started_count"],
+               "tool_completed_count": evidence["tool_completed_count"],
+               "thread_id": evidence["thread_id"],
+               "unsupported_tools": evidence["unsupported_tools"],
+               "terminal_failures": evidence["terminal_failures"],
+               "token_counts": evidence["token_counts"],
+               "stderr_excerpt": _tail(stderr_text),
+               "last_message_excerpt": "", "logs": [str(prompt_path), str(jsonl_path),
+                                                        str(stderr_path), str(last_path)]}
+    report["attempts"].append(attempt)
+    report["worker_patch_present"] = False
+    report["tests"] = []
+    report["logs"].extend(attempt["logs"])
+    (report_dir / "worker-attempt-1.stderr.log").write_text(stderr_text, encoding="utf-8")
+    (report_dir / "worker-attempt-1.jsonl").write_text(stdout_text, encoding="utf-8")
+
+    message, missing, tampered = safe_read_job_text(last_path, report_dir, secrets)
+    if missing:
+        attempt["last_message_missing"] = missing
+    if tampered:
+        attempt["last_message_tampered"] = tampered
+    # Read payloads are untrusted until the schema and every citation pass. Keep raw output out
+    # of the launcher report so an invalid answer is never presented to the planner as evidence.
+    attempt["last_message_excerpt"] = ""
+    try:
+        if missing or tampered:
+            report["answer_bytes"] = len(message.encode("utf-8"))
+        else:
+            report["answer_bytes"] = last_path.stat().st_size
+    except OSError:
+        report["answer_bytes"] = len(message.encode("utf-8"))
+    report["citations"] = []
+    report["citation_verification"] = {"total": 0, "verified": 0, "failures": []}
+    errors: List[str] = []
+    if report["answer_bytes"] > task.max_answer_bytes:
+        errors.append("answer exceeds max_answer_bytes (%d > %d)" %
+                      (report["answer_bytes"], task.max_answer_bytes))
+    elif missing or tampered:
+        errors.append("the worker did not produce a readable answer envelope")
+    else:
+        try:
+            envelope = json.loads(message)
+        except (ValueError, TypeError):
+            envelope = None
+            errors.append("the worker output is not valid JSON")
+        if envelope is not None:
+            schema_errors = read_answers.validate(envelope, schema)
+            errors.extend(schema_errors)
+            citations = envelope.get("citations") if isinstance(envelope, dict) else None
+            if isinstance(citations, list):
+                checked = read_answers.verify_citations(worktree, citations)
+                report["citation_verification"] = checked
+                if checked["failures"]:
+                    errors.extend("citation %d: %s" % (item["index"], item["reason"])
+                                  for item in checked["failures"])
+            if not errors and isinstance(envelope, dict):
+                report["answer"] = envelope["answer"]
+                report["citations"] = envelope["citations"]
+    if result["returncode"] != 0 or result["timed_out"] or result.get("output_limit_exceeded"):
+        errors.append("the read worker did not finish successfully")
+    if routing == "mismatch":
+        errors.append("worker model routing did not match the pinned model")
+    report["status"] = "answer_invalid" if errors else "ok"
+    if errors:
+        report.pop("answer", None)
+        report["citations"] = []
+        report["failure_reason"] = "; ".join(errors[:10])
+    report.pop("_active_attempt", None)
 
 
 def progress(report: Dict[str, Any], phase: str) -> None:
@@ -2816,16 +2997,31 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         report["tooling"] = probe_tools(
             loaded, codex_bin=options.codex_bin,
             env={name: value for name, value in env.items() if name != API_KEY_ENV},
-            overrides=config_overrides(profile, context_window, catalog_path),
+            overrides=config_overrides(
+                profile, context_window, catalog_path,
+                sandbox_mode="read-only" if task.kind == "read" else REQUIRED_SANDBOX_MODE),
             deadline=deadline, codex_home=codex_home)
     except ToolProbeError as error:
         raise BlockedError(f"required MCP tools could not be probed: {error}") from error
     # Self-check the pinned policy before the first subprocess: drift is a refusal, not a
-    # degraded run. The sandbox probe runs on the same total budget as everything else.
-    _policy_check(worker_argv(options.codex_bin, worktree, profile, context_window,
-                              report_dir / "policy-check.last-message.txt",
-                              loaded["overrides"], list(loaded["environment"]), catalog_path),
-                  profile, context_window, catalog)
+    # degraded run. Read jobs add Codex's read-only sandbox and generated output schema.
+    if task.kind == "read":
+        read_schema_path = report_dir / "answer.schema.json"
+        read_schema_path.write_text(json.dumps(
+            read_answers.envelope_schema(task.answer_schema or {}), indent=2) + "\n",
+            encoding="utf-8")
+        read_argv = worker_argv(
+            options.codex_bin, worktree, profile, context_window,
+            report_dir / "policy-check.last-message.txt", loaded["overrides"],
+            list(loaded["environment"]), catalog_path, sandbox_mode="read-only",
+            output_schema=read_schema_path)
+        _policy_check(read_argv, profile, context_window, catalog,
+                      sandbox_mode="read-only", output_schema=read_schema_path)
+    else:
+        _policy_check(worker_argv(options.codex_bin, worktree, profile, context_window,
+                                  report_dir / "policy-check.last-message.txt",
+                                  loaded["overrides"], list(loaded["environment"]), catalog_path),
+                      profile, context_window, catalog)
     # Every process that runs model-influenced code from here on (the worker, each check, each
     # native step) runs behind the job's deny wrapper; the self-check above saw the inner argv.
     wrapper = setup_deny_wrapper(options, report, perms, report_dir, worktree, codex_home,
@@ -2842,6 +3038,16 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     if wrapper.applied and sandbox.get("backend") == FULL_HOST_BACKEND:
         sandbox["confinement"] = FULL_HOST_DENY_CONFINEMENT
     report["sandbox"] = sandbox
+
+    if task.kind == "read":
+        if options.apple_simulator_udid is not None or options.native_preflight_plan is not None:
+            raise BlockedError("read jobs cannot opt into native build or simulator execution")
+        sandbox["verification"] = "not run for read jobs"
+        report["sandbox"] = sandbox
+        _execute_read_job(options, report, deadline, profile, context_window, worktree,
+                          report_dir, env, loaded, catalog_path, catalog, wrapper, secrets,
+                          report.get("_policy"))
+        return
 
     if options.apple_simulator_udid is not None:
         native_gate(options, report, worktree, sandbox, verify_env, secrets, deadline, wrapper)
@@ -3199,6 +3405,7 @@ STATUS_REASONS = {
     "model_mismatch": "the worker was served by a model other than the pinned one",
     "no_changes": "the worker produced no in-scope implementation patch that survived to the "
                   "final audit; baseline verification passed, and parent review is required",
+    "answer_invalid": "the read worker's output failed schema or citation verification",
 }
 
 
@@ -3352,7 +3559,7 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
                     # This audit is the last word: a patch that vanished before the report was
                     # written cannot be reported as a patch. Failures below keep their priority.
                     report["worker_patch_present"] = False
-                    if report.get("status") == "ok":
+                    if report.get("status") == "ok" and options.task.kind != "read":
                         report["status"] = "no_changes"
                 if unfinished and claimed:
                     stream.record_attempt(report["job_id"], has_patch=bool(final_audit.patch) and final_audit.patch != unfinished["before_patch"] and not final_audit.violations)

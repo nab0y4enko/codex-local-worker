@@ -70,6 +70,7 @@ class ContractV2Tests(unittest.TestCase):
         self.assertEqual(fake.verification_calls()[0]["env"]["JAVA_HOME"], value)
         saved = Path(report["report_dir"], "report.json").read_text(encoding="utf-8")
         self.assertNotIn(value, saved)
+        self.assertNotIn(value, json.dumps(report))
 
     def test_cloud_tier_needs_a_model(self):
         with self.assertRaises(lw.ContractError):

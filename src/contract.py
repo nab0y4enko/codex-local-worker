@@ -172,12 +172,18 @@ class Contract:
         return cls(**kwargs)
 
     def to_dict(self) -> Dict[str, Any]:
+        tier: Dict[str, Any]
+        if self.tier.kind == "cloud":
+            tier = {"cloud": self.tier.model}
+            if self.tier.reasoning_effort is not None:
+                tier["reasoning_effort"] = self.tier.reasoning_effort
+        else:
+            tier = {"local": True}
         result = {"task_id": self.task_id, "kind": self.kind, "repo_path": str(self.repo_path),
                   "base_ref": self.base_ref, "goal": self.goal,
                   "timeout_seconds": self.timeout_seconds, "workstream": self.workstream,
                   "environment": {"pass": list(self.environment_pass)},
-                  "tier": {"kind": self.tier.kind, "model": self.tier.model,
-                           "reasoning_effort": self.tier.reasoning_effort}}
+                  "tier": tier}
         if self.kind == "write":
             result.update(acceptance_criteria=self.acceptance_criteria,
                           allowed_paths=self.allowed_paths, test_commands=self.test_commands,
@@ -257,10 +263,37 @@ def _validate_schema_keywords(schema: Any, pointer: str = "") -> None:
     if unknown:
         raise ContractError("answer_schema%s: unsupported keyword(s): %s" %
                             (pointer, ", ".join(unknown)))
+    types = {"object", "array", "string", "integer", "number", "boolean", "null"}
+    if "type" in schema:
+        declared = schema["type"]
+        declared = declared if isinstance(declared, list) else [declared]
+        if not declared or any(not isinstance(item, str) or item not in types for item in declared):
+            raise ContractError("answer_schema%s/type: contains an unsupported JSON type" % pointer)
+    required = schema.get("required", [])
+    if not isinstance(required, list) or any(not isinstance(item, str) for item in required):
+        raise ContractError("answer_schema%s/required: must be an array of strings" % pointer)
     properties = schema.get("properties", {})
-    if not isinstance(properties, dict):
+    if not isinstance(properties, dict) or any(not isinstance(key, str) for key in properties):
         raise ContractError("answer_schema%s/properties: must be an object" % pointer)
     for key, child in properties.items():
         _validate_schema_keywords(child, pointer + "/properties/" + str(key))
     if "items" in schema:
         _validate_schema_keywords(schema["items"], pointer + "/items")
+    additional = schema.get("additionalProperties", True)
+    if not isinstance(additional, (bool, dict)):
+        raise ContractError("answer_schema%s/additionalProperties: must be a boolean or schema" % pointer)
+    if isinstance(additional, dict):
+        _validate_schema_keywords(additional, pointer + "/additionalProperties")
+    if "enum" in schema and not isinstance(schema["enum"], list):
+        raise ContractError("answer_schema%s/enum: must be an array" % pointer)
+    for key in ("minItems", "maxItems", "maxLength"):
+        if key in schema and (isinstance(schema[key], bool) or not isinstance(schema[key], int)
+                              or schema[key] < 0):
+            raise ContractError("answer_schema%s/%s: must be a non-negative integer" %
+                                (pointer, key))
+    for key in ("minimum", "maximum"):
+        if key in schema and (isinstance(schema[key], bool) or
+                              not isinstance(schema[key], (int, float))):
+            raise ContractError("answer_schema%s/%s: must be a number" % (pointer, key))
+    if "description" in schema and not isinstance(schema["description"], str):
+        raise ContractError("answer_schema%s/description: must be a string" % pointer)
