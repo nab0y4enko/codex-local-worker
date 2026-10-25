@@ -226,6 +226,12 @@ class Endpoint(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(lw.PreflightError):
                 lw.validate_endpoint(value)
 
+    def test_the_refusal_writes_the_ipv6_host_in_brackets_like_a_url(self):
+        with self.assertRaises(lw.PreflightError) as ctx:
+            lw.validate_endpoint("http://evil.example:8000/v1")
+        self.assertIn("[::1]", str(ctx.exception))
+        self.assertNotIn("|::1>", str(ctx.exception))
+
     def test_the_endpoint_of_a_profile_is_its_base_url_plus_v1(self):
         profile = sp.discovered_profile()
         self.assertEqual(lw.profile_endpoint(profile), profile.base_url + "/v1")
@@ -687,6 +693,15 @@ class Cli(LauncherCase):
         self.assertIn("classification", report)
         self.assertEqual(worker.calls, [])
         self.assertNotIn("/health", fake.calls)
+
+    def test_a_bad_context_cap_refuses_the_job_before_anything_is_loaded(self):
+        fake = sp.FakeOmlx("one")
+        options = sp.job_options(self.root / "badcap", self.repo, omlx=fake)
+        options.load_model, options.requested_model, options.context_cap = True, MODEL, 5
+        report = lw.run_job(options)
+        self.assertNotEqual(report["status"], "ok")
+        self.assertIn("context cap", report["failure_reason"])
+        self.assertFalse([path for path in fake.calls if path.endswith("/load")])
 
     def test_without_load_nothing_is_ever_loaded(self):
         fake = sp.FakeOmlx("one")

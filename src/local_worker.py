@@ -622,6 +622,8 @@ Task = contract.Contract
 # Every loopback host oMLX may listen on, as it is written inside a URL (IPv6 in brackets).
 _LOOPBACK_URL_HOSTS = "|".join(
     re.escape(f"[{host}]" if ":" in host else host) for host in omlx_discovery.LOOPBACK_HOSTS)
+_LOOPBACK_URL_HOSTS_SHOWN = tuple(
+    f"[{host}]" if ":" in host else host for host in omlx_discovery.LOOPBACK_HOSTS)
 ENDPOINT_RE = re.compile(rf"http://(?:{_LOOPBACK_URL_HOSTS}):([0-9]{{1,5}}){re.escape(API_PREFIX)}/?")
 
 
@@ -631,7 +633,7 @@ def validate_endpoint(endpoint: Any) -> str:
     match = ENDPOINT_RE.fullmatch(endpoint) if isinstance(endpoint, str) else None
     if match is None or not 1 <= int(match.group(1)) <= 65535:
         raise PreflightError(
-            f"endpoint must be http://<{'|'.join(omlx_discovery.LOOPBACK_HOSTS)}>:<port>"
+            f"endpoint must be http://<{'|'.join(_LOOPBACK_URL_HOSTS_SHOWN)}>:<port>"
             f"{API_PREFIX}, got {endpoint!r}")
     return endpoint.rstrip("/")
 
@@ -823,7 +825,12 @@ def _run_codex_info(codex_bin: str, args: Sequence[str], run: Callable[..., Any]
             return None, "job deadline expired before `%s`" % " ".join(argv)
     try:
         if run is subprocess.run:
-            bounded = run_bounded(argv, cwd=None, env=dict(os.environ), timeout=timeout)
+            # A version or help call needs neither the user's Codex home (it would create
+            # ``tmp/arg0-*`` there) nor credentials: minimal env, throwaway home.
+            env = {key: os.environ[key] for key in BASE_ENV_KEYS if key in os.environ}
+            with tempfile.TemporaryDirectory(prefix="local-worker-codex-info-") as home:
+                env["CODEX_HOME"] = home
+                bounded = run_bounded(argv, cwd=None, env=env, timeout=timeout)
             return subprocess.CompletedProcess(argv, bounded["returncode"],
                                                bounded["stdout"], bounded["stderr"]), None
         return run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -857,7 +864,9 @@ def codex_compat(codex_bin: str, run: Callable[..., Any] = subprocess.run,
     else:
         found = tuple(int(part) for part in match.groups())
         result["version"] = ".".join(match.groups())
-        if found < MIN_CODEX_VERSION:
+        # A prerelease of the minimum (0.164.0-alpha.1) sorts below it.
+        prerelease = _output_text(version.stdout)[match.end():].startswith("-")
+        if found < MIN_CODEX_VERSION or (found == MIN_CODEX_VERSION and prerelease):
             problems.append("Codex CLI %s is older than %s, the oldest version this launcher "
                             "supports" % (result["version"], minimum))
     if deadline is not None and deadline.remaining() <= 0:
@@ -924,12 +933,19 @@ def job_codex_home(report_dir: Path) -> Path:
     try:
         home.mkdir(mode=0o700)
     except FileExistsError:
-        if home.is_symlink() or not home.is_dir() or any(home.iterdir()):
+        try:
+            unusable = home.is_symlink() or not home.is_dir() or any(home.iterdir())
+        except OSError as error:
+            raise BlockedError(f"cannot inspect the job Codex home {home}: {error}") from error
+        if unusable:
             raise BlockedError(f"the job Codex home {home} already exists and is not an empty "
                                "directory") from None
     except OSError as error:
         raise BlockedError(f"cannot create the job Codex home {home}: {error}") from error
-    home.chmod(0o700)
+    try:
+        home.chmod(0o700)
+    except OSError as error:
+        raise BlockedError(f"cannot make the job Codex home {home} private: {error}") from error
     return home
 
 
@@ -3932,6 +3948,8 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     if options.load_model:
         if not options.requested_model:
             raise ContractError("--load requires --model")
+        if options.context_cap is not None:   # a bad cap refuses the job before a slow load
+            validate_context_cap(options.context_cap)
         load_timeout = deadline.require("model load")
         report["model_load"] = load_requested_model(options.settings_path,
                                                     options.requested_model, options.omlx_fetch,

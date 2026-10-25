@@ -95,6 +95,19 @@ class JobHome(IsolationCase):
         with self.assertRaises(lw.BlockedError):
             lw.job_codex_home(other)
 
+    def test_a_home_that_cannot_be_inspected_or_locked_down_is_a_blocked_job(self):
+        report_dir = self.root / "report"
+        (report_dir / "codex-home").mkdir(parents=True)
+        denied = PermissionError(13, "Permission denied")
+        with mock.patch.object(Path, "iterdir", side_effect=denied):
+            with self.assertRaises(lw.BlockedError):
+                lw.job_codex_home(report_dir)
+        fresh = self.root / "fresh"
+        fresh.mkdir()
+        with mock.patch.object(Path, "chmod", side_effect=denied):
+            with self.assertRaises(lw.BlockedError):
+                lw.job_codex_home(fresh)
+
     def test_the_report_names_the_home_and_the_hash_of_the_catalog_it_launched_with(self):
         report, run = self.run_clean_job()
         home = Path(report["report_dir"]) / "codex-home"
@@ -304,6 +317,32 @@ class Compatibility(IsolationCase):
                         "codex-cli 0.165.0-alpha.3"):
             with self.subTest(version=version):
                 self.assertTrue(lw.codex_compat("codex", run=sp.fake_help(version))["ok"])
+
+    def test_a_prerelease_of_the_minimum_version_is_below_the_floor(self):
+        for version in ("codex-cli 0.164.0-alpha.1", "codex-cli 0.164.0-rc.2"):
+            with self.subTest(version=version):
+                compat = lw.codex_compat("codex", run=sp.fake_help(version))
+                self.assertFalse(compat["ok"])
+                self.assertIn("0.164.0", compat["reason"])
+
+    def test_the_probes_run_with_a_minimal_env_and_a_throwaway_codex_home(self):
+        seen = []
+
+        def bounded(argv, *, cwd, env, timeout):
+            home = Path(env["CODEX_HOME"])
+            seen.append((list(argv), dict(env), home.is_dir()))
+            return {"returncode": 0, "stdout": b"codex-cli 0.164.0 --ephemeral", "stderr": b""}
+
+        user_home = str(self.root / "user-codex")
+        with mock.patch.dict(os.environ, {"CODEX_HOME": user_home, "OPENAI_API_KEY": "x",
+                                          "HTTPS_PROXY": "http://proxy.invalid"}), \
+                mock.patch.object(lw, "run_bounded", bounded):
+            lw._run_codex_info("codex", ["--version"], subprocess.run)
+        (argv, env, existed), = seen
+        self.assertTrue(existed)
+        self.assertNotEqual(env["CODEX_HOME"], user_home)
+        self.assertFalse(Path(env["CODEX_HOME"]).exists(), "the throwaway home is removed")
+        self.assertLessEqual(set(env), set(lw.BASE_ENV_KEYS) | {"CODEX_HOME"})
 
     def test_every_required_flag_must_be_listed(self):
         for flag in lw.CODEX_REQUIRED_FLAGS:
