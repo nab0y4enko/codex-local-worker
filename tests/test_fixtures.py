@@ -3,26 +3,33 @@
 No test here talks to a server or a model; the capture script is exercised with an injected
 fetch function.
 """
+import getpass
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import support as sp  # noqa: E402
 import capture_fixtures as cap  # noqa: E402
 
-FIXTURES = Path(__file__).parent / "fixtures"
+FIXTURES = sp.FIXTURES
 OMLX_FILES = ("health_ok", "health_loading", "api_status", "models_status_one",
               "models_status_none_loaded", "models_status_two_loaded",
               "models_status_helper_and_embedding")
 CODEX_FILES = ("exec_pilot.jsonl", "debug_models.json", "rollout_planner.jsonl")
 CHAT_TYPES = ("llm", "vlm")
 # The repository is public: no fixture may name a person, a home directory or a scratch path.
-PERSONAL_MARKERS = ("oleksii", "/users/", "/private/tmp/claude")
+# The person is whoever runs the tests, so no name is spelled out in this file either.
+GENERIC_ACCOUNTS = ("root", "runner", "user", "ubuntu", "admin", "docker", "jenkins", "build")
+PERSONAL_MARKERS = tuple(dict.fromkeys(
+    [name for name in (getpass.getuser().lower(), Path.home().name.lower())
+     if len(name) >= 3 and name not in GENERIC_ACCOUNTS] + ["/users/", "/private/tmp/claude"]))
 
 
 def loaded(status, *, chat_only=False):
@@ -300,6 +307,83 @@ class CaptureScript(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             self.capture(leaking)
         self.assertNotIn("capture-test-key", str(ctx.exception))
+        self.assertFalse((self.root / "out").exists(), "a refused capture wrote files")
+
+    def test_a_refused_capture_writes_nothing_for_a_stray_path_either(self):
+        with self.assertRaises(SystemExit):
+            self.capture(self.fake_fetch(), pilot_extra="/Users/other/x")
+        self.assertFalse((self.root / "out").exists(), "a refused capture wrote files")
+
+    def test_http_get_sends_the_key_only_as_a_header_and_decodes_json(self):
+        seen = {}
+
+        class Answer:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b'{"ok": true}'
+
+        class Opener:
+            def open(self, request, timeout=None):
+                seen["url"], seen["auth"] = request.full_url, request.get_header("Authorization")
+                return Answer()
+
+        with mock.patch.object(cap.urllib.request, "build_opener", return_value=Opener()):
+            self.assertEqual(cap.http_get("http://127.0.0.1:1", "/health", "k-1"),
+                             (200, {"ok": True}))
+            self.assertEqual(seen, {"url": "http://127.0.0.1:1/health", "auth": "Bearer k-1"})
+            cap.http_get("http://127.0.0.1:1", "/health", None)
+            self.assertIsNone(seen["auth"])
+
+    def test_http_get_refuses_an_unreachable_server_and_a_non_json_answer(self):
+        class Down:
+            def open(self, request, timeout=None):
+                raise cap.urllib.error.URLError("refused")
+
+        class Html:
+            def open(self, request, timeout=None):
+                class Answer:
+                    status = 200
+
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *exc):
+                        return False
+
+                    def read(self):
+                        return b"<html>"
+                return Answer()
+
+        for opener in (Down(), Html()):
+            with mock.patch.object(cap.urllib.request, "build_opener", return_value=opener):
+                with self.assertRaises(SystemExit):
+                    cap.http_get("http://127.0.0.1:1", "/health", "k-1")
+
+    def test_codex_catalog_reads_debug_models_and_refuses_a_failure(self):
+        ok = subprocess.CompletedProcess([], 0, b'{"models": []}', b"")
+        with mock.patch.object(cap.subprocess, "run", return_value=ok) as run:
+            self.assertEqual(cap.codex_catalog("codex-x"), {"models": []})
+        self.assertEqual(run.call_args[0][0], ["codex-x", "debug", "models"])
+        for bad in (subprocess.CompletedProcess([], 3, b"", b""),
+                    subprocess.CompletedProcess([], 0, b"not json", b"")):
+            with mock.patch.object(cap.subprocess, "run", return_value=bad):
+                with self.assertRaises(SystemExit):
+                    cap.codex_catalog("codex-x")
+        with mock.patch.object(cap.subprocess, "run", side_effect=OSError("missing")):
+            with self.assertRaises(SystemExit):
+                cap.codex_catalog("codex-x")
+
+    def test_the_capture_script_is_executable(self):
+        script = Path(cap.__file__)
+        self.assertTrue(script.read_text(encoding="utf-8").startswith("#!"))
+        self.assertTrue(os.access(str(script), os.X_OK))
 
 
 if __name__ == "__main__":
