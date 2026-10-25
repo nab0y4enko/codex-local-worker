@@ -2489,7 +2489,7 @@ class JobOptions:
     maximum: int = 1
     native_preflight_plan: Optional[Path] = None
     preflight_only: bool = False
-    workstream: str = "default"
+    workstream: Optional[str] = None
     job_kind: str = "implementation"
     tool_config: Optional[Path] = None
     # Runs the two informational Codex calls of the compatibility check (``subprocess.run``
@@ -2549,7 +2549,7 @@ def new_report(options: JobOptions) -> Dict[str, Any]:
                         "denials": []},
         "budget": {"total_seconds": float(task.timeout_seconds), "elapsed_seconds": 0.0,
                    "remaining_seconds": float(task.timeout_seconds), "exceeded": False},
-        "workstream": options.workstream,
+        "workstream": options.workstream or task.workstream,
         "job_kind": options.job_kind,
         "native_preflight": None,
         "preflight": {},
@@ -3113,6 +3113,7 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         except policy.PolicyStop as error:
             report["failure_reason"] = str(error)
             report["policy_stop"] = True
+            report["policy_stop_next_action"] = error.next_action
             break
         except DeadlineExpired as error:
             report["attempts"].append({"attempt": attempt_number, "skipped": str(error)})
@@ -3237,8 +3238,6 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         # Success has to be earned by the worker, not by a verification command that happens to
         # write a file: this is the only place the flag is set, and it is always a bool.
         report["worker_patch_present"] = bool(after_worker.patch) and bool(worker_authored)
-        if stream is not None:
-            report["workstream_progress"] = stream.record_attempt(report["job_id"], has_patch=has_patch)
         report.pop("_active_attempt", None)
         last_message, last_message_missing, last_message_tampered = safe_read_job_text(
             last_path, report_dir, secrets)
@@ -3279,6 +3278,9 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         if evidence["unsupported_tools"]:
             attempt["failure_hint"] = "worker reported an unsupported tool; stopping without any model switch"
             report["attempts"].append(attempt)
+            if stream is not None:
+                report["workstream_progress"] = stream.record_attempt(
+                    report["job_id"], capability_failure=False, has_patch=has_patch)
             report["failure_reason"] = attempt["failure_hint"]
             break
         if result.get("output_limit_exceeded"):
@@ -3288,6 +3290,9 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
                 "the run cannot be judged from truncated output; the termination record "
                 "separately states what was done to the process group")
             report["attempts"].append(attempt)
+            if stream is not None:
+                report["workstream_progress"] = stream.record_attempt(
+                    report["job_id"], capability_failure=False, has_patch=has_patch)
             report["failure_reason"] = attempt["failure_hint"]
             break
         report["attempts"].append(attempt)
@@ -3333,15 +3338,21 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
                      and not result.get("output_limit_exceeded")
                      and routing != "mismatch" and not evidence["terminal_failure"])
         tests_ok = (all(test.get("status") == "passed" for test in tests) if options.verify else True)
-        if routing == "mismatch" or (worker_ok and tests_ok and not audit.violations):
-            break
         candidate_status = ("audit_violation" if audit.violations else
-                            "tests_failed" if worker_ok and not tests_ok else "worker_failed")
+                            "tests_failed" if worker_ok and not tests_ok else
+                            "no_changes" if worker_ok and tests_ok and not report.get("worker_patch_present") else
+                            "worker_failed")
         previous_codes = [item.get("code") for item in report.get("auto_retries", [])
                           if isinstance(item, dict) and isinstance(item.get("code"), str)]
         classification = failure_classify.classify(dict(
             report, status=candidate_status, context_window=context_window,
             previous_codes=previous_codes))
+        if stream is not None:
+            report["workstream_progress"] = stream.record_attempt(
+                report["job_id"], capability_failure=(classification.cls == "capability"),
+                has_patch=has_patch)
+        if routing == "mismatch" or (worker_ok and tests_ok and not audit.violations):
+            break
         fix = classification.auto_fix
         if (classification.next_action == "retry_local"
                 and isinstance(fix, dict) and deadline.remaining() > reserve + MIN_ATTEMPT_BUDGET_SECONDS):
@@ -3568,7 +3579,9 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
                 f"{options.task.repo_path}; reports and logs must not be worker-writable"
             )
         try:
-            stream = policy.Workstream(options.state_dir, repo_identity(options.task.repo_path), options.workstream, options.job_kind)
+            stream = policy.Workstream(options.state_dir, repo_identity(options.task.repo_path),
+                                       options.workstream or options.task.workstream,
+                                       options.job_kind, tier=options.task.tier.kind)
             if not options.preflight_only:
                 admission = stream.claim(report["job_id"], deadline.require("workstream admission"), options.task.max_attempts)
                 claimed = True
@@ -3576,6 +3589,8 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
                 if admission["job_budget_seconds"] < deadline.remaining():
                     deadline.end = min(deadline.end, time.monotonic() + admission["job_budget_seconds"])
         except (policy.PolicyStop, ValueError) as error:
+            if isinstance(error, policy.PolicyStop):
+                report["policy_stop_next_action"] = error.next_action
             raise BlockedError(str(error)) from error
         report["_policy"] = stream if claimed else None
         key_error: Optional[Exception] = None
@@ -3627,7 +3642,9 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
                     if report.get("status") == "ok" and options.task.kind != "read":
                         report["status"] = "no_changes"
                 if unfinished and claimed:
-                    stream.record_attempt(report["job_id"], has_patch=bool(final_audit.patch) and final_audit.patch != unfinished["before_patch"] and not final_audit.violations)
+                    stream.record_attempt(report["job_id"], capability_failure=False,
+                        has_patch=bool(final_audit.patch) and final_audit.patch != unfinished["before_patch"]
+                        and not final_audit.violations)
                 report["primary_fingerprint_after"] = primary_fingerprint(options.task.repo_path)
                 report["primary_unchanged"] = report["primary_fingerprint_after"] == report["primary_fingerprint_before"]
                 report["primary_changed_during_job"] = not report["primary_unchanged"]
@@ -3656,7 +3673,10 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
         report["exit_code"] = EXIT_CODES.get(report["status"], 4)
         if report["status"] not in ("ok", "ready") and not report.get("failure_reason"):
             report["failure_reason"] = redact(describe_failure(report), secrets)
-        report["classification"] = failure_classify.classify(report).as_dict()
+        classification = failure_classify.classify(report).as_dict()
+        if report.get("policy_stop_next_action"):
+            classification["next_action"] = report["policy_stop_next_action"]
+        report["classification"] = classification
         report.pop("_worker_authored", None)
         report.pop("_git_layout", None)
         report.pop("_git_admin_before", None)
@@ -3761,7 +3781,7 @@ def build_parser() -> argparse.ArgumentParser:
                           "build/install/launch/test, and the model pins are unchanged")
     run.add_argument("--native-preflight-plan", type=Path)
     run.add_argument("--preflight-only", action="store_true", help="qualify native baseline without starting a worker")
-    run.add_argument("--workstream", default="default", help="stable scope name shared across retries and repair jobs")
+    run.add_argument("--workstream", default=None, help="stable scope name shared across retries and repair jobs (default: task_id)")
     run.add_argument("--job-kind", choices=("implementation", "repair"), default="implementation")
     run.add_argument("--tool-config", type=Path, default=None,
                      help="optional MCP tools manifest for this task: the manifest names the "
@@ -3777,6 +3797,13 @@ def build_parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status", help="read progress and actual usage without starting a worker")
     status.add_argument("--state-dir")
     status.add_argument("--job-id")
+    workstream = sub.add_parser("workstream", help="manage persistent workstream budgets")
+    workstream_sub = workstream.add_subparsers(dest="workstream_command", required=True)
+    reset_parser = workstream_sub.add_parser("reset", help="explicitly reset both tier budgets for one workstream")
+    reset_parser.add_argument("--repo", required=True, help="repository whose budget should be reset")
+    reset_parser.add_argument("--workstream", required=True, help="stable workstream name")
+    reset_parser.add_argument("--state-dir")
+    reset_parser.add_argument("--actor", default=os.environ.get("USER") or "cli")
     check = sub.add_parser("preflight", help="check the installed Codex CLI, then discover the "
                                              "loaded model and its limits; does not qualify "
                                              "native execution")
@@ -3965,6 +3992,14 @@ def main(argv: Optional[Sequence[str]] = None, *,
                 result.append(status_snapshot(item))
             print(json.dumps(result, indent=2))
             return 0
+        if args.command == "workstream":
+            repo = Path(os.path.expanduser(args.repo)).absolute()
+            if not repo.is_dir():
+                raise ContractError("workstream reset repo must be an existing directory")
+            result = policy.reset(resolve_state_dir(args.state_dir), repo_identity(repo),
+                                  args.workstream, actor=args.actor)
+            print(json.dumps(result, indent=2))
+            return 0
         if args.command == "permissions":
             return run_permissions_command(args)
         requested_model, context_cap = selection_from_args(args)
@@ -4001,7 +4036,7 @@ def main(argv: Optional[Sequence[str]] = None, *,
             maximum=maximum,
             native_preflight_plan=args.native_preflight_plan,
             preflight_only=args.preflight_only,
-            workstream=args.workstream,
+            workstream=args.workstream or task.workstream,
             job_kind=args.job_kind,
             tool_config=args.tool_config,
             codex_run=codex_run,
