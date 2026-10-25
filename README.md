@@ -101,6 +101,10 @@ filesystem or network access. Keep credentials outside repositories sent to work
 requests a change. Doctor only reads an existing file and does not create missing permission
 state.
 
+Known limit: the wrapper write-protects the job worktree directory itself so it cannot be
+renamed or replaced, so `touch .` (or `tar -C .` setting times) at the worktree root fails with
+"Operation not permitted" inside a job. Files and subdirectories below the root are unaffected.
+
 ## Troubleshooting by classification code
 
 Use the current report's `classification.code`, evidence, remediation, and `next_action`:
