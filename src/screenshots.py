@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import shutil
 import struct
@@ -142,15 +143,37 @@ def _relative(raw: str) -> PurePosixPath:
     return path
 
 
+def validate_source_name(value: Any) -> str:
+    """Validate a source identifier before callers use it in an output path."""
+    if not isinstance(value, str) or not _SAFE_NAME.fullmatch(value):
+        raise ValueError("capture source name must be a safe identifier")
+    return value
+
+
+def _reject_symlink_ancestors(path: Path, label: str) -> Path:
+    if ".." in Path(path).parts:
+        raise ValueError(f"overlay {label} path contains traversal")
+    absolute = Path(os.path.abspath(str(path)))
+    cursor = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise ValueError(f"overlay {label} path contains a symlink: {cursor}")
+    return absolute
+
+
 def apply_overlay(result_tree: Path, before_tree: Path, overlay_paths: List[str],
                   allowed_roots: List[str]) -> List[str]:
     """Copy only regular files under declared harness roots from result into before."""
     result_tree, before_tree = Path(result_tree), Path(before_tree)
     for root, label in ((result_tree, "source"), (before_tree, "destination")):
-        if root.is_symlink():
-            raise ValueError(f"overlay {label} root must not be a symlink")
+        root = _reject_symlink_ancestors(root, label)
         if not root.is_dir():
             raise ValueError(f"overlay {label} root is not a directory: {root}")
+        if label == "source":
+            result_tree = root
+        else:
+            before_tree = root
     result_tree, before_tree = result_tree.resolve(), before_tree.resolve()
     roots = [_relative(root) for root in allowed_roots]
     copied: List[str] = []
@@ -262,26 +285,25 @@ def _wait(seconds: Any, deadline: Any) -> None:
 def capture_source(plan: Dict, source: CaptureSource, worktree: Path, out_dir: Path,
                    run: Callable, deadline: Any = None) -> List[Dict]:
     """Build and capture one source into its own artifact tree and screenshot directory."""
+    validate_source_name(source.name)
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     screenshots = plan.get("screenshots") or []
     if not isinstance(screenshots, list) or not screenshots:
         return [{"name": "screenshots", "path": None, "method": "simctl",
                  "uniform": False, "error": "native plan has no requested screenshots"}]
-    if not _SAFE_NAME.fullmatch(source.name):
-        raise ValueError("capture source name must be a safe identifier")
-    evidence_dir = out_dir.parent / "capture-native" / source.name
+    evidence_dir = out_dir.parent / "apple-scratch" / "capture-native" / source.name
     if evidence_dir.exists():
         raise ValueError(f"capture evidence directory already exists: {evidence_dir}")
     evidence_dir.mkdir(parents=True)
-    product_dir = evidence_dir / "apple-scratch" / "captures" / source.name / "products"
-    derived_data = evidence_dir / "apple-scratch" / "captures" / source.name / "derived-data"
+    product_dir = evidence_dir / "apple-scratch" / "products"
+    derived_data = evidence_dir / "apple-scratch" / "derived-data"
     original_app = str(plan.get("app_bundle", "App.app")).replace("{worktree}", "")
     app_name = Path(original_app).name
     if not app_name.endswith(".app"):
         raise ValueError("native plan app_bundle must end in .app")
     app_bundle = product_dir / app_name
-    result_bundle = evidence_dir / "apple-scratch" / "captures" / source.name / "Tests.xcresult"
+    result_bundle = evidence_dir / "apple-scratch" / "Tests.xcresult"
     source_plan = dict(plan)
     source_plan["version"] = 2
     source_plan["destination"] = dict(source.destination)

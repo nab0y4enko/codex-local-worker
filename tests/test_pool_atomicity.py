@@ -192,11 +192,11 @@ class PoolAtomicityCase(unittest.TestCase):
 
     # -- in-process helpers -------------------------------------------------------
     def lease(self, repo=None, allowed_paths=("add.py",), capacity=2, timeout=0.4,
-              task_id="probe", job_deadline=None):
+              task_id="probe", job_deadline=None, simulator_udid=None):
         return wp.lease(self.state, capacity=capacity, task_id=task_id,
                         repo_identity=lw.repo_identity(repo if repo is not None else self.repo),
                         allowed_paths=list(allowed_paths), lock_timeout=timeout,
-                        job_deadline=job_deadline)
+                        job_deadline=job_deadline, simulator_udid=simulator_udid)
 
     @contextlib.contextmanager
     def hold_coordinator(self, timeout=10.0):
@@ -476,6 +476,83 @@ class MixedCapacities(PoolAtomicityCase):
         self.assertEqual(wp._effective_capacity(records, wp.MAX_WORKERS_LIMIT), 2)
         self.assertEqual(wp._effective_capacity([{"slot": 1, "capacity": "two"}], 4), 1)
         self.assertEqual(wp._effective_capacity([], wp.MAX_WORKERS_LIMIT), wp.MAX_WORKERS_LIMIT)
+
+
+class SimulatorResourceLocks(PoolAtomicityCase):
+    def test_multi_device_resources_are_acquired_once_in_sorted_order(self):
+        udids = ["BBBBBBBB-1234-1234-1234-123456789ABC",
+                 "AAAAAAAA-1234-1234-1234-123456789ABC",
+                 "bbbbbbbb-1234-1234-1234-123456789abc"]
+        opened = []
+        original_open = wp._open_lock
+
+        def recording_open(state_dir, relative):
+            opened.append(relative)
+            return original_open(state_dir, relative)
+
+        with mock.patch.object(wp, "_open_lock", recording_open):
+            with wp._simulator_resources(self.state, udids, lock_timeout=0.5) as held:
+                self.assertEqual(held, {item.lower() for item in udids[:2]})
+        self.assertEqual(opened, [
+            "resources/apple-simulator-aaaaaaaa-1234-1234-1234-123456789abc.lock",
+            "resources/apple-simulator-bbbbbbbb-1234-1234-1234-123456789abc.lock",
+        ])
+
+    def test_resource_set_uses_the_same_lock_as_single_simulator_leases(self):
+        udid = "AAAAAAAA-1234-1234-1234-123456789ABC"
+        with wp._simulator_resources(self.state, [udid], lock_timeout=0.5):
+            with self.assertRaises(wp.PoolUnavailableError):
+                with self.lease(simulator_udid=udid, timeout=0.05):
+                    self.fail("single simulator lease ignored the shared resource lock")
+
+    def test_multi_device_resource_wait_uses_original_job_deadline(self):
+        udid = "AAAAAAAA-1234-1234-1234-123456789ABC"
+        deadline = time.monotonic() + 0.04
+        with wp._simulator_resources(self.state, [udid], lock_timeout=0.5):
+            started = time.monotonic()
+            with self.assertRaises(wp.PoolUnavailableError):
+                with wp._simulator_resources(self.state, [udid], lock_timeout=0.5,
+                                            job_deadline=deadline):
+                    self.fail("contended resource lock was acquired")
+            self.assertLess(time.monotonic() - started, 0.2)
+
+    def test_capture_resources_follow_legacy_lock_for_both_pool_modes(self):
+        udids = ["BBBBBBBB-1234-1234-1234-123456789ABC",
+                 "AAAAAAAA-1234-1234-1234-123456789ABC"]
+        for capacity in (1, 2):
+            with self.subTest(capacity=capacity):
+                options = dataclasses.replace(sp.job_options(self.root, self.repo),
+                                              maximum=capacity)
+                events = []
+                original_acquire = wp._acquire
+
+                def recording_acquire(handle, deadline, label, exclusive=True):
+                    events.append(label)
+                    return original_acquire(handle, deadline, label, exclusive=exclusive)
+
+                original_job_lock = lw.job_lock
+
+                @contextlib.contextmanager
+                def recording_job_lock(*args, **kwargs):
+                    with original_job_lock(*args, **kwargs) as held:
+                        events.append("legacy-exclusive")
+                        yield held
+
+                report = {"job_id": "order-test-%s" % capacity}
+                with mock.patch.object(wp, "_acquire", recording_acquire), \
+                        mock.patch.object(lw, "job_lock", recording_job_lock):
+                    with lw.job_lease(options, report, timeout=1.0,
+                                      simulator_udids=udids):
+                        pass
+                legacy_index = next(i for i, item in enumerate(events)
+                                    if item in (wp.WORKER_LOCK, "legacy-exclusive"))
+                resource_indices = [i for i, item in enumerate(events)
+                                    if item.startswith("apple-simulator:")]
+                resource_labels = [events[index] for index in resource_indices]
+                self.assertEqual(resource_labels, sorted(resource_labels),
+                                 "resource locks must be acquired in sorted order")
+                self.assertTrue(resource_indices)
+                self.assertGreater(min(resource_indices), legacy_index)
 
 
 if __name__ == "__main__":

@@ -459,6 +459,10 @@ STUB_CODEX = textwrap.dedent('''\
         with open(path, mode) as handle:
             handle.write(text)
 
+    def write_nested(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return write(path)
+
     attempt("worktree", lambda: write(os.path.join(cwd, "add.py"),
                                       "def add(a, b):\\n    return a + b\\n"))
     attempt("codex_home", lambda: write(os.path.join(home, "session.log")))
@@ -474,6 +478,8 @@ STUB_CODEX = textwrap.dedent('''\
     # NB1: native tools create their own directories under the two pre-made roots.
     attempt("scratch_mkdir", lambda: os.makedirs(os.path.join(report_dir, "apple-scratch", "derived", "Build")))
     attempt("scratch_write", lambda: write(os.path.join(report_dir, "apple-scratch", "derived", "Build", "f")))
+    attempt("capture_native_write", lambda: write_nested(os.path.join(report_dir, "apple-scratch", "capture-native", "source", "apple-scratch", "products", "build.log")))
+    attempt("capture_checkout_write", lambda: write_nested(os.path.join(report_dir, "apple-scratch", "capture-worktrees", "source", ".git", "config")))
     attempt("screenshot", lambda: write(os.path.join(report_dir, "screenshots", "shot.png")))
     attempt("scratch_root_moved", lambda: os.rename(os.path.join(report_dir, "apple-scratch"),
                                                     os.path.join(report_dir, "scratch-moved")))
@@ -547,11 +553,16 @@ class RealWrappedJob(WrapperCase):
         self.assertEqual(report["catalog_sha256"], hashlib.sha256(catalog.read_bytes()).hexdigest())
         # NB1: apple-scratch and screenshots are pre-created, so tools can build under them, but
         # the roots themselves cannot be moved away.
-        for name in ("scratch_mkdir", "scratch_write", "screenshot"):
+        for name in ("scratch_mkdir", "scratch_write", "capture_native_write",
+                     "capture_checkout_write", "screenshot"):
             with self.subTest(name=name):
                 self.assertEqual(results[name], "ok")
         self.assertEqual(results["scratch_root_moved"], "Operation not permitted")
         self.assertTrue((Path(report["report_dir"]) / lw.NATIVE_SCRATCH_NAME / "derived" / "Build" / "f").is_file())
+        self.assertTrue((Path(report["report_dir"]) / lw.NATIVE_SCRATCH_NAME / "capture-native" / "source" /
+                         "apple-scratch" / "products" / "build.log").is_file())
+        self.assertTrue((Path(report["report_dir"]) / lw.NATIVE_SCRATCH_NAME / "capture-worktrees" /
+                         "source" / ".git" / "config").is_file())
         self.assertTrue((Path(report["report_dir"]) / lw.SCREENSHOTS_DIR_NAME / "shot.png").is_file())
 
     def test_a_job_on_a_primary_with_a_separate_git_dir_cannot_write_its_common_dir(self):

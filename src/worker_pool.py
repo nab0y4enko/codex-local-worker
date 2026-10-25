@@ -440,10 +440,44 @@ def _effective_capacity(records: Sequence[Dict[str, Any]], capacity: int) -> int
 
 
 @contextlib.contextmanager
+def _simulator_resources(state_dir: Path, udids: Sequence[str], *,
+                        lock_timeout: float = LOCK_TIMEOUT_SECONDS,
+                        job_deadline: Optional[float] = None):
+    """Hold an ordered set of simulator locks from the pool's shared resource namespace.
+
+    Capture jobs can visit several devices. Callers must acquire this set after the legacy
+    worker lock and before taking a worker slot. The complete set is normalized and acquired in
+    sorted order, so captures cannot deadlock by holding opposite subsets. The deadline remains
+    the caller's original job deadline.
+    """
+    state_dir = Path(state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    keys = sorted({_resource_key(udid) for udid in udids})
+    deadline = time.monotonic() + max(float(lock_timeout), 0.0)
+    if job_deadline is not None:
+        deadline = min(deadline, float(job_deadline))
+    handles = []
+    try:
+        for key in keys:
+            handle = _open_lock(state_dir, f"{RESOURCE_DIR}/apple-simulator-{key}.lock")
+            try:
+                _acquire(handle, deadline, f"apple-simulator:{key}")
+            except Exception:
+                _release(handle)
+                raise
+            handles.append(handle)
+        yield set(keys)
+    finally:
+        for handle in reversed(handles):
+            _release(handle)
+
+
+@contextlib.contextmanager
 def lease(state_dir: Path, *, capacity: int = DEFAULT_MAX_WORKERS, task_id: str,
           repo_identity: str, allowed_paths: Sequence[str], job_id: Optional[str] = None,
           base_ref: Optional[str] = None, lock_timeout: float = LOCK_TIMEOUT_SECONDS,
           simulator_udid: Optional[str] = None,
+          simulator_udids: Optional[Sequence[str]] = None,
           job_deadline: Optional[float] = None):
     """Claim one of at most ``capacity`` slots in one shared state directory.
 
@@ -468,21 +502,35 @@ def lease(state_dir: Path, *, capacity: int = DEFAULT_MAX_WORKERS, task_id: str,
     state_dir.mkdir(parents=True, exist_ok=True)
     identity = canonical_repo_path(repo_identity)
     owned = [str(path) for path in allowed_paths]
-    resource = f"apple-simulator:{_resource_key(simulator_udid)}" if simulator_udid else None
+    resource_keys = {_resource_key(udid) for udid in (simulator_udids or [])}
+    if simulator_udid:
+        resource_keys.add(_resource_key(simulator_udid))
+    resource_keys = sorted(resource_keys)
+    resource = (f"apple-simulator:{_resource_key(simulator_udid)}"
+                if simulator_udid else None)
     deadline = time.monotonic() + max(float(lock_timeout), 0.0)
     if job_deadline is not None:
         deadline = min(deadline, float(job_deadline))
     metadata_deadline = float(job_deadline) if job_deadline is not None else deadline
     waits: Dict[str, float] = {}
-    legacy = device = slot_handle = coordinator = None
+    legacy = slot_handle = coordinator = None
+    device_handles = []
     holder: Optional[Lease] = None
     try:
         legacy = _open_lock(state_dir, WORKER_LOCK)
         waits["legacy"] = _acquire(legacy, deadline, WORKER_LOCK, exclusive=(capacity == 1))
-        if resource is not None:
-            device = _open_lock(
-                state_dir, f"{RESOURCE_DIR}/apple-simulator-{resource.split(':', 1)[1]}.lock")
-            waits["resource"] = _acquire(device, deadline, resource)
+        resource_started = time.monotonic()
+        for key in resource_keys:
+            device = _open_lock(state_dir,
+                                f"{RESOURCE_DIR}/apple-simulator-{key}.lock")
+            try:
+                _acquire(device, deadline, f"apple-simulator:{key}")
+            except Exception:
+                _release(device)
+                raise
+            device_handles.append(device)
+        if resource_keys:
+            waits["resource"] = round(time.monotonic() - resource_started, 3)
         claim_started = time.monotonic()
         while True:
             coordinator = _open_lock(state_dir, COORDINATOR_LOCK)
@@ -527,5 +575,5 @@ def lease(state_dir: Path, *, capacity: int = DEFAULT_MAX_WORKERS, task_id: str,
         if holder is not None:
             with contextlib.suppress(Exception):
                 holder.forget()
-        for handle in (slot_handle, device, legacy):
+        for handle in [slot_handle, *reversed(device_handles), legacy]:
             _release(handle)

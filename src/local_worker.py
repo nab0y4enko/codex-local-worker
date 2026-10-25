@@ -1233,7 +1233,8 @@ def parse_max_workers(value: Any) -> int:
 
 @contextlib.contextmanager
 def job_lease(options: JobOptions, report: Dict[str, Any], timeout: float,
-              job_deadline: Optional[float] = None):
+              job_deadline: Optional[float] = None,
+              simulator_udids: Optional[Sequence[str]] = None):
     """Take the pool lease for one job, honestly reported.
 
     Capacity 1 keeps the legacy exclusive ``worker.lock`` untouched; capacity 2..4 takes
@@ -1250,15 +1251,22 @@ def job_lease(options: JobOptions, report: Dict[str, Any], timeout: float,
     try:
         if capacity == 1:
             with job_lock(options.state_dir, timeout):
-                waited = round(time.monotonic() - started, 3)
-                report["lease"] = {
-                    "mode": "exclusive", "capacity": 1, "slot": None,
-                    "legacy_lock": "exclusive", "resource": None, "wait_seconds": waited,
-                    "waits": {"legacy": waited}, "pool": str(options.state_dir),
-                    "task_id": task.task_id,
-                    "repo_identity": pool.canonical_repo_path(task.repo_path),
-                }
-                yield None
+                remaining_lock = max(0.0, timeout - (time.monotonic() - started))
+                with pool._simulator_resources(options.state_dir, simulator_udids or [],
+                                              lock_timeout=remaining_lock,
+                                              job_deadline=job_deadline) as held:
+                    waited = round(time.monotonic() - started, 3)
+                    report["lease"] = {
+                        "mode": "exclusive", "capacity": 1, "slot": None,
+                        "legacy_lock": "exclusive", "resource": None,
+                        "wait_seconds": waited, "waits": {"legacy": waited},
+                        "pool": str(options.state_dir), "task_id": task.task_id,
+                        "repo_identity": pool.canonical_repo_path(task.repo_path),
+                    }
+                    if held:
+                        report["lease"]["capture_resources"] = [
+                            "apple-simulator:" + udid for udid in sorted(held)]
+                    yield None
             return
         with pool.lease(options.state_dir, capacity=capacity, task_id=task.task_id,
                         repo_identity=repo_identity(task.repo_path),
@@ -1266,8 +1274,13 @@ def job_lease(options: JobOptions, report: Dict[str, Any], timeout: float,
                         job_id=report.get("job_id"), base_ref=task.base_ref,
                         lock_timeout=timeout,
                         simulator_udid=options.apple_simulator_udid,
+                        simulator_udids=simulator_udids,
                         job_deadline=job_deadline) as holder:
             report["lease"] = holder.as_report()
+            if simulator_udids:
+                report["lease"]["capture_resources"] = [
+                    "apple-simulator:" + udid for udid in sorted(
+                        {item.lower() for item in simulator_udids})]
             yield holder
     except pool.PoolConflictError as error:
         raise BlockedError(str(error)) from error
@@ -3057,6 +3070,10 @@ def _capture_source(value: Any, default_destination: Dict[str, Any],
     if not isinstance(value, dict):
         raise BlockedError("capture source must be an object")
     name = value.get("name")
+    try:
+        screenshots.validate_source_name(name)
+    except ValueError as error:
+        raise BlockedError(str(error)) from error
     repo_path = value.get("repo_path")
     ref = value.get("ref")
     scheme = value.get("scheme", default_scheme)
@@ -3080,17 +3097,33 @@ def _capture_source(value: Any, default_destination: Dict[str, Any],
     return screenshots.CaptureSource(name, repo, ref, scheme, destination)
 
 
-def _capture_checkout(source: screenshots.CaptureSource, root: Path) -> Path:
+def _capture_checkout(source: screenshots.CaptureSource, root: Path, run: Callable,
+                      temporary: List[Path]) -> Path:
     """Make a disposable local clone; source repositories and refs are only read."""
+    try:
+        screenshots.validate_source_name(source.name)
+    except ValueError as error:
+        raise BlockedError(str(error)) from error
     if source.repo_path.is_symlink() or not source.repo_path.is_dir():
         raise BlockedError(f"capture source {source.name} is not a safe repository directory")
     target = root / source.name
     if target.exists() or target.is_symlink():
         raise BlockedError(f"capture scratch already exists for {source.name}: {target}")
     root.mkdir(parents=True, exist_ok=True)
-    git(source.repo_path, "clone", "--local", "--no-hardlinks", "--no-checkout",
-        str(source.repo_path), str(target))
-    git(target, "checkout", "--detach", source.ref)
+    # Register before clone so a partial clone or failed checkout is still cleaned in the
+    # caller's finally block.
+    temporary.append(target)
+    for argv, cwd in ((["git", "clone", "--local", "--no-hardlinks", "--no-checkout",
+                        str(source.repo_path), str(target)], source.repo_path),
+                      (["git", "-C", str(target), "checkout", "--detach", source.ref],
+                       source.repo_path)):
+        result = run(cwd, argv)
+        if result.get("timed_out"):
+            raise BlockedError(f"capture source {source.name} checkout command timed out")
+        if result.get("returncode") != 0:
+            stderr = result.get("stderr", "")
+            raise BlockedError(f"capture source {source.name} checkout failed: " +
+                               str(stderr)[-300:])
     return target
 
 
@@ -3128,18 +3161,18 @@ def _capture_all(options: JobOptions, report: Dict[str, Any], worktree: Path,
     if len(names) != len(set(names)):
         raise BlockedError("capture source names must be unique")
 
-    scratch_root = report_dir / "capture-worktrees"
+    scratch_root = report_dir / NATIVE_SCRATCH_NAME / "capture-worktrees"
     screenshot_dir = report_dir / SCREENSHOTS_DIR_NAME
     screenshot_dir.mkdir(parents=True, exist_ok=True)
     results: Dict[str, List[Dict[str, Any]]] = {}
     counter = 0
 
-    def run_capture(tree: Path, argv: Sequence[str]):
+    def run_capture(cwd: Path, argv: Sequence[str]):
         nonlocal counter
         deadline.require("screenshot command")
         wrapped = wrapper.wrap(verification_argv(report.get("sandbox") or {},
-                                                 options.codex_bin, tree, argv))
-        result = run_bounded(wrapped, cwd=tree, env=full_host_env(verify_env),
+                                                 options.codex_bin, cwd, argv))
+        result = run_bounded(wrapped, cwd=cwd, env=full_host_env(verify_env),
                              timeout=deadline.require("screenshot command"))
         counter += 1
         output = redact((result["stdout"] + b"\n" + result["stderr"]).decode(
@@ -3157,14 +3190,16 @@ def _capture_all(options: JobOptions, report: Dict[str, Any], worktree: Path,
             if source.name == "after" and not capture_only:
                 tree = worktree
             else:
-                tree = _capture_checkout(source, scratch_root)
-                temporary.append(tree)
+                tree = _capture_checkout(source, scratch_root, run_capture, temporary)
             if source.name == "before" and not capture_only:
                 overlays = plan.get("capture_overlay_paths", [])
                 if not isinstance(overlays, list) or any(not isinstance(path, str) for path in overlays):
                     raise BlockedError("capture_overlay_paths must be an array of paths")
                 copied = screenshots.apply_overlay(
-                    worktree, tree, overlays,
+                    # These launcher-created worktrees may live below a trusted macOS /var
+                    # alias. Canonicalize at this trusted boundary; apply_overlay itself still
+                    # rejects symlinks in every component of the paths it receives.
+                    worktree.resolve(), tree.resolve(), overlays,
                     allowed_roots=["Tests", "UITests", "Test", "UITestHarness", "TestHarness",
                                    "tests", "ui-tests", "test-harness"])
                 report.setdefault("capture_overlay", {})[source.name] = copied
@@ -3986,6 +4021,54 @@ def task_native_plan(task: Any) -> Any:
     return None
 
 
+def _capture_simulator_udids(options: JobOptions) -> List[str]:
+    """Return every simulator a capture job may use, before any capture subprocess runs."""
+    task = options.task
+    if task.kind != "capture" and not task.ui_review:
+        return []
+    value = options.native_preflight_plan
+    if value is None:
+        raise BlockedError("screenshot capture requires a native plan")
+    if isinstance(value, dict):
+        plan = value
+    else:
+        try:
+            plan = json.loads(Path(value).read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as error:
+            raise BlockedError(f"cannot read capture native plan: {error}") from error
+    default = native_destination(value, options.apple_simulator_udid)
+    capture = getattr(task, "capture", None)
+    if task.kind == "capture":
+        sources = capture.get("sources", plan.get("capture_sources", [])) \
+            if isinstance(capture, dict) else plan.get("capture_sources", [])
+        if not sources:
+            destinations = [default]
+        elif isinstance(sources, list):
+            destinations = [default] + [item.get("destination", default) for item in sources
+                                        if isinstance(item, dict)]
+        else:
+            raise BlockedError("capture sources must be an array")
+    else:
+        raw = plan.get("capture_sources", [])
+        if not isinstance(raw, list):
+            raise BlockedError("capture_sources must be an array")
+        destinations = [default] + [item.get("destination", default) for item in raw
+                                    if isinstance(item, dict)]
+    udids = set()
+    for destination in destinations:
+        if not isinstance(destination, dict):
+            raise BlockedError("capture source destination must be an object")
+        udid = destination.get("simulator")
+        if udid is not None:
+            if not isinstance(udid, str):
+                raise BlockedError("capture simulator destination must contain a UUID")
+            try:
+                udids.add(apple.validate_simulator_udid(udid).lower())
+            except apple.ApplePolicyError as error:
+                raise BlockedError(str(error)) from error
+    return sorted(udids)
+
+
 def run_job(options: JobOptions) -> Dict[str, Any]:
     """Run one serialized job and return the structured report."""
     if options.native_preflight_plan is None:
@@ -4046,7 +4129,9 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
         lock_timeout = min(float(options.lock_timeout),
                            float(options.task.timeout_seconds),
                            max(deadline.remaining(), 0.0))
-        with job_lease(options, report, lock_timeout, job_deadline=deadline.end) as lease:
+        _simulator_resources = _capture_simulator_udids(options)
+        with job_lease(options, report, lock_timeout, job_deadline=deadline.end,
+                       simulator_udids=_simulator_resources) as lease:
             report["reaped_orphans"] = reap_orphans(options.state_dir)
             if key_error is not None:
                 raise key_error

@@ -1,8 +1,10 @@
 """Screenshot decoding, safe overlays, capture reporting and job integration."""
+import contextlib
 import sys
 import json
 import plistlib
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,11 +23,16 @@ class CaptureJobRunner:
         self.delegate = sp.FakeRun(worker_edit=worker_edit or sp.fix_add)
         self.udid = None
         self.calls = []
+        self.wrapped_calls = []
+        self.timeouts = []
+        self.fail_checkout = False
 
     def __call__(self, argv, **kwargs):
         raw = [str(arg) for arg in argv]
         inner, wrapped = sp.deny_wrapped(raw)
         self.calls.append(inner)
+        self.wrapped_calls.append(wrapped)
+        self.timeouts.append(kwargs.get("timeout"))
         if inner and Path(inner[0]).name == "xcodebuild":
             if "build" in inner and "test" not in inner:
                 product_dir = Path(next(arg.split("=", 1)[1] for arg in inner
@@ -39,6 +46,12 @@ class CaptureJobRunner:
                 destination = inner[inner.index("-destination") + 1]
                 self.udid = destination.split("=", 1)[1]
             return sp.result(raw, 0)
+        if inner and Path(inner[0]).name == "git":
+            if "checkout" in inner and self.fail_checkout:
+                return sp.result(raw, 1, err="checkout fixture failure")
+            completed = subprocess.run(inner, cwd=kwargs.get("cwd"), capture_output=True,
+                                       text=True, timeout=kwargs.get("timeout"), check=False)
+            return sp.result(raw, completed.returncode, completed.stdout, completed.stderr)
         if inner and Path(inner[0]).name == "xcrun":
             if inner[1:3] == ["xcresulttool", "get"]:
                 summary = {"result": "Passed", "totalTestCount": 1, "passedTests": 1,
@@ -61,7 +74,7 @@ class PngTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
 
     def test_uniform_png_is_detected(self):
         black = sp.write_png(self.root / "black.png", 4, 4, (0, 0, 0))
@@ -81,7 +94,7 @@ class OverlayTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.after = self.root / "after"
         self.before = self.root / "before"
         self.before.mkdir()
@@ -120,8 +133,27 @@ class OverlayTests(unittest.TestCase):
     def test_overlay_rejects_symlinked_ancestor_root(self):
         alias = self.root / "alias"
         alias.symlink_to(self.after, target_is_directory=True)
-        with self.assertRaisesRegex(ValueError, "source root must not be a symlink"):
+        with self.assertRaisesRegex(ValueError, "source path contains a symlink"):
             screenshots.apply_overlay(alias, self.before, ["UITests/Settings.swift"],
+                                       allowed_roots=["UITests"])
+
+    def test_overlay_rejects_symlink_in_root_ancestor(self):
+        alias = self.root / "parent-link"
+        alias.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "source path contains a symlink"):
+            screenshots.apply_overlay(alias / "after", self.before, ["UITests/Settings.swift"],
+                                       allowed_roots=["UITests"])
+
+    def test_overlay_rejects_traversal_in_root_before_normalization(self):
+        with self.assertRaisesRegex(ValueError, "source path contains traversal"):
+            screenshots.apply_overlay(self.root / "after" / ".." / "after", self.before,
+                                       ["UITests/Settings.swift"], allowed_roots=["UITests"])
+
+    def test_overlay_rejects_symlink_in_destination_root_ancestor(self):
+        alias = self.root / "destination-link"
+        alias.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "destination path contains a symlink"):
+            screenshots.apply_overlay(self.after, alias / "before", ["UITests/Settings.swift"],
                                        allowed_roots=["UITests"])
 
 
@@ -129,7 +161,7 @@ class CaptureTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.work = self.root / "worktree"
         self.work.mkdir()
         self.out = self.root / "report" / "screenshots"
@@ -150,6 +182,14 @@ class CaptureTests(unittest.TestCase):
         }
         self.source = screenshots.CaptureSource("after", self.root, "result", "App",
                                                 {"simulator": self.udid})
+
+    def test_unsafe_source_name_is_rejected_before_checkout_paths_are_created(self):
+        scratch = self.root / "scratch"
+        source = screenshots.CaptureSource("../escape", self.root, "result", "App",
+                                           {"simulator": self.udid})
+        with self.assertRaisesRegex(sp.lw.BlockedError, "safe identifier"):
+            sp.lw._capture_checkout(source, scratch, lambda cwd, argv: None, [])
+        self.assertFalse(scratch.exists())
 
     def test_capture_source_builds_unique_artifacts_and_writes_screenshot(self):
         calls = []
@@ -222,15 +262,26 @@ class CaptureTests(unittest.TestCase):
     def test_ui_review_captures_before_after_and_reference(self):
         repo = sp.make_repo(self.root)
         plan_path = self.root / "native-plan.json"
+        alternate_udid = "ABCDEF12-1234-1234-1234-123456789ABC"
         plan = dict(self.plan, capture_sources=[{
             "name": "original", "repo_path": str(repo), "ref": "main",
-            "scheme": "TiviaryOriginal", "destination": {"simulator": self.udid}}])
+            "scheme": "TiviaryOriginal", "destination": {"simulator": alternate_udid}}])
         plan_path.write_text(json.dumps(plan))
         options = sp.job_options(self.root, repo, tier={"local": True},
                                   native_plan=str(plan_path), ui_review=True)
         runner = CaptureJobRunner()
+        locked_udids = []
+        original_locks = sp.lw.pool._simulator_resources
+
+        @contextlib.contextmanager
+        def record_locks(state_dir, udids, **kwargs):
+            locked_udids.extend(udids)
+            with original_locks(state_dir, udids, **kwargs) as held:
+                yield held
+
         with mock.patch.object(sp.lw, "run_bounded", runner), \
-                mock.patch.object(sp.lw, "native_gate", lambda *args, **kwargs: None):
+                mock.patch.object(sp.lw, "native_gate", lambda *args, **kwargs: None), \
+                mock.patch.object(sp.lw.pool, "_simulator_resources", record_locks):
             report = sp.lw.run_job(options)
         self.assertEqual(sorted(report["screenshots"]["sources"]),
                          ["after", "before", "original"])
@@ -243,6 +294,44 @@ class CaptureTests(unittest.TestCase):
                         for arg in argv if arg.startswith("CONFIGURATION_BUILD_DIR=")]
         self.assertEqual(len(product_dirs), 3)
         self.assertEqual(len(set(product_dirs)), 3)
+        git_calls = [call for call in runner.calls if Path(call[0]).name == "git"]
+        self.assertTrue(git_calls)
+        self.assertTrue(all(runner.wrapped_calls[index]
+                            for index, call in enumerate(runner.calls)
+                            if Path(call[0]).name == "git"))
+        self.assertTrue(all(runner.timeouts[index] is not None
+                            for index, call in enumerate(runner.calls)
+                            if Path(call[0]).name == "git"))
+        self.assertTrue(all(runner.timeouts[index] <= options.task.timeout_seconds
+                            for index, call in enumerate(runner.calls)
+                            if Path(call[0]).name == "git"))
+        self.assertEqual(locked_udids, sorted([self.udid.lower(), alternate_udid.lower()]))
+        self.assertEqual(report["lease"]["capture_resources"], [
+            "apple-simulator:" + self.udid.lower(),
+            "apple-simulator:" + alternate_udid.lower(),
+        ])
+        scratch = Path(report["report_dir"]) / sp.lw.NATIVE_SCRATCH_NAME
+        self.assertTrue((scratch / "capture-native" / "before").is_dir())
+        self.assertTrue((scratch / "capture-native" / "after").is_dir())
+        self.assertFalse((scratch / "capture-worktrees" / "before").exists())
+
+    def test_failed_checkout_removes_the_registered_partial_clone(self):
+        repo = sp.make_repo(self.root)
+        plan_path = self.root / "native-plan.json"
+        plan = dict(self.plan, capture_sources=[{
+            "name": "original", "repo_path": str(repo), "ref": "main"}])
+        plan_path.write_text(json.dumps(plan))
+        options = sp.job_options(self.root, repo, tier={"local": True},
+                                 native_plan=str(plan_path), ui_review=True)
+        runner = CaptureJobRunner()
+        runner.fail_checkout = True
+        with mock.patch.object(sp.lw, "run_bounded", runner), \
+                mock.patch.object(sp.lw, "native_gate", lambda *args, **kwargs: None):
+            report = sp.lw.run_job(options)
+        self.assertEqual(report["status"], "blocked")
+        scratch = Path(report["report_dir"]) / sp.lw.NATIVE_SCRATCH_NAME / "capture-worktrees"
+        self.assertTrue(scratch.is_dir())
+        self.assertEqual(list(scratch.iterdir()), [])
 
     def test_index_has_one_row_per_name_and_source_columns(self):
         before = sp.write_png(self.out / "before" / "settings.png", 2, 2, (1, 2, 3),
