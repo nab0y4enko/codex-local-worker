@@ -67,6 +67,12 @@ See [the setup skill](skills/setup/SKILL.md) for override handling and the migra
    <root>/bin/local-worker run --task-file /absolute/path/task.json --json
    ```
 
+   Jobs run **one at a time by default**. Queue jobs sequentially, or pass
+   `--lock-timeout <seconds>` to wait; lock waiting consumes the contract's total time budget.
+   A `worker_busy` result means the worker never started: wait and retry as directed, without
+   treating it as verification failure. Use `--max-workers 2` (up to 4) only for deliberately
+   independent jobs with non-overlapping paths and resources; keep one shared state directory.
+
 4. **Review.** Inspect the returned `status`, `classification.next_action`, patch, tests, audit,
    logs, screenshots, timings, and token counts. A successful command is evidence for that
    command; it is not approval to merge a patch. Keep the main checkout and unrelated active
@@ -75,10 +81,27 @@ See [the setup skill](skills/setup/SKILL.md) for override handling and the migra
    remediation. If it says `escalate_cloud`, inspect the live catalog using
    `models --cloud --json`; select the cheapest suitable live entry and start with low reasoning
    effort. Continue the same job contract and link it with `--escalates <job-id>`.
-6. **Summarize.** Run `<root>/bin/local-worker summary` when the session's jobs are complete. It
+6. **Archive and summarize.** Once each finished job's result is reviewed and integrated into
+   the primary checkout, or explicitly rejected, archive its launcher worktree with
+   `<root>/bin/local-worker-archive archive --repo <repo> --state-dir <state> --job-id <id>`.
+   This applies even when integration is uncommitted; no commit or push is required. Verify
+   the archived receipt, recovery ref, and bundle before moving on. Preserve unfinished jobs
+   and their evidence, and report any worktree that could not be archived. Never-started jobs
+   without a worktree need no archive; retain their reports.
+
+   **Summarize.** Run `<root>/bin/local-worker summary` when the session's jobs are complete. It
    writes Markdown and JSON summaries, sends a best-effort notification, and includes measured
    outcomes, model/tier totals, planner usage when available, screenshots, escalations, and
    **Suggested fixes for this plugin**. Missing measurements remain unavailable, not zero.
+
+### Patch integration
+
+After reviewing a worker patch, use `git apply --check --whitespace=fix <patch>` followed by
+`git apply --whitespace=fix <patch>` to correct trailing whitespace during integration. Inspect
+`git diff --check` and the resulting files, then run the combined project tests. Disclose any
+planner edits to worker results, including whitespace normalization, in the final report.
+Summary token totals exclude jobs with zero worker attempts; usage missing from a job that ran
+remains unavailable, never zero. Individual job rows retain never-started outcomes.
 
 ### UI work and screenshots
 
@@ -119,6 +142,7 @@ Use the current report's `classification.code`, evidence, remediation, and `next
 | `server_unreachable` / `server_loading` | Check the local model service, then rerun doctor and preflight. |
 | `model_not_loaded` / `model_ambiguous` / `model_changed` | Load or select a currently available chat model; do not guess an alias. |
 | `missing_env` / `missing_tool` | Provide the named environment value or install the missing verification command. |
+| `worker_busy` | Worker did not start. Wait and retry or increase `--lock-timeout` within the job budget. |
 | `verification_blocked` | Make the exact verification command runnable; blocked is not a pass. |
 | `simulator_unavailable` | Check the selected simulator's current state and lease. |
 | `secret_read_denied` | Review the reported path; change the user's permission list only if needed and explicitly requested. |
@@ -129,9 +153,8 @@ Use the current report's `classification.code`, evidence, remediation, and `next
 
 Do not infer success from a worker's prose, an empty log, a simulator's presence, or a command
 that could not run. `status --state-dir <dir> [--job-id <id>]` reads live progress. Preserve failed
-and interrupted reports, logs, worktrees, and patches for review. After the task branch is
-committed and pushed, archive completed launcher worktrees and verify the receipt, recovery ref,
-and bundle before cleanup. See [operating policy](skills/local-worker/references/operating-policy.md).
+and interrupted reports, logs, worktrees, and patches for review. Archive each finished job worktree after its reviewed result is integrated or rejected,
+even without a commit or push; verify the receipt, recovery ref, and bundle before cleanup. See [operating policy](skills/local-worker/references/operating-policy.md).
 
 ## Tests
 

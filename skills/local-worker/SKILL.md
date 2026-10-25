@@ -46,6 +46,12 @@ Follow these steps for each repository request:
    <root>/bin/local-worker run --task-file /absolute/path/task.json --json
    ```
 
+   Jobs run **one at a time by default**. Queue jobs sequentially, or pass
+   `--lock-timeout <seconds>` to wait; lock waiting consumes the contract's total time budget.
+   A `worker_busy` result means the worker never started: wait and retry as directed, without
+   treating it as verification failure. Use `--max-workers 2` (up to 4) only for deliberately
+   independent jobs with non-overlapping paths and resources; keep one shared state directory.
+
 4. **Review.** Read the JSON fields `status`, `classification`, `answer`, `patch_path`,
    `screenshots`, `tests`, `tokens`, `durations`, and `report_path`. Inspect the patch, test
    results, audit, and report yourself before integrating anything. For UI work, include a
@@ -64,7 +70,15 @@ Follow these steps for each repository request:
    must be authorized by the user's request and applicable policy. Continue the same scoped task
    and link it with `--escalates <job-id>`; do not invent a model slug, retry a cloud job as
    local, or silently reset the workstream.
-6. **Summarize.** After the last job, run `<root>/bin/local-worker summary`. Report the generated
+6. **Archive and summarize.** Once each finished job's result is reviewed and integrated into
+   the primary checkout, or explicitly rejected, archive its launcher worktree with
+   `<root>/bin/local-worker-archive archive --repo <repo> --state-dir <state> --job-id <id>`.
+   This applies even when integration is uncommitted; no commit or push is required. Verify
+   the archived receipt, recovery ref, and bundle before moving on. Preserve unfinished jobs
+   and their evidence, and report any worktree that could not be archived. Never-started jobs
+   without a worktree need no archive; retain their reports.
+
+   **Summarize.** After the last job, run `<root>/bin/local-worker summary`. Report the generated
    summary, job outcomes, measured token and time totals, screenshots, escalations, missing
    evidence, and any section named **Suggested fixes for this plugin**. The summary notification
    is a hand-off that the session record is ready; it is not approval to integrate a patch.
@@ -80,8 +94,8 @@ asks to change the list. Doctor is read-only and does not create a missing permi
 
 Use `status --state-dir <dir> [--job-id <id>]` to inspect active work. A failed, interrupted, or
 superseded job preserves its report, logs, worktree, and patch for review. Do not reset or merge
-its worktree. After reviewed work is committed and pushed, archive a completed launcher worktree
-with `<root>/bin/local-worker-archive archive --repo <repo> --state-dir <state> --job-id <id>`;
+its worktree. After a finished job is reviewed and integrated or rejected, archive its launcher
+worktree if present (no commit or push required) with `<root>/bin/local-worker-archive archive --repo <repo> --state-dir <state> --job-id <id>`;
 verify the recovery ref, bundle, and archive receipt before cleanup. See
 [operating policy](references/operating-policy.md) for retention and failure handling and
 [Apple verification](references/apple-verification.md) for simulator plans.
@@ -95,3 +109,12 @@ verify the recovery ref, bundle, and archive receipt before cleanup. See
   Do not present either as a passing check.
 - The local model identity comes from live discovery and pinned request evidence. If discovery
   fails, report its classification and follow the returned `next_action`.
+
+### Patch integration
+
+After reviewing a worker patch, use `git apply --check --whitespace=fix <patch>` followed by
+`git apply --whitespace=fix <patch>` to correct trailing whitespace during integration. Inspect
+`git diff --check` and the resulting files, then run the combined project tests. Disclose any
+planner edits to worker results, including whitespace normalization, in the final report.
+Summary token totals exclude jobs with zero worker attempts; usage missing from a job that ran
+remains unavailable, never zero. Individual job rows retain never-started outcomes.

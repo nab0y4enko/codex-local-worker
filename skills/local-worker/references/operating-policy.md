@@ -59,7 +59,8 @@ Use `status --state-dir <dir> [--job-id <id>]` for live progress and measured us
 counts with their source and completeness; cached counts stay separate. Never turn missing usage
 into zero or estimate dollars from token totals.
 
-Once the reviewed task branch is committed and pushed, archive completed launcher worktrees with
+Once each finished job is reviewed and integrated or rejected, archive its launcher worktree
+regardless of whether integration is committed or pushed, with
 `<root>/bin/local-worker-archive archive --repo <repo> --state-dir <state> --job-id <id>`. Confirm
 the `archived` receipt, recovery ref, and verified bundle/archive copy before cleanup. Preserve
 needed logs, screenshots, result bundles, ignored artifacts, and unfinished drafts. Do not delete
