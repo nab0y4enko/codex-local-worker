@@ -297,6 +297,8 @@ def _read_ledger(path: Path, *, tolerate_corruption: bool = False) -> Tuple[List
 
 
 def _totals(rows: List[Dict[str, Any]]) -> Dict[str, Optional[int]]:
+    # Explicit zero-attempt jobs never invoked a worker. Unknown legacy rows still count.
+    rows = [row for row in rows if row.get("attempts") != 0]
     result = {}
     for field in COUNT_FIELDS:
         # Ledger token names are concise but remain explicit in the public summary.

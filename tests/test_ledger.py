@@ -82,6 +82,17 @@ class LedgerTests(unittest.TestCase):
         report["attempts"] = [{"attempt": 1, "returncode": 0, "terminal_failures": []}]
         self.assertTrue(ledger._safe_report(report)["first_try_success"])
 
+
+    def test_never_started_job_does_not_poison_totals(self):
+        ledger.append_job(self.state, "busy", self.job("ran", tokens=(10, 5, 2, 1)))
+        busy = self.job("waiting", status="worker_busy")
+        busy["attempts"] = []
+        ledger.append_job(self.state, "busy", busy)
+        summary = ledger.build_summary(self.state, "busy", self.home)
+        self.assertEqual(summary["totals"]["local"]["input_tokens"], 10)
+        self.assertEqual(summary["all_job_totals"]["output_tokens"], 2)
+        self.assertEqual(len(summary["jobs"]), 2)
+
     def test_missing_data_is_shown_as_missing(self):
         ledger.append_job(self.state, "S2", self.job("J3", tokens=None))
         summary = ledger.build_summary(self.state, "S2", self.home)
