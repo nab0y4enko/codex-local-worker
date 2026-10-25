@@ -12,6 +12,14 @@ launch. It does not load the interactive Codex configuration. The selected windo
 remains the planner and reviewer. No alternate or cloud model is allowed when local
 preflight or worker launch fails.
 
+Each job runs Codex in its own empty `CODEX_HOME` (`<report_dir>/codex-home`) in an
+`--ephemeral` session, with a model catalog generated there for the discovered model; the report
+records `codex_home` and the catalog's `catalog_sha256`. The worker never sees your
+`~/.codex/AGENTS.md`, memories, sessions, `auth.json` or skills list, so put every instruction
+the worker needs into the task contract. Preflight and `run` refuse with `preflight_failed`
+when the installed Codex CLI is older than 0.164.0 or `codex exec --help` lacks a flag the
+worker needs.
+
 Execution is full-host for both halves of a job. The worker runs `codex exec` with
 `-s danger-full-access`, `approval_policy=never`, and `--ignore-rules`, so no approval prompt
 and no execpolicy rule gates it and its network access is the launcher's own. Verification runs
@@ -85,7 +93,8 @@ table.
 
 Native work is opt-in and stays on the full-host backend. `--apple-simulator-udid` pins scope,
 not confinement: the selected tvOS simulator UUID is held by one exclusive pool lease, the
-toolchain environment is pinned, `HOME` and `CODEX_HOME` stay untouched, and
+toolchain environment is pinned, `HOME` stays untouched (`CODEX_HOME` is the job's own home,
+as for every job), and
 `IBToolNeverDeque=1` is forced so a pooled `ibtoold` cannot reuse another job's state. No
 Seatbelt profile is generated, no confined readiness probe runs, and no scratch confinement is
 configured; the report names `full-host-access` as the backend and records that the native probe

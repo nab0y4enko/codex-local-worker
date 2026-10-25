@@ -191,7 +191,7 @@ class NativeGateIntegrationTests(unittest.TestCase):
                 str(self.options.state_dir), '--settings', str(self.options.settings_path),
                 '--codex-bin', sys.executable, '--apple-simulator-udid', sp.APPLE_UDID,
                 '--native-preflight-plan', str(self.plan), '--preflight-only', '--json'],
-                omlx_fetch=sp.FakeOmlx('one'))
+                omlx_fetch=sp.FakeOmlx('one'), codex_run=sp.fake_help())
         self.assertEqual(status, 0, output.getvalue())
         self.assertEqual(json.loads(output.getvalue())['status'], 'ready')
         self.assertEqual(self.fake.exec_calls, 0)

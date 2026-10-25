@@ -106,7 +106,8 @@ the default 300-second startup wait for every bundle.
 Native verification forces `IBToolNeverDeque=1`. The installed actool/ibtool supports this
 mode; it prevents reuse of pooled ibtoold processes that cannot write the next job's fresh
 DerivedData path. Do not share an app product to hide this failure. The report records the
-setting, and `HOME` and `CODEX_HOME` remain unchanged. Qualify repeat fresh builds, not only
+setting, and `HOME` remains unchanged; `CODEX_HOME` is the job's own home, as for every job.
+Qualify repeat fresh builds, not only
 the first warm run.
 
 ## Historical: confined Seatbelt backend

@@ -8,7 +8,9 @@ Plan task 6, the decision gate for spec §6.2 "Generated model catalog". The que
 pilot jobs. Codex reported no `Model metadata … not found` item, logged no
 `unsupported call: apply_patch`, applied every edit with its own patch engine (a completed
 `file_change` item), and the launcher's verification passed. Task 7 ships a generated catalog,
-not `catalog: "fallback"`.
+not `catalog: "fallback"`. Task 7 then revised the base instructions (allow project tools and
+`git mv`, document `*** Move to:`, let a required answer format win) and re-ran the gate on the
+launcher's own generated catalog: 3 of 3 passed (see "Task 7: revised instructions").
 
 ## Environment
 
@@ -52,9 +54,12 @@ python3 scripts/spike_local_catalog.py pilot  --out <scratch>/final/pilot-record
   each way a model can ask for a patch, plus a 60,000-character command output.
 - **`pilot`** builds a fresh pilot (`scripts/prepare_pilot.py`, `timeout_seconds` raised to 900)
   and runs the real launcher, `bin/local-worker run --task-file … --state-dir … --json`.
-  `--codex-bin` points at a generated wrapper that adds the variant's
-  `-c model_catalog_json=…` before the trailing `-- -`, because the launcher does not pass a
-  catalog yet. The launcher reads the oMLX key itself. With `--record`, the wrapper also points
+  Since Task 7 the launcher generates and passes the catalog itself, so the `template` variant
+  runs on the launcher's own catalog. For every other variant `--codex-bin` points at a
+  generated wrapper that drops the launcher's `-c model_catalog_json=…` and adds the variant's
+  before the trailing `-- -` (`none` adds none), so a worker never gets two catalogs. (Before
+  Task 7 the wrapper only added the variant's catalog, because the launcher passed none.) The
+  launcher reads the oMLX key itself. With `--record`, the wrapper also points
   the provider at a loopback proxy in front of oMLX. The proxy forwards everything unchanged,
   records the request bodies and finished response items, and never records `Authorization`.
   The proxy is transparent: `pilot-direct` runs without it.
@@ -211,7 +216,8 @@ The worker column is in seconds. Tokens are input / cached / output.
 The recorded `template` runs made only `exec_command` calls, for example `cat add.py`, then
 `apply_patch <<'EOF'` with a bare `@@` hunk, then `python3 -m unittest -v`. The only remaining
 error item in every run is ``Under-development features enabled: skip_host_skill_discovery``,
-which comes from the launcher's feature pins, not the catalog.
+which comes from the launcher's feature pins, not the catalog. (Task 7 dropped that pin; see
+"Findings outside the catalog".)
 
 ### All runs, by variant
 
@@ -232,13 +238,62 @@ field and spells out three defaults.
 
 ### Instruction drafts that did not ship
 
-| Draft | Runs | Passed | What went wrong |
-| --- | ---: | ---: | --- |
-| First draft (template and freeform) | 4 | 4 | One freeform run sent four malformed hunks (unified-diff headers such as `@@ -1,6 +1,6 @@`) before one applied. |
-| Second draft: added "never a line-number range: do not write `@@ -1,5 +1,5 @@`" | 3 | 1 | The negative example primed the 9B model. Two runs wrote exactly those headers: one applied after seven failed patches, the other gave up and rewrote the file with `printf`. The third called a function `apply_patch`. |
+| Draft | Instructions sha256, length | Runs | Passed | What went wrong |
+| --- | --- | ---: | ---: | --- |
+| First draft (template and freeform) | `afc996ec`, 2,163 chars | 4 | 4 | One freeform run sent four malformed hunks (unified-diff headers such as `@@ -1,6 +1,6 @@`) before one applied. |
+| Second draft: added "never a line-number range: do not write `@@ -1,5 +1,5 @@`" | `fa1e56ec`, 2,305 chars | 3 | 1 | The negative example primed the 9B model. Two runs wrote exactly those headers: one applied after seven failed patches, the other gave up and rewrote the file with `printf`. The third called a function `apply_patch`. |
+| Third draft, shipped by the spike | `6b445a43`, 2,084 chars | 13 | 13 | — |
+| Task 7 revision of the third draft (shipped now) | `0ad2098b`, 2,532 chars | 3 | 3 | — (see "Task 7: revised instructions") |
+
+The hashes are the first 8 hex digits of the sha256 of the `base_instructions` string, the value
+`render` reports as `base_instructions_sha256`.
 
 The shipped instructions give only a positive example with a bare `@@` hunk and context lines,
 and never name a tool called `apply_patch`.
+
+**Limits.** Every qualifying run, for all drafts and variants, was the same pilot: one trivial
+task whose whole edit is a one-line `*** Update File` hunk in `add.py`. The shipped text is the
+third draft, tuned on that pilot after the first two drafts were judged on it, so it is fitted
+to that task as much as it is qualified. Nothing here shows how the model handles
+`*** Add File`, `*** Delete File`, `*** Move to:`, several hunks in one file or several files in
+one patch. The live qualification suite (plan Task 26) must cover Add File, Delete File,
+multi-hunk and multi-file edits before the instructions count as qualified beyond this pilot.
+
+### Task 7: revised instructions
+
+Task 7 changed the third draft minimally (`6b445a43`, 2,084 chars, to `0ad2098b`, 2,532 chars):
+
+- Hand edits still go through the `apply_patch` heredoc via `exec_command`, and `sed -i`,
+  `echo >`, `cat >` and self-written scripts are still not allowed for them. New: when the task
+  calls for them, the model may run the project's own formatters, code generators and build
+  tools, and move a file with `git mv`. The old text forbade any scripted edit, which ruled out
+  the formatters and generators real tasks need.
+- The patch format adds `*** Move to: NEW_PATH` right after `*** Update File: PATH`, followed by
+  the hunks, and says to use `git mv` for a move without changes. A `calls`-style stub check
+  confirmed that Codex's patch engine applies a move with a hunk. A move with no hunk is
+  refused: ``Update file hunk for path 'add.py' is empty``.
+- "Finish with a short summary" now yields when the task specifies the format of the final
+  answer, so it does not conflict with a JSON answer under `--output-schema`.
+
+The gate was re-run with the existing script and local inference only:
+`pilot --variant template --repeat 3`. Each run used a fresh pilot. The launcher ran with its
+Task 7 invocation: generated catalog, job `CODEX_HOME`, `--ephemeral`, and the pins described
+under "Findings outside the catalog". Tokens are input / cached / output.
+
+| Run | Status, tests | Worker s | Job wall s | Tokens | Patch tool applied | `unsupported call` | Error items | Gate |
+| --- | --- | ---: | ---: | --- | --- | ---: | ---: | --- |
+| 1 | ok, 0 | 27.1 | 28.4 | 16,379 / 12,764 / 531 | yes | 0 | 0 | **pass** |
+| 2 | ok, 0 | 18.2 | 20.0 | 16,360 / 14,801 / 512 | yes | 0 | 0 | **pass** |
+| 3 | ok, 0 | 17.6 | 18.8 | 16,332 / 14,778 / 501 | yes | 0 | 0 | **pass** |
+
+All three used the launcher's own catalog (the same `catalog_sha256` each time) and ran
+`cat add.py`, then the patch, then `python3 -m unittest -v`. Input tokens dropped from about
+23,700 to about 16,350 per job. That drop comes from the new pins, not the wording: the
+3,458-character skills message and the three goal tools are no longer sent. A `render` of the
+launcher's argv confirms the request now carries just two developer messages, the
+2,532-character base instructions and the permissions note, plus `exec_command`, `write_stdin`,
+`request_user_input` and `view_image`. The revised wording keeps the pass rate on this pilot
+(3 of 3), and the Limits above still apply to it.
 
 ## Decision: the template, field by field
 
@@ -264,14 +319,17 @@ substitutes typed values: `"{{slug}}"` and `"{{display_name}}"` become strings,
 | `experimental_supported_tools` | `[]` | No cloud experimental tools. |
 | `include_{skills,plugin,apps}_usage_instructions` | `false` | Explicit defaults. `true` adds about 2.5k characters of skills guidance. |
 | `visibility`, `supported_in_api`, `priority` | `list`, `true`, `0` | Required; neutral values. |
-| `base_instructions` | 2,084 characters, local | States the unattended context, the shell tool, and how to edit: an `apply_patch` heredoc through `exec_command`. Explains the patch format with one positive example and a bare `@@` hunk. Forbids `sed -i` and redirection edits. Ends with working rules. Against the fallback prompt it uses 60% fewer input tokens per job (median 23,664 vs 58,926), and the worker finishes about 34% faster (median 22.7 s vs 34.2 s). |
+| `base_instructions` | 2,532 characters, local (2,084 as qualified by the spike) | States the unattended context, the shell tool, and how to edit: an `apply_patch` heredoc through `exec_command`. Explains the patch format with one positive example and a bare `@@` hunk, plus `*** Move to:`. Forbids `sed -i` and redirection edits by hand; allows the project's own formatters, generators and build tools and `git mv` (Task 7). Ends with working rules. Against the fallback prompt it uses 60% fewer input tokens per job (median 23,664 vs 58,926), and the worker finishes about 34% faster (median 22.7 s vs 34.2 s). |
 
-Task 7 should hash the generated file into the argv self-check, as spec §6.2 says.
+Task 7 should hash the generated file into the argv self-check, as spec §6.2 says. (Done: the
+launcher writes the catalog into the job's `CODEX_HOME`, records its `catalog_sha256`, and
+re-hashes the file in the self-check before every launch.)
 
 ## Findings outside the catalog (for later tasks)
 
 - **`get_goal` / `create_goal` / `update_goal` are offered to every worker.** Pinning
   `features.goals=false` removes them (checked with `render --set features.goals=false`).
+  Task 7 pins it.
 - **`request_user_input` is always offered by `codex exec` 0.164.** It is described as
   Plan-mode only. No catalog field or feature removed it.
 - **`view_image` stays with a text-only entry.** Only the `view_image` feature controls it.
@@ -281,9 +339,33 @@ Task 7 should hash the generated file into the argv self-check, as spec §6.2 sa
   that Codex installs into the throwaway home (`skills/.system`: imagegen, openai-docs, …).
   Spec §6.2 says the worker never sees the user's skills, so the isolation work needs a way to
   turn this off.
+
+  **Resolved in Task 7.** The binary's config schema has a `skills` table with `bundled`,
+  `include_instructions`, `max_context_tokens` and `config`, plus the `skill_search` and
+  `skip_host_skill_discovery` features. Each candidate was tried with the request recorder, with
+  no inference:
+  - **No switch in Codex 0.164 turns off discovery of `~/.agents/skills` itself.**
+    `features.skip_host_skill_discovery` true and false give the same skills message.
+    `features.skill_search=false` changes nothing.
+  - `skills.include_instructions=false` drops the whole skills developer message (3,458
+    characters here), so the request names no skill root and no skill.
+  - `skills.bundled.enabled=false` stops Codex installing the system skills into the job home.
+
+  Task 7 pins both `skills.*` values and the self-check requires them. Per-skill
+  `skills.config` entries could disable named skills, but only by listing each host's skills,
+  so they were not used.
 - **Every run carries one error item:** ``Under-development features enabled:
   skip_host_skill_discovery``. Either pin `suppress_unstable_features_warning=true` or drop
   that feature pin; otherwise every report keeps an error item that is not a real error.
+  **Resolved in Task 7:** the pin achieved no isolation (above), so it was dropped. No
+  under-development feature is enabled now, so the error item is gone (0 in the three Task 7
+  runs) and `suppress_unstable_features_warning` is not needed.
+- **Codex writes into its home during a run.** Besides its state databases, Codex 0.164 adds a
+  `[projects."<repo>"] trust_level = "trusted"` entry to `$CODEX_HOME/config.toml`, even with
+  `--ignore-user-config`. Before Task 7 the worker inherited the caller's `CODEX_HOME`, so the
+  same write presumably went to the user's own `config.toml`; that was not tested. With the job
+  home it stays in `<report_dir>/codex-home`. With `--ephemeral`, no `sessions/` directory is
+  created.
 - **A stray `apply_patch` function call is still possible.** It never happened in 13 runs with
   the shipped instructions. If it does, the attempt still finishes, and stderr shows
   `unsupported call: apply_patch`. Classify that as a model slip, not an environment failure.

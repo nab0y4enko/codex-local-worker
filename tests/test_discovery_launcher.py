@@ -37,7 +37,8 @@ class LauncherCase(unittest.TestCase):
         """``(exit code, parsed stdout)`` of one ``main`` call served by a discovery fake."""
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            code = lw.main(argv, omlx_fetch=omlx if omlx is not None else sp.FakeOmlx("one"))
+            code = lw.main(argv, omlx_fetch=omlx if omlx is not None else sp.FakeOmlx("one"),
+                           codex_run=sp.fake_help())
         return code, json.loads(out.getvalue())
 
     def task_file(self):
@@ -62,8 +63,9 @@ class Preflight(LauncherCase):
     def test_preflight_reports_the_discovered_model(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            code = lw.main(["preflight", "--settings", str(self.settings)],
-                           omlx_fetch=sp.FakeOmlx("one"))
+            code = lw.main(["preflight", "--settings", str(self.settings), "--codex-bin",
+                            "codex-mock"], omlx_fetch=sp.FakeOmlx("one"),
+                           codex_run=sp.fake_help())
         receipt = json.loads(out.getvalue())
         self.assertEqual(code, 0)
         self.assertEqual(receipt["profile"]["model"]["api_model"], "Qwen3.5-9B-OptiQ-4bit")
@@ -332,14 +334,14 @@ class Pins(unittest.TestCase):
         argv = lw.worker_argv("codex", Path("/wt"), profile, 32768, Path("/r/l.txt"))
         self.assertEqual(lw.missing_config_pins(argv, profile, 32768), [])
 
-    def test_the_catalog_arguments_are_accepted_and_do_not_change_the_pins_yet(self):
+    def test_a_catalog_path_adds_exactly_the_catalog_pin(self):
         plain = self.argv()
         with_catalog = self.argv(catalog_path=Path("/c/catalog.json"))
-        self.assertEqual(plain, with_catalog)
-        self.assertEqual(lw.config_overrides(self.profile, 32768, Path("/c/catalog.json")),
-                         lw.config_overrides(self.profile, 32768))
-        self.assertEqual(lw.missing_config_pins(plain, self.profile, 32768,
-                                                (Path("/c/catalog.json"), "0" * 64)), [])
+        self.assertNotIn("model_catalog_json", lw.config_overrides_map(plain))
+        added = [pair for pair in lw.config_override_pairs(with_catalog)
+                 if pair not in lw.config_override_pairs(plain)]
+        self.assertEqual(added, [("model_catalog_json", '"/c/catalog.json"')])
+        self.assertEqual(len(with_catalog), len(plain) + 2)
 
 
 class JobReport(LauncherCase):
@@ -700,7 +702,8 @@ class Cli(LauncherCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out), mock.patch.object(
                 lw, "run_bounded", sp.FakeRun(worker_edit=sp.fix_add)):
-            lw.main(self.run_args("--load", "--model", MODEL), omlx_fetch=fake)
+            lw.main(self.run_args("--load", "--model", MODEL), omlx_fetch=fake,
+                    codex_run=sp.fake_help())
         self.assertNotIn(sp.SECRET, out.getvalue())
 
 

@@ -13,7 +13,6 @@ import json
 import os
 import selectors
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 
@@ -44,13 +43,14 @@ class ToolProbeError(ValueError):
     """
 
 
-def probe_tools(loaded, *, codex_bin, env, overrides, deadline, report_dir):
+def probe_tools(loaded, *, codex_bin, env, overrides, deadline, codex_home):
     """Return a copy of ``loaded['evidence']`` with every selected server marked probed.
 
-    ``overrides`` is the launcher's own ``config_overrides(profile, context_window)`` (local
-    pins, features off) and ``loaded['overrides']`` adds the selected MCP servers, so the probe
-    asks the real Codex MCP client the very same questions the worker will run under. No
-    servers means nothing to check and the evidence comes back unchanged.
+    ``overrides`` is the launcher's own ``config_overrides(profile, context_window, catalog)``
+    (local pins, features off) and ``loaded['overrides']`` adds the selected MCP servers, so the
+    probe asks the real Codex MCP client the very same questions the worker will run under.
+    ``codex_home`` is the job's own Codex home, the one the worker gets too. No servers means
+    nothing to check and the evidence comes back unchanged.
     """
     evidence = _evidence(loaded)
     servers = evidence.get("servers")
@@ -63,14 +63,14 @@ def probe_tools(loaded, *, codex_bin, env, overrides, deadline, report_dir):
     budget = _budget(deadline, servers, names)
     if not str(codex_bin or "").strip():
         raise ToolProbeError("no Codex executable was available to probe the required MCP tools")
-    parent = Path(report_dir)
-    parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="tool-probe-", dir=str(parent)) as home:
-        process = _spawn(codex_bin, overrides, loaded, env, home)
-        try:
-            discovered = _Session(process, budget).exchange(names)
-        finally:
-            _discard(process)
+    home = Path(codex_home)
+    if not home.is_dir():
+        raise ToolProbeError("the job Codex home for the tool probe does not exist")
+    process = _spawn(codex_bin, overrides, loaded, env, str(home))
+    try:
+        discovered = _Session(process, budget).exchange(names)
+    finally:
+        _discard(process)
     for name in names:
         meta = servers[name]
         found = discovered.get(name)
@@ -126,10 +126,10 @@ def _budget(deadline, servers, names):
 
 
 def _spawn(codex_bin, overrides, loaded, env, home):
-    """Start the app-server in its own process group, in a throwaway CODEX_HOME and cwd.
+    """Start the app-server in its own process group, with the job's CODEX_HOME as home and cwd.
 
-    Only the child sees the isolated ``CODEX_HOME``/cwd: the worker's own HOME and CODEX_HOME are
-    untouched. The model credential is removed because a metadata probe must not authenticate.
+    The user's Codex home is never used: ``home`` is the job's own, the same one the worker runs
+    in. The model credential is removed because a metadata probe must not authenticate.
     """
     argv = [str(codex_bin), "app-server", "--listen", "stdio://"]
     argv.extend(str(item) for item in (overrides or []))

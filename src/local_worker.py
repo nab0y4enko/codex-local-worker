@@ -10,6 +10,11 @@ Standard library only. Design rules:
   attempt: if the pinned model is gone or changed, that attempt does not start.
 * The oMLX key is loaded into the child environment only; it is excluded from the
   model's shell environment via shell_environment_policy and redacted from all logs.
+* Every job runs Codex in its own empty ``CODEX_HOME`` inside the report directory, in an
+  ephemeral session, on a model catalog generated for the discovered model
+  (``codex_catalog``): the worker never sees the user's Codex home, and the self-check pins
+  the catalog file's hash. An installed Codex that is too old or lacks a required flag is a
+  preflight refusal.
 * Every job runs in its own detached ``git worktree``. The primary checkout is never
   mutated. Failed worktrees are preserved, never auto-merged, never committed.
 * One job runs at a time by default. ``--max-workers`` 2-4 widens that to a bounded pool of
@@ -44,9 +49,10 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import apple_verification as apple
+import codex_catalog
 import omlx_discovery
 import worker_pool as pool
 import native_readiness as native
@@ -150,9 +156,10 @@ PROXY_ENV_VARS = (
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "GATEWAY_INTERFACE",
     "http_proxy", "https_proxy", "all_proxy", "no_proxy", "CURL_HOME",
 )
+# ``CODEX_HOME`` is deliberately not inherited: every job sets its own (``job_codex_home``).
 BASE_ENV_KEYS = (
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LC_ALL", "TMPDIR",
-    "TMP", "TEMP", "TZ", "CODEX_HOME", "XPC_SERVICE_NAME",
+    "TMP", "TEMP", "TZ", "XPC_SERVICE_NAME",
 )
 CLOUD_ENV_PREFIXES = (
     "OPENAI_", "ANTHROPIC_", "AZURE_OPENAI", "GOOGLE_", "GEMINI_", "VERTEX_", "AWS_",
@@ -167,17 +174,38 @@ CLOUD_ENV_NAMES = (
     "XAI_API_KEY", "GROQ_API_KEY",
 )
 
+# ``goals`` would offer get/create/update_goal to every worker. There is no
+# ``skip_host_skill_discovery`` pin: in Codex 0.164 that under-development flag isolated nothing
+# (the host skills were still listed) and only added an error item to every run.
 FEATURE_FLAGS = {
     "features.apps": False,
     "features.plugins": False,
     "features.remote_plugin": False,
     "features.multi_agent": False,
-    "features.skip_host_skill_discovery": True,
+    "features.goals": False,
+}
+# The worker never sees the host's skills. Codex 0.164 discovers ``~/.agents/skills`` whatever
+# ``CODEX_HOME`` is, and no switch turns that discovery off, so the skills list is kept out of
+# the request entirely and the bundled system skills are never installed into the job home.
+SKILL_PINS = {
+    "skills.include_instructions": "false",
+    "skills.bundled.enabled": "false",
 }
 # Non-negotiable CLI flags of the worker invocation. The worker never loads the user's config
 # or rules, so these flags plus the ``-c`` pins are the entire policy: full-host access,
-# machine-readable events and no interactive approval can never be inherited by accident.
-REQUIRED_WORKER_FLAGS = ("--ignore-user-config", "--ignore-rules", "--json")
+# machine-readable events, no interactive approval and no persisted session can never be
+# inherited by accident.
+REQUIRED_WORKER_FLAGS = ("--ignore-user-config", "--ignore-rules", "--json", "--ephemeral")
+# The oldest Codex CLI the worker invocation was qualified on, and the ``codex exec`` flags it
+# relies on; ``codex_compat`` checks both before any job (or preflight) proceeds.
+MIN_CODEX_VERSION = (0, 164, 0)
+CODEX_REQUIRED_FLAGS = ("--ephemeral", "--output-schema", "--ignore-user-config",
+                        "--ignore-rules", "--json")
+CODEX_COMPAT_TIMEOUT_SECONDS = 30.0
+# Each job's Codex home is this directory inside its report directory; the generated model
+# catalog lives in it and ``-c model_catalog_json`` points at it.
+CODEX_HOME_NAME = "codex-home"
+CATALOG_PIN_KEY = "model_catalog_json"
 # Single-valued flags: a second, different value is drift, not a later value quietly winning.
 SANDBOX_FLAGS = ("-s", "--sandbox")
 MODEL_FLAGS = ("-m", "--model")
@@ -250,6 +278,14 @@ class PreflightError(LauncherError):
         super().__init__(message)
         self.code = code
         self.candidates: Tuple[str, ...] = tuple(candidates)
+
+
+class CodexIncompatible(PreflightError):
+    """The installed Codex CLI cannot run the worker invocation; ``compat`` is the evidence."""
+
+    def __init__(self, compat: Dict[str, Any]) -> None:
+        super().__init__("the installed Codex CLI cannot run the worker: %s" % compat["reason"])
+        self.compat = dict(compat)
 
 
 class BlockedError(LauncherError):
@@ -591,6 +627,98 @@ def run_preflight(settings_path: Path, requested_model: Optional[str],
     profile, context_window = discover_job_profile(settings_path, requested_model, context_cap,
                                                    fetch)
     return preflight_receipt(profile, context_window)
+
+
+VERSION_RE = re.compile(r"(?<![0-9.])([0-9]+)\.([0-9]+)\.([0-9]+)")
+
+
+def _output_text(value: Any) -> str:
+    """Process output as text, whether the runner returned bytes or a string."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return value if isinstance(value, str) else ""
+
+
+def _run_codex_info(codex_bin: str, args: Sequence[str], run: Callable[..., Any]
+                    ) -> Tuple[Optional[Any], Optional[str]]:
+    """One bounded informational Codex call: ``(completed process, None)`` or ``(None, why)``."""
+    argv = [str(codex_bin), *args]
+    try:
+        return run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                   stderr=subprocess.PIPE, timeout=CODEX_COMPAT_TIMEOUT_SECONDS,
+                   check=False), None
+    except (OSError, subprocess.SubprocessError) as error:
+        return None, "`%s` could not be run (%s)" % (" ".join(argv), error)
+
+
+def codex_compat(codex_bin: str, run: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
+    """Whether the installed Codex CLI can run the worker invocation, without starting a model.
+
+    Two informational calls: ``codex --version`` must report at least ``MIN_CODEX_VERSION``, and
+    ``codex exec --help`` must list every flag in ``CODEX_REQUIRED_FLAGS``. Returns
+    ``{"ok", "version", "missing_flags", "reason"}``; ``reason`` is ``None`` only when ok.
+    """
+    result: Dict[str, Any] = {"ok": False, "version": None, "missing_flags": [], "reason": None}
+    minimum = ".".join(str(part) for part in MIN_CODEX_VERSION)
+    problems: List[str] = []
+    version, failure = _run_codex_info(codex_bin, ["--version"], run)
+    if version is None:
+        result["reason"] = failure
+        return result
+    match = VERSION_RE.search(_output_text(version.stdout))
+    if version.returncode != 0 or match is None:
+        problems.append("`%s --version` did not report a version (exit %s); Codex CLI %s or "
+                        "newer is required" % (codex_bin, version.returncode, minimum))
+    else:
+        found = tuple(int(part) for part in match.groups())
+        result["version"] = ".".join(match.groups())
+        if found < MIN_CODEX_VERSION:
+            problems.append("Codex CLI %s is older than %s, the oldest version this launcher "
+                            "supports" % (result["version"], minimum))
+    help_run, failure = _run_codex_info(codex_bin, ["exec", "--help"], run)
+    if help_run is None:
+        problems.append(str(failure))
+    else:
+        text = _output_text(help_run.stdout) + "\n" + _output_text(help_run.stderr)
+        result["missing_flags"] = [
+            flag for flag in CODEX_REQUIRED_FLAGS
+            if not re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(flag), text)]
+        if result["missing_flags"]:
+            problems.append("`codex exec --help` does not list %s"
+                            % ", ".join(result["missing_flags"]))
+    result["ok"] = not problems
+    result["reason"] = "; ".join(problems) or None
+    return result
+
+
+def require_codex_compat(codex_bin: str, run: Callable[..., Any] = subprocess.run
+                         ) -> Dict[str, Any]:
+    """``codex_compat`` evidence, or a ``CodexIncompatible`` preflight refusal carrying it."""
+    compat = codex_compat(codex_bin, run=run)
+    if not compat["ok"]:
+        raise CodexIncompatible(compat)
+    return compat
+
+
+def job_codex_home(report_dir: Path) -> Path:
+    """The job's own Codex home, ``<report_dir>/codex-home``, created empty and private.
+
+    The worker and the tool probe run with ``CODEX_HOME`` set to it, so neither ever reads the
+    user's ``AGENTS.md``, memories, skills, sessions or ``auth.json``. A path that already
+    exists is refused unless it is an empty real directory: a link or leftover files would
+    hand the worker a home the launcher did not make.
+    """
+    home = Path(report_dir) / CODEX_HOME_NAME
+    try:
+        home.mkdir(mode=0o700)
+    except FileExistsError:
+        if home.is_symlink() or not home.is_dir() or any(home.iterdir()):
+            raise BlockedError(f"the job Codex home {home} already exists and is not an empty "
+                               "directory") from None
+    except OSError as error:
+        raise BlockedError(f"cannot create the job Codex home {home}: {error}") from error
+    home.chmod(0o700)
+    return home
 
 
 def model_label(name: str) -> str:
@@ -1166,11 +1294,17 @@ def run_bounded(argv: Sequence[str], *, cwd: Optional[Path], env: Dict[str, str]
 # --------------------------------------------------------------------------------------
 # Worker invocation
 # --------------------------------------------------------------------------------------
+def catalog_pin(catalog_path: Path) -> str:
+    """The ``model_catalog_json`` value for a catalog file: its path as a quoted TOML string."""
+    return json.dumps(str(catalog_path))
+
+
 def config_overrides(profile: omlx_discovery.ServerProfile, context_window: int,
                      catalog_path: Optional[Path] = None) -> List[str]:
     """Explicit local provider/model overrides for the job's discovered model; the user's
-    config is never loaded. ``catalog_path`` is reserved for the generated model catalog and
-    does not change the pins yet."""
+    config is never loaded. ``catalog_path`` is the job's generated model catalog: when given,
+    ``model_catalog_json`` points Codex at it, so the model runs on its own metadata instead of
+    Codex's fallback."""
     provider = f"model_providers.{PROVIDER_ID}"
     pins = policy_pins(profile, context_window)
     settings = [
@@ -1193,8 +1327,11 @@ def config_overrides(profile: omlx_discovery.ServerProfile, context_window: int,
         ("model_context_window", pins["model_context_window"]),
         ("model_auto_compact_token_limit", pins["model_auto_compact_token_limit"]),
     ]
+    if catalog_path is not None:
+        settings.append((CATALOG_PIN_KEY, catalog_pin(catalog_path)))
     for key, value in sorted(FEATURE_FLAGS.items()):
         settings.append((key, "true" if value else "false"))
+    settings.extend(sorted(SKILL_PINS.items()))
     settings.append(("shell_environment_policy.inherit", '"core"'))
     settings.append(shell_env_override())
     return [item for key, value in settings for item in ("-c", f"{key}={value}")]
@@ -1320,8 +1457,10 @@ def missing_config_pins(argv: Sequence[str], profile: omlx_discovery.ServerProfi
     duplicate override or a second model/sandbox flag all refuse the launch instead of letting
     the last occurrence quietly win. Every expected value comes from the job's own pinned
     ``profile`` and ``context_window``, so the argv must name exactly the model, endpoint and
-    window discovery found. ``catalog`` (the generated model catalog and its sha256) is
-    accepted for the catalog pin and is not checked yet.
+    window discovery found. ``catalog`` is the job's generated model catalog and the sha256
+    ``codex_catalog.write_catalog`` returned for it: the argv must point ``model_catalog_json``
+    at exactly that file, and the file is hashed again here, so a catalog changed after it was
+    written is drift too. Without ``catalog`` no ``model_catalog_json`` may appear at all.
     """
     alias = profile.model.api_model
     endpoint = profile_endpoint(profile)
@@ -1331,8 +1470,22 @@ def missing_config_pins(argv: Sequence[str], profile: omlx_discovery.ServerProfi
     pinned = expected_config_pins(profile, context_window)
     # The documented floor stays required on its own: deleting a pin from config_overrides()
     # must not silently delete the requirement for it.
-    for key, expected in {**CONFIG_PINS, **policy_pins(profile, context_window)}.items():
+    for key, expected in {**CONFIG_PINS, **SKILL_PINS,
+                          **policy_pins(profile, context_window)}.items():
         pinned.setdefault(key, expected)
+    if catalog is not None:
+        catalog_path, catalog_sha = catalog
+        pinned[CATALOG_PIN_KEY] = catalog_pin(catalog_path)
+        actual_sha = codex_catalog.file_sha256(catalog_path)
+        if actual_sha is None:
+            problems.append(f"{CATALOG_PIN_KEY} names {catalog_path}, which can no longer be "
+                            "read")
+        elif actual_sha != catalog_sha:
+            problems.append(f"{CATALOG_PIN_KEY} file {catalog_path} changed after it was "
+                            f"generated (sha256 {actual_sha}, generated {catalog_sha})")
+    elif CATALOG_PIN_KEY in overrides:
+        problems.append(f"{CATALOG_PIN_KEY}={overrides[CATALOG_PIN_KEY]} names a catalog this "
+                        "job did not generate")
     for key, expected in sorted(pinned.items()):
         actual = overrides.get(key)
         if actual is None:
@@ -1386,6 +1539,7 @@ def worker_argv(codex_bin: str, worktree: Path, profile: omlx_discovery.ServerPr
         "-C", str(worktree),
         "-s", "danger-full-access",
         "--json",
+        "--ephemeral",
         "-o", str(last_message),
         "-m", profile.model.api_model,
         *config_overrides(profile, context_window, catalog_path),
@@ -1396,13 +1550,16 @@ def worker_argv(codex_bin: str, worktree: Path, profile: omlx_discovery.ServerPr
     return argv
 
 
-def worker_env(api_key: str) -> Tuple[Dict[str, str], List[str], List[str]]:
-    """Minimal child environment: loopback key present, proxies and cloud credentials gone."""
+def worker_env(api_key: str, codex_home: Path
+               ) -> Tuple[Dict[str, str], List[str], List[str]]:
+    """Minimal child environment: loopback key present, proxies and cloud credentials gone, and
+    ``CODEX_HOME`` the job's own home, never the caller's."""
     cleaned, stripped = strip_proxy_env(dict(os.environ))
     cloud = cloud_credential_names(cleaned)
     env = {key: cleaned[key] for key in BASE_ENV_KEYS if key in cleaned}
     env.setdefault("TERM", "dumb")
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    env["CODEX_HOME"] = str(codex_home)
     env[API_KEY_ENV] = api_key
     return env, stripped, cloud
 
@@ -1982,6 +2139,9 @@ class JobOptions:
     workstream: str = "default"
     job_kind: str = "implementation"
     tool_config: Optional[Path] = None
+    # Runs the two informational Codex calls of the compatibility check (``subprocess.run``
+    # signature); tests replace it so no installed Codex is needed.
+    codex_run: Callable[..., Any] = subprocess.run
 
 
 def new_report(options: JobOptions) -> Dict[str, Any]:
@@ -2002,6 +2162,11 @@ def new_report(options: JobOptions) -> Dict[str, Any]:
         "attempt_timeout_cap_seconds": options.attempt_timeout_cap,
         "model_fallback": False,
         "provider": PROVIDER_ID,
+        # The installed Codex CLI's compatibility evidence, the job's own Codex home and the
+        # sha256 of the model catalog generated in it (pinned by the launch self-check).
+        "codex_compat": None,
+        "codex_home": None,
+        "catalog_sha256": None,
         "sandbox_mode": "danger-full-access",
         "repo_path": str(task.repo_path),
         "base_ref": task.base_ref,
@@ -2209,6 +2374,11 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     lease_update(lease, report_dir=str(report_dir))
     progress(report, "model_preflight")
     deadline.require("preflight")
+    # The installed Codex must run the qualified invocation before anything else is spent on
+    # the job, a model load included.
+    report["codex_compat"] = codex_compat(options.codex_bin, run=options.codex_run)
+    if not report["codex_compat"]["ok"]:
+        raise CodexIncompatible(report["codex_compat"])
     if options.load_model:
         if not options.requested_model:
             raise ContractError("--load requires --model")
@@ -2251,10 +2421,24 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     report["worktree_preserved"] = True
     lease_update(lease, worktree=str(worktree))
 
-    env, stripped_proxies, cloud_names = worker_env(api_key)
+    # The job's own Codex home and the model catalog generated for the pinned model. The hash
+    # write_catalog returns is what every launch self-check compares the file against.
+    codex_home = job_codex_home(report_dir)
+    report["codex_home"] = str(codex_home)
+    catalog_path = codex_home / codex_catalog.CATALOG_NAME
+    try:
+        catalog_sha = codex_catalog.write_catalog(
+            catalog_path, codex_catalog.build_local_entry(profile.model, context_window))
+    except (OSError, ValueError) as error:
+        raise BlockedError(f"cannot generate the model catalog {catalog_path}: {error}") from error
+    report["catalog_sha256"] = catalog_sha
+    catalog = (catalog_path, catalog_sha)
+
+    env, stripped_proxies, cloud_names = worker_env(api_key, codex_home)
     if options.apple_simulator_udid is not None:
-        # Native toolchain pin for the worker itself: ibtool/actool run in-process. HOME and
-        # CODEX_HOME stay exactly as the job had them, so the real simctl/Xcode state is used.
+        # Native toolchain pin for the worker itself: ibtool/actool run in-process. HOME stays
+        # exactly as the job had it, so the real simctl/Xcode state is used; CODEX_HOME is the
+        # job's own home like for every other job.
         env["IBToolNeverDeque"] = "1"
 
     # Task tools are opt-in. The loader only ever sees the credentials the manifest names, and
@@ -2278,7 +2462,7 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         "cloud_credential_vars_removed": cloud_names,
         "api_key_env": API_KEY_ENV,
         "shell_env_excludes": list(SHELL_ENV_EXCLUDES),
-        "codex_home": env.get("CODEX_HOME", "default (~/.codex), unchanged"),
+        "codex_home": env["CODEX_HOME"],
     }
     if options.apple_simulator_udid is not None:
         report["environment"]["native_env"] = {
@@ -2297,16 +2481,16 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         report["tooling"] = probe_tools(
             loaded, codex_bin=options.codex_bin,
             env={name: value for name, value in env.items() if name != API_KEY_ENV},
-            overrides=config_overrides(profile, context_window),
-            deadline=deadline, report_dir=report_dir)
+            overrides=config_overrides(profile, context_window, catalog_path),
+            deadline=deadline, codex_home=codex_home)
     except ToolProbeError as error:
         raise BlockedError(f"required MCP tools could not be probed: {error}") from error
     # Self-check the pinned policy before the first subprocess: drift is a refusal, not a
     # degraded run. The sandbox probe runs on the same total budget as everything else.
     _policy_check(worker_argv(options.codex_bin, worktree, profile, context_window,
                               report_dir / "policy-check.last-message.txt",
-                              loaded["overrides"], list(loaded["environment"])),
-                  profile, context_window)
+                              loaded["overrides"], list(loaded["environment"]), catalog_path),
+                  profile, context_window, catalog)
     sandbox = probe_sandbox(options.codex_bin, worktree, verify_env, secrets, deadline)
     if not options.verify:
         sandbox = dict(sandbox)
@@ -2392,8 +2576,8 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         last_path = report_dir / f"attempt-{attempt_number}.last-message.txt"
         prompt_path.write_text(redact(prompt, secrets), encoding="utf-8")
         argv = worker_argv(options.codex_bin, worktree, profile, context_window, last_path,
-                           loaded["overrides"], list(loaded["environment"]))
-        _policy_check(argv, profile, context_window)
+                           loaded["overrides"], list(loaded["environment"]), catalog_path)
+        _policy_check(argv, profile, context_window, catalog)
         before_worker = audit_worktree(worktree, base_commit, task.allowed_paths, secrets, scratch_dir=report_dir)
         patch_before = before_worker.patch
         # Snapshot every changed-from-base path *before* the worker runs, so whatever state a
@@ -2918,9 +3102,12 @@ def build_parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status", help="read progress and actual usage without starting a worker")
     status.add_argument("--state-dir")
     status.add_argument("--job-id")
-    check = sub.add_parser("preflight", help="discover the loaded model and its limits; does not "
-                                             "qualify native execution")
+    check = sub.add_parser("preflight", help="check the installed Codex CLI, then discover the "
+                                             "loaded model and its limits; does not qualify "
+                                             "native execution")
     check.add_argument("--settings", default=str(OMLX_SETTINGS))
+    check.add_argument("--codex-bin", help=f"Codex CLI path (default PATH or {CODEX_BIN_ENV}, "
+                                           f"legacy {LEGACY_CODEX_BIN_ENV})")
     add_selection_arguments(check)
     return parser
 
@@ -3012,6 +3199,8 @@ def refusal_payload(error: LauncherError) -> Dict[str, Any]:
     """What the CLI prints for a refused invocation; a discovery refusal also carries its code
     and the model names the caller could choose instead."""
     payload: Dict[str, Any] = {"status": error.status, "failure_reason": str(error)}
+    if isinstance(error, CodexIncompatible):
+        payload["codex_compat"] = error.compat
     if isinstance(error, PreflightError) and error.code:
         payload["discovery_error"] = {"code": error.code, "message": str(error),
                                       "candidates": list(error.candidates)}
@@ -3019,7 +3208,8 @@ def refusal_payload(error: LauncherError) -> Dict[str, Any]:
 
 
 def main(argv: Optional[Sequence[str]] = None, *,
-         omlx_fetch: omlx_discovery.HttpFetch = omlx_discovery.http_fetch) -> int:
+         omlx_fetch: omlx_discovery.HttpFetch = omlx_discovery.http_fetch,
+         codex_run: Callable[..., Any] = subprocess.run) -> int:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:
@@ -3038,8 +3228,10 @@ def main(argv: Optional[Sequence[str]] = None, *,
             return 0
         requested_model, context_cap = selection_from_args(args)
         if args.command == "preflight":
+            compat = require_codex_compat(resolve_codex_bin(args.codex_bin), run=codex_run)
             evidence = run_preflight(Path(os.path.expanduser(args.settings)), requested_model,
                                      context_cap, omlx_fetch)
+            evidence["codex_compat"] = compat
             print(json.dumps(evidence, indent=2))
             return 0
 
@@ -3071,6 +3263,7 @@ def main(argv: Optional[Sequence[str]] = None, *,
             workstream=args.workstream,
             job_kind=args.job_kind,
             tool_config=args.tool_config,
+            codex_run=codex_run,
         )
         report = run_job(options)
     except LauncherError as error:

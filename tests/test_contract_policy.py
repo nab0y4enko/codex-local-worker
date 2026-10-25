@@ -78,9 +78,10 @@ class EnvironmentAndArgv(unittest.TestCase):
                     "no_proxy": "x", "OPENAI_API_KEY": "sk-cloud",
                     "AWS_SECRET_ACCESS_KEY": "aws", "GITHUB_TOKEN": "gh", "SOME_LOCAL_TOOL": "keep"}
         with mock.patch.dict(os.environ, injected, clear=True):
-            env, proxies, cloud = lw.worker_env(sp.SECRET)
+            env, proxies, cloud = lw.worker_env(sp.SECRET, Path("/r/codex-home"))
         self.assertEqual(env[lw.API_KEY_ENV], sp.SECRET)
         self.assertEqual(env["PATH"], "/usr/bin")
+        self.assertEqual(env["CODEX_HOME"], "/r/codex-home")
         self.assertEqual(sorted(proxies), ["HTTP_PROXY", "no_proxy"])
         self.assertEqual(cloud, ["AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "OPENAI_API_KEY"])
         for name in list(proxies) + cloud + ["SOME_LOCAL_TOOL"]:

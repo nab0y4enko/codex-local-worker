@@ -1,0 +1,298 @@
+"""The worker runs in its own Codex home, on a generated model catalog, in an ephemeral session.
+
+Nothing here talks to a server, a model or the installed Codex: discovery is ``sp.FakeOmlx``,
+the worker is ``sp.FakeRun`` and the compatibility check is ``sp.fake_help``. Every git call is a
+real disposable repository.
+"""
+import contextlib
+import hashlib
+import io
+import json
+import os
+import sys
+import unittest
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import support as sp  # noqa: E402
+import codex_catalog  # noqa: E402
+
+lw = sp.lw
+
+
+def failing_tests_run(**kwargs):
+    """A worker that edits nothing useful, so verification fails and a second attempt runs."""
+    return sp.FakeRun(test_rc=1, **kwargs)
+
+
+class IsolationCase(unittest.TestCase):
+    def setUp(self):
+        self.root = sp.tmpdir()
+        self.addCleanup(sp.cleanup, self.root)
+        self.repo = sp.make_repo(self.root)
+        self.profile = sp.discovered_profile()
+
+    def run_clean_job(self, **kwargs):
+        return sp.run_clean_job(self.root, self.repo, **kwargs)
+
+    def argv_with_catalog(self):
+        """A worker argv on a catalog generated for ``self.profile`` at a 32768 window."""
+        report_dir = self.root / "report"
+        report_dir.mkdir()
+        self.catalog = lw.job_codex_home(report_dir) / codex_catalog.CATALOG_NAME
+        self.catalog_sha = codex_catalog.write_catalog(
+            self.catalog, codex_catalog.build_local_entry(self.profile.model, 32768))
+        return lw.worker_argv("codex", Path("/wt"), self.profile, 32768, Path("/r/l.txt"),
+                              catalog_path=self.catalog)
+
+
+class JobHome(IsolationCase):
+    def test_worker_never_sees_the_users_codex_home(self):
+        user_home = sp.tmpdir()
+        self.addCleanup(sp.cleanup, user_home)
+        (user_home / "AGENTS.md").write_text("route to launcher\n")
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(user_home)}):
+            report, run = self.run_clean_job()
+        self.assertEqual(report["status"], "ok", report.get("failure_reason"))
+        worker = run.calls_of("exec")[0]
+        self.assertNotEqual(worker["env"]["CODEX_HOME"], str(user_home))
+        self.assertTrue(worker["env"]["CODEX_HOME"].startswith(report["report_dir"]))
+        self.assertIn("--ephemeral", worker["argv"])
+        self.assertEqual(lw.config_overrides_map(worker["argv"])["model_catalog_json"],
+                         json.dumps(str(Path(report["report_dir"]) / "codex-home"
+                                        / "local-model-catalog.json")))
+
+    def test_the_job_home_is_created_empty_inside_the_report_directory(self):
+        report_dir = self.root / "report"
+        report_dir.mkdir()
+        home = lw.job_codex_home(report_dir)
+        self.assertEqual(home, report_dir / "codex-home")
+        self.assertTrue(home.is_dir())
+        self.assertEqual(list(home.iterdir()), [])
+        self.assertEqual(home.stat().st_mode & 0o777, 0o700)
+
+    def test_a_home_that_already_holds_files_is_refused(self):
+        report_dir = self.root / "report"
+        (report_dir / "codex-home").mkdir(parents=True)
+        (report_dir / "codex-home" / "auth.json").write_text("{}")
+        with self.assertRaises(lw.BlockedError):
+            lw.job_codex_home(report_dir)
+        other = self.root / "other-report"
+        other.mkdir()
+        os.symlink(str(self.root), str(other / "codex-home"))
+        with self.assertRaises(lw.BlockedError):
+            lw.job_codex_home(other)
+
+    def test_the_report_names_the_home_and_the_hash_of_the_catalog_it_launched_with(self):
+        report, run = self.run_clean_job()
+        home = Path(report["report_dir"]) / "codex-home"
+        catalog = home / "local-model-catalog.json"
+        self.assertEqual(report["codex_home"], str(home))
+        self.assertEqual(report["environment"]["codex_home"], str(home))
+        self.assertEqual(report["catalog_sha256"], hashlib.sha256(catalog.read_bytes()).hexdigest())
+        entry = json.loads(catalog.read_text(encoding="utf-8"))["models"][0]
+        self.assertEqual(entry["slug"], report["api_model"])
+        self.assertEqual(entry["context_window"], report["context_window"])
+
+    def test_every_attempt_runs_in_the_same_home_on_the_same_catalog(self):
+        report, run = self.run_clean_job(fake_run=failing_tests_run(worker_edit=sp.fix_add),
+                                         max_attempts=2)
+        workers = run.calls_of("exec")
+        self.assertEqual(len(workers), 2)
+        homes = {worker["env"]["CODEX_HOME"] for worker in workers}
+        catalogs = {lw.config_overrides_map(worker["argv"])["model_catalog_json"]
+                    for worker in workers}
+        self.assertEqual(homes, {report["codex_home"]})
+        self.assertEqual(len(catalogs), 1)
+
+    def test_verification_commands_never_get_the_users_codex_home_either(self):
+        user_home = sp.tmpdir()
+        self.addCleanup(sp.cleanup, user_home)
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(user_home)}):
+            report, run = self.run_clean_job()
+        others = [call for call in run.calls if call["argv"][1:2] != ["exec"]]
+        self.assertTrue(others)
+        for call in others:
+            self.assertNotEqual(call["env"].get("CODEX_HOME"), str(user_home))
+
+    def test_the_tool_probe_uses_the_job_home(self):
+        seen = {}
+
+        def probe(loaded, **kwargs):
+            seen.update(kwargs)
+            return loaded["evidence"]
+
+        with mock.patch.object(lw, "probe_tools", probe):
+            report, _ = self.run_clean_job()
+        self.assertEqual(seen["codex_home"], Path(report["codex_home"]))
+        overrides = lw.config_overrides_map(seen["overrides"])
+        self.assertEqual(overrides["model_catalog_json"],
+                         json.dumps(str(Path(report["codex_home"]) / codex_catalog.CATALOG_NAME)))
+        self.assertNotIn("report_dir", seen)
+
+    def test_a_catalog_changed_after_it_was_written_blocks_before_any_worker(self):
+        real = codex_catalog.write_catalog
+
+        def write_then_drift(path, entry):
+            digest = real(path, entry)
+            Path(path).write_text("{}", encoding="utf-8")
+            return digest
+
+        with mock.patch.object(lw.codex_catalog, "write_catalog", write_then_drift):
+            report, run = self.run_clean_job()
+        self.assertEqual(report["status"], "blocked")
+        self.assertIn("model_catalog_json", report["failure_reason"])
+        self.assertEqual(run.calls_of("exec"), [])
+
+
+class SelfCheck(IsolationCase):
+    def test_catalog_drift_is_refused(self):
+        argv = self.argv_with_catalog()
+        Path(self.catalog).write_text("{}")
+        self.assertTrue(lw.missing_config_pins(argv, self.profile, 32768,
+                                               (self.catalog, self.catalog_sha)))
+
+    def test_the_generated_catalog_passes_the_self_check(self):
+        argv = self.argv_with_catalog()
+        self.assertEqual(lw.missing_config_pins(argv, self.profile, 32768,
+                                                (self.catalog, self.catalog_sha)), [])
+        lw._policy_check(argv, self.profile, 32768, (self.catalog, self.catalog_sha))
+
+    def test_a_generated_catalog_must_be_pinned_by_its_path(self):
+        argv = self.argv_with_catalog()
+        unpinned = lw.worker_argv("codex", Path("/wt"), self.profile, 32768, Path("/r/l.txt"))
+        other = [item.replace(str(self.catalog), "/elsewhere/catalog.json") for item in argv]
+        for label, drifted in (("no catalog pin", unpinned), ("another path", other)):
+            with self.subTest(label=label):
+                problems = " ".join(lw.missing_config_pins(drifted, self.profile, 32768,
+                                                           (self.catalog, self.catalog_sha)))
+                self.assertIn("model_catalog_json", problems)
+
+    def test_a_catalog_the_launcher_did_not_generate_is_refused(self):
+        argv = self.argv_with_catalog()
+        problems = " ".join(lw.missing_config_pins(argv, self.profile, 32768))
+        self.assertIn("model_catalog_json", problems)
+
+    def test_a_deleted_or_rewritten_catalog_is_refused(self):
+        argv = self.argv_with_catalog()
+        wrong_hash = (self.catalog, "0" * 64)
+        self.assertTrue(lw.missing_config_pins(argv, self.profile, 32768, wrong_hash))
+        self.catalog.unlink()
+        problems = " ".join(lw.missing_config_pins(argv, self.profile, 32768,
+                                                   (self.catalog, self.catalog_sha)))
+        self.assertIn("model_catalog_json", problems)
+
+    def test_every_session_is_ephemeral(self):
+        argv = self.argv_with_catalog()
+        self.assertIn("--ephemeral", argv)
+        self.assertIn("--ephemeral", lw.REQUIRED_WORKER_FLAGS)
+        drifted = [item for item in argv if item != "--ephemeral"]
+        problems = lw.missing_config_pins(drifted, self.profile, 32768,
+                                          (self.catalog, self.catalog_sha))
+        self.assertIn("--ephemeral is missing", problems)
+
+    def test_host_skills_and_goal_tools_are_switched_off_and_pinned(self):
+        argv = self.argv_with_catalog()
+        overrides = lw.config_overrides_map(argv)
+        expected = {"skills.include_instructions": "false", "skills.bundled.enabled": "false",
+                    "features.goals": "false"}
+        for key, value in expected.items():
+            with self.subTest(key=key):
+                self.assertEqual(overrides[key], value)
+                drifted = [item for item in argv if not item.startswith(key + "=")]
+                self.assertTrue(lw.missing_config_pins(drifted, self.profile, 32768,
+                                                       (self.catalog, self.catalog_sha)))
+        # The under-development flag isolated nothing and only added an error item to every run.
+        self.assertNotIn("features.skip_host_skill_discovery", overrides)
+        self.assertNotIn("features.skip_host_skill_discovery", lw.FEATURE_FLAGS)
+
+
+class Compatibility(IsolationCase):
+    def test_codex_compatibility_is_checked_at_preflight(self):
+        compat = lw.codex_compat("codex", run=sp.fake_help(version="codex-cli 0.163.0"))
+        self.assertFalse(compat["ok"]); self.assertIn("0.164.0", compat["reason"])
+        self.assertTrue(lw.codex_compat("codex", run=sp.fake_help(version="codex-cli 0.164.0"))["ok"])
+
+    def test_the_minimum_version_and_the_required_flags(self):
+        self.assertEqual(lw.MIN_CODEX_VERSION, (0, 164, 0))
+        self.assertEqual(sorted(lw.CODEX_REQUIRED_FLAGS),
+                         sorted(["--ephemeral", "--output-schema", "--ignore-user-config",
+                                 "--ignore-rules", "--json"]))
+
+    def test_a_compatible_codex_reports_its_version_and_both_calls(self):
+        run = sp.fake_help()
+        compat = lw.codex_compat("/opt/codex", run=run)
+        self.assertEqual(compat, {"ok": True, "version": "0.164.0", "missing_flags": [],
+                                  "reason": None})
+        self.assertEqual(run.calls, [["/opt/codex", "--version"],
+                                     ["/opt/codex", "exec", "--help"]])
+
+    def test_newer_and_prerelease_versions_pass(self):
+        for version in ("codex-cli 0.164.1", "codex-cli 0.170.0", "codex-cli 1.0.0",
+                        "codex-cli 0.165.0-alpha.3"):
+            with self.subTest(version=version):
+                self.assertTrue(lw.codex_compat("codex", run=sp.fake_help(version))["ok"])
+
+    def test_every_required_flag_must_be_listed(self):
+        for flag in lw.CODEX_REQUIRED_FLAGS:
+            with self.subTest(flag=flag):
+                compat = lw.codex_compat("codex", run=sp.fake_help(missing=[flag]))
+                self.assertFalse(compat["ok"])
+                self.assertEqual(compat["missing_flags"], [flag])
+                self.assertIn(flag, compat["reason"])
+
+    def test_an_unreadable_version_or_a_missing_binary_is_not_compatible(self):
+        compat = lw.codex_compat("codex", run=sp.fake_help(version="codex-cli dev"))
+        self.assertFalse(compat["ok"])
+        self.assertIsNone(compat["version"])
+
+        def absent(argv, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", argv[0])
+
+        compat = lw.codex_compat("/nowhere/codex", run=absent)
+        self.assertFalse(compat["ok"])
+        self.assertIn("/nowhere/codex", compat["reason"])
+
+    def test_run_refuses_an_incompatible_codex_before_discovery_or_any_worker(self):
+        omlx = sp.FakeOmlx("one")
+        options = sp.job_options(self.root, self.repo, omlx=omlx)
+        options.codex_run = sp.fake_help(version="codex-cli 0.163.0")
+        fake = sp.FakeRun(worker_edit=sp.fix_add)
+        with mock.patch.object(lw, "run_bounded", fake):
+            report = lw.run_job(options)
+        self.assertEqual(report["status"], "preflight_failed")
+        self.assertEqual(report["exit_code"], lw.EXIT_CODES["preflight_failed"])
+        self.assertIn("0.164.0", report["failure_reason"])
+        self.assertIs(report["codex_compat"]["ok"], False)
+        self.assertEqual(omlx.calls, [])
+        self.assertEqual(fake.calls_of("exec"), [])
+        self.assertIsNone(report["worktree"])
+
+    def test_preflight_refuses_an_incompatible_codex(self):
+        settings = sp.write_settings(self.root / "omlx" / "settings.json")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = lw.main(["preflight", "--settings", str(settings), "--codex-bin", "codex-mock"],
+                           omlx_fetch=sp.FakeOmlx("one"),
+                           codex_run=sp.fake_help(missing=["--ephemeral"]))
+        payload = json.loads(out.getvalue())
+        self.assertEqual(code, lw.EXIT_CODES["preflight_failed"])
+        self.assertEqual(payload["status"], "preflight_failed")
+        self.assertEqual(payload["codex_compat"]["missing_flags"], ["--ephemeral"])
+        self.assertNotIn("discovery_error", payload)
+
+    def test_preflight_reports_a_compatible_codex(self):
+        settings = sp.write_settings(self.root / "omlx" / "settings.json")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = lw.main(["preflight", "--settings", str(settings), "--codex-bin", "codex-mock"],
+                           omlx_fetch=sp.FakeOmlx("one"), codex_run=sp.fake_help())
+        receipt = json.loads(out.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(receipt["codex_compat"]["version"], "0.164.0")
+        self.assertEqual(receipt["profile"]["model"]["api_model"], sp.MODEL)
+
+
+if __name__ == "__main__":
+    unittest.main()

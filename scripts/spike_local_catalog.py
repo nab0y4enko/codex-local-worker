@@ -16,14 +16,16 @@ Reproduces the evidence recorded in docs/qualification/2026-10-24-catalog-spike.
             run shows how Codex handles it: applied, refused, or what it answers the model.
     pilot   Real local inference. For each chosen variant, lay down a fresh pilot repository
             (scripts/prepare_pilot.py) and run the real launcher on it
-            (``bin/local-worker run --json``) with ``--codex-bin`` pointing at a tiny wrapper
-            that adds the variant's ``-c model_catalog_json=...`` to the worker argv (the
-            launcher does not pass a catalog yet). ``--record`` also routes the worker through a
-            loopback recording proxy in front of oMLX, so the record shows what the model saw
-            and which calls it made.
+            (``bin/local-worker run --json``). The ``template`` variant runs on the catalog the
+            launcher itself generates from the template; any other variant runs with
+            ``--codex-bin`` pointing at a tiny wrapper that swaps the launcher's
+            ``-c model_catalog_json=...`` for the variant's (``none`` removes it), so the worker
+            never gets two catalogs. ``--record`` also routes the worker through a loopback
+            recording proxy in front of oMLX, so the record shows what the model saw and which
+            calls it made.
 
-Every Codex process gets a fresh throwaway ``CODEX_HOME`` under ``--out``; the user's
-``~/.codex`` is never read. Inference only ever goes to the loopback oMLX server that discovery
+Every Codex process gets a fresh throwaway ``CODEX_HOME`` under ``--out`` (in ``pilot``, the
+launcher's own job home); the user's ``~/.codex`` is never read. Inference only ever goes to the loopback oMLX server that discovery
 finds; no cloud model is called. In ``pilot`` the launcher reads the oMLX key itself; the
 recording proxy forwards the request headers unchanged and never records ``Authorization``.
 Nothing here prints the key, and the stub runs use a dummy key.
@@ -510,9 +512,29 @@ def resolve_codex() -> str:
     return lw.resolve_codex_bin(None)
 
 
+def without_catalog(argv: List[str]) -> List[str]:
+    """*argv* with every ``-c model_catalog_json=...`` pair removed."""
+    kept: List[str] = []
+    index = 0
+    while index < len(argv):
+        if argv[index] == "-c" and index + 1 < len(argv) \
+                and argv[index + 1].startswith("model_catalog_json="):
+            index += 2
+            continue
+        kept.append(argv[index])
+        index += 1
+    return kept
+
+
 def with_catalog(argv: List[str], catalog: Optional[Path],
                  extra: Optional[List[str]] = None) -> List[str]:
-    """Insert ``-c model_catalog_json=...`` (and *extra*) before the trailing ``-- -``."""
+    """Insert ``-c model_catalog_json=...`` (and *extra*) before the trailing ``-- -``.
+
+    A catalog the argv already names (``worker_argv(..., catalog_path=...)``) is replaced, never
+    duplicated; ``catalog=None`` leaves the argv's own catalog, if any, in place.
+    """
+    if catalog is not None:
+        argv = without_catalog(argv)
     added: List[str] = []
     if catalog is not None:
         added += ["-c", f"model_catalog_json={json.dumps(str(catalog))}"]
@@ -557,8 +579,7 @@ def capture_fallback_instructions(codex: str, profile: omlx_discovery.ServerProf
         stub_profile = dataclasses.replace(profile, base_url=stub.base_url)
         argv = lw.worker_argv(codex, repo, stub_profile, profile.model.context_window,
                               home / "last.txt")
-        env, _, _ = lw.worker_env(DUMMY_KEY)
-        env["CODEX_HOME"] = str(home)
+        env, _, _ = lw.worker_env(DUMMY_KEY, home)
         run_codex(argv, repo, env, STUB_PROMPT)
         requests = stub.model_requests()
     if not requests:
@@ -619,8 +640,7 @@ def prompt_input(codex: str, profile: omlx_discovery.ServerProfile,
     if catalog is not None:
         argv += ["-c", f"model_catalog_json={json.dumps(str(catalog))}"]
     argv += EXTRA_CONFIG + [STUB_PROMPT]
-    env, _, _ = lw.worker_env(DUMMY_KEY)
-    env["CODEX_HOME"] = str(home)
+    env, _, _ = lw.worker_env(DUMMY_KEY, home)
     return subprocess.run(argv, cwd=str(repo), env=env, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, text=True, timeout=CODEX_TIMEOUT_SECONDS)
 
@@ -709,8 +729,7 @@ def render_variant(name: str, codex: str, profile: omlx_discovery.ServerProfile,
         argv = with_catalog(lw.worker_argv(codex, repo, stub_profile,
                                            profile.model.context_window, home / "last.txt"),
                             catalog)
-        env, _, _ = lw.worker_env(DUMMY_KEY)
-        env["CODEX_HOME"] = str(home)
+        env, _, _ = lw.worker_env(DUMMY_KEY, home)
         code, stdout, stderr = run_codex(argv, repo, env, STUB_PROMPT)
         requests = stub.model_requests()
     (work / "exec.jsonl").write_text(stdout, encoding="utf-8")
@@ -871,8 +890,7 @@ def probe_call(variant: str, probe: str, codex: str, profile: omlx_discovery.Ser
         argv = with_catalog(lw.worker_argv(codex, repo, stub_profile,
                                            profile.model.context_window, home / "last.txt"),
                             catalog)
-        env, _, _ = lw.worker_env(DUMMY_KEY)
-        env["CODEX_HOME"] = str(home)
+        env, _, _ = lw.worker_env(DUMMY_KEY, home)
         code, stdout, stderr = run_codex(argv, repo, env, STUB_PROMPT)
         requests = stub.model_requests()
     (work / "exec.jsonl").write_text(stdout, encoding="utf-8")
@@ -919,15 +937,32 @@ def cmd_calls(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------------------
 WRAPPER = '''#!{python}
 # Spike wrapper: adds the variant's overrides to a `codex exec` argv, then runs the real Codex.
+# With SWAP_CATALOG the launcher's own `-c model_catalog_json=...` is dropped first, so the
+# worker runs on the variant's catalog (or, with none in EXTRA, on Codex fallback metadata).
 import os, sys
 REAL = {real!r}
 EXTRA = {extra!r}
+SWAP_CATALOG = {swap!r}
 argv = sys.argv[1:]
+if argv[:1] == ["exec"] and SWAP_CATALOG:
+    kept, index = [], 0
+    while index < len(argv):
+        if argv[index] == "-c" and index + 1 < len(argv) \\
+                and argv[index + 1].startswith("model_catalog_json="):
+            index += 2
+            continue
+        kept.append(argv[index])
+        index += 1
+    argv = kept
 if argv[:1] == ["exec"] and EXTRA:
     cut = len(argv) - 2 if argv[-2:] == ["--", "-"] else len(argv)
     argv = argv[:cut] + EXTRA + argv[cut:]
 os.execv(REAL, [REAL] + argv)
 '''
+
+# The variant whose catalog the launcher itself generates (from the same template), so its
+# pilot runs the launcher's own catalog instead of a swapped-in copy.
+LAUNCHER_VARIANT = "template"
 
 
 def pilot_variant(name: str, run: int, codex: str, facts: Facts, out: Path, timeout: int,
@@ -935,7 +970,8 @@ def pilot_variant(name: str, run: int, codex: str, facts: Facts, out: Path, time
     _, build = VARIANTS[name]
     root = prepare_pilot(out / f"{name}-{run}", timeout)
     home = fresh_dir(root / "codex-home")
-    entry = build(facts) if build else None
+    swap = name != LAUNCHER_VARIANT
+    entry = build(facts) if build and swap else None
     catalog = write_catalog(entry, home)
     recorder = Recorder(upstream) if record else None
     extra: List[str] = []
@@ -945,8 +981,8 @@ def pilot_variant(name: str, run: int, codex: str, facts: Facts, out: Path, time
         extra += ["-c", f'model_providers.{lw.PROVIDER_ID}.base_url="{recorder.base_url}/v1"']
     extra += EXTRA_CONFIG
     wrapper = root / "codex-wrapper.py"
-    wrapper.write_text(WRAPPER.format(python=sys.executable, real=codex, extra=extra),
-                       encoding="utf-8")
+    wrapper.write_text(WRAPPER.format(python=sys.executable, real=codex, extra=extra,
+                                      swap=swap), encoding="utf-8")
     wrapper.chmod(0o755)
     argv = [str(REPO / "bin" / "local-worker"), "run", "--task-file", str(root / "task.json"),
             "--state-dir", str(root / "state"), "--json", "--codex-bin", str(wrapper)]
@@ -961,7 +997,9 @@ def pilot_variant(name: str, run: int, codex: str, facts: Facts, out: Path, time
         if recorder is not None:
             recorder.__exit__(None, None, None)
     wall = round(time.monotonic() - started, 1)
-    result: Dict[str, Any] = {"variant": name, "run": run, "catalog": entry is not None,
+    result: Dict[str, Any] = {"variant": name, "run": run,
+                              "catalog": "variant" if entry is not None
+                              else ("none" if swap else "launcher"),
                               "launcher_exit": proc.returncode, "wall_seconds": wall}
     reports = sorted((root / "state" / "reports").glob("*/report.json"))
     if not reports:
@@ -981,6 +1019,7 @@ def pilot_variant(name: str, run: int, codex: str, facts: Facts, out: Path, time
                   for k in ("input_tokens", "cached_input_tokens", "output_tokens")},
         "stream": stream_summary(jsonl, stderr),
         "patch_excerpt": report.get("patch_excerpt"),
+        "catalog_sha256": report.get("catalog_sha256"),
     })
     if recorder is not None:
         requests = recorder.model_requests()

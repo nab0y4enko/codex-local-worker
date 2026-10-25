@@ -100,6 +100,7 @@ class FakeAppServer(unittest.TestCase):
         self.addCleanup(sp.cleanup, self.root)
         self.report = self.root / "report"
         self.report.mkdir()
+        self.home = lw.job_codex_home(self.report)
         self.environ = dict(os.environ)
 
     def tearDown(self):
@@ -125,7 +126,7 @@ class FakeAppServer(unittest.TestCase):
         result = probe.probe_tools(loaded, codex_bin=str(script), env=env,
                                    overrides=lw.config_overrides(sp.discovered_profile(),
                                                                  sp.MODEL_WINDOW),
-                                   deadline=lw.Deadline(seconds), report_dir=self.report)
+                                   deadline=lw.Deadline(seconds), codex_home=self.home)
         return loaded, result
 
     def log_data(self):
@@ -168,9 +169,10 @@ class FakeAppServer(unittest.TestCase):
         self.assertIn("features.plugins=false", joined)               # stay off for the probe
         self.assertFalse(record["model_key"])                  # metadata needs no model auth
         self.assertTrue(record["tool_token"])                  # the server credential is inherited
-        self.assertEqual(Path(record["cwd"]), Path(record["codex_home"]).resolve())
-        self.assertTrue(str(record["codex_home"]).startswith(str(self.report) + os.sep))
-        self.assertEqual([item.name for item in self.report.iterdir()], [])  # scratch is removed
+        # The probe runs in the job's own Codex home, never the caller's (``self.root`` above).
+        self.assertEqual(record["codex_home"], str(self.home))
+        self.assertEqual(Path(record["cwd"]), self.home.resolve())
+        self.assertEqual([item.name for item in self.report.iterdir()], ["codex-home"])
 
     def test_missing_configured_tool_is_refused_naming_the_server(self):
         with self.assertRaises(probe.ToolProbeError) as caught:
@@ -221,7 +223,14 @@ class FakeAppServer(unittest.TestCase):
         loaded = {"overrides": [], "evidence": {"schema_version": 1, "servers": {}}}
         self.assertEqual(probe.probe_tools(loaded, codex_bin="/nonexistent/codex", env={},
                                            overrides=[], deadline=lw.Deadline(30),
-                                           report_dir=self.report), loaded["evidence"])
+                                           codex_home=self.home), loaded["evidence"])
+
+    def test_a_missing_job_home_is_refused_before_anything_starts(self):
+        with self.assertRaises(probe.ToolProbeError) as caught:
+            probe.probe_tools(self.loaded(), codex_bin="/nonexistent/codex", env={},
+                              overrides=[], deadline=lw.Deadline(30),
+                              codex_home=self.report / "absent")
+        self.assertIn("Codex home", str(caught.exception))
 
 
 class McpEchoFixture(unittest.TestCase):

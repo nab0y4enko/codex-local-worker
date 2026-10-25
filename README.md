@@ -254,7 +254,7 @@ The versioned plan format and required evidence are in
 | --- | --- |
 | `--task-file` | JSON task contract (required for `run`) |
 | `--state-dir` | reports/logs/worktrees root; default `$LOCAL_WORKER_STATE_DIR` or `~/.local-implement` |
-| `--codex-bin` | Codex CLI path; default `$PATH` or `$LOCAL_WORKER_CODEX_BIN` |
+| `--codex-bin` | Codex CLI path (`run`, `preflight`); default `$PATH` or `$LOCAL_WORKER_CODEX_BIN` |
 | `--lock-timeout` | seconds to wait for the worker lock (default 30); waits count against the job budget |
 | `--max-workers` | ceiling for the **shared** state directory: `1` (default) keeps the exclusive `worker.lock`; `2`-`4` also takes one exclusive slot lease. Integer 1-4 only, validated before any worktree is created; the launcher never spawns a worker by itself |
 | `--no-verify` | skip verification commands; they are simply **not run**, so they cannot satisfy acceptance |
@@ -292,6 +292,20 @@ bin/local-worker preflight                       # which model would run, and it
 bin/local-worker run --task-file task.json --model Qwen3.5-9B-OptiQ-4bit --context-cap 32768
 bin/local-worker run --task-file task.json --model Qwen3.5-9B-OptiQ-4bit --load
 ```
+
+### Codex home, model catalog and compatibility
+
+Each job runs Codex in its own empty `CODEX_HOME`, `<report_dir>/codex-home`, with `--ephemeral`,
+so the worker never sees your `~/.codex` (`AGENTS.md`, memories, sessions, `auth.json`) and no
+session is kept. The launcher writes `local-model-catalog.json` there, generated from
+`src/codex_local_model_template.json` for the discovered model, and passes
+`-c model_catalog_json=…`; the argv self-check re-hashes that file before every launch. The
+skills list and goal tools are switched off (`skills.include_instructions=false`,
+`skills.bundled.enabled=false`, `features.goals=false`). The report records `codex_home`,
+`catalog_sha256` and `codex_compat`. Before anything else, `run` and `preflight` check that
+`codex --version` is at least 0.164.0 and that `codex exec --help` lists `--ephemeral`,
+`--output-schema`, `--ignore-user-config`, `--ignore-rules` and `--json`; if not, they refuse
+with `preflight_failed`.
 
 Exit codes: `0 ok`, `1 contract_invalid`, `2 preflight_failed`, `3 blocked`,
 `4 worker_failed`, `5 audit_violation`, `6 tests_failed`, `7 verification_blocked`,

@@ -206,10 +206,14 @@ The current CLI/env overrides (`--canonical-model`, `--api-model`, `--context-wi
   The worker never sees the user's `AGENTS.md`, memories, skills, sessions, or `auth.json`.
   `--ephemeral` is passed.
 - **Generated model catalog.** The launcher writes `<codex-home>/local-model-catalog.json` with
-  one entry for the discovered model (context window, image input, patch tool, shell type,
-  reasoning) and passes `-c model_catalog_json=…`. The exact field values that make the patch
-  tool available and keep the tool set suitable for a local model are settled by a spike before
-  implementation (plan task 1); the self-check pins the generated file's hash.
+  one entry for the discovered model (context window, image input, shell type, reasoning, base
+  instructions) and passes `-c model_catalog_json=…`. The entry registers no patch tool: oMLX
+  passes only `function` tools to the model and drops Codex's freeform `apply_patch`, so edits
+  are applied by Codex intercepting the `apply_patch <<'EOF'` heredoc the model runs through the
+  shell tool, which the entry's base instructions direct it to use. The exact field values that
+  make edits work and keep the tool set suitable for a local model were settled by the catalog
+  spike (`docs/qualification/2026-10-24-catalog-spike.md`); the self-check pins the generated
+  file's hash.
 - **Compaction.** `model_auto_compact_token_limit` is pinned to a fraction of the discovered
   window (builder chooses the fraction; ~80 %), so Codex compacts before the server rejects.
 - **Permissions (decided: full host access by default).** Write jobs run Codex with
@@ -506,8 +510,10 @@ which is what makes background terminals lose access to folders the user approve
 - Unit tests (offline, as today) for every module, with **recorded oMLX fixtures** captured from
   the real server: `/health`, `/api/status`, `/v1/models/status` (one model, several, none,
   loading, helper present), streamed `/v1/responses`, and a real `codex exec --json` stream.
-- Contract tests for Codex: generated catalog accepted (`codex debug prompt-input` shows the
-  expected tools), argv flags exist in the installed version.
+- Contract tests for Codex: generated catalog accepted, and the tools and base instructions Codex
+  really sends checked by pointing the worker at a loopback recording stub that captures the
+  request (the catalog spike's `render`/`calls` method; `codex debug prompt-input` renders the
+  input list only and never shows tools); argv flags exist in the installed version.
 - Live qualification suite (`tests/live/`, opt-in, run on both Macs): discovery, read pilot with
   citations, write pilot, forced environment failure (context cap too small) and its
   classification, forced capability failure and a cloud escalation dry run (catalog + argv only

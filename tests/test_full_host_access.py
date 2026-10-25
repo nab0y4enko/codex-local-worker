@@ -32,7 +32,7 @@ def task(root, commands=None):
 
 def options(root, **overrides):
     kwargs = dict(task=task(Path(root)), state_dir=Path(root) / "state", codex_bin="codex",
-                  verify=True)
+                  verify=True, codex_run=sp.fake_help())
     kwargs.update(overrides)
     return lw.JobOptions(**kwargs)
 
@@ -56,7 +56,7 @@ class WorkerArgv(unittest.TestCase):
         self.assertEqual(self.argv[self.argv.index("-s") + 1], "danger-full-access")
         self.assertIn("--ignore-rules", self.argv)
         self.assertIn("--ignore-user-config", self.argv)
-        self.assertNotIn("--ephemeral", self.argv)
+        self.assertIn("--ephemeral", self.argv)
 
     def test_pinned_policy_is_full_host_and_self_checks_clean(self):
         self.assertEqual(self.overrides["sandbox_mode"], '"danger-full-access"')

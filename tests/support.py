@@ -4,11 +4,12 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import urllib.parse
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -187,6 +188,40 @@ class FakeOmlx:
         return 404, {"detail": "Model not found: " + model_id}
 
 
+# The option lines of a real ``codex exec --help`` (Codex CLI 0.164.0), one per flag.
+EXEC_HELP_FLAGS = ("-c, --config <key=value>", "--enable <FEATURE>", "--disable <FEATURE>",
+                   "-m, --model <MODEL>", "-s, --sandbox <SANDBOX_MODE>", "-C, --cd <DIR>",
+                   "--skip-git-repo-check", "--ephemeral", "--ignore-user-config",
+                   "--ignore-rules", "--output-schema <FILE>", "--color <COLOR>", "--json",
+                   "-o, --output-last-message <FILE>", "-h, --help", "-V, --version")
+CODEX_VERSION = "codex-cli 0.164.0"
+
+
+def fake_help(version: str = CODEX_VERSION, missing: Sequence[str] = ()):
+    """A fake ``subprocess.run`` for the two calls of the Codex compatibility check.
+
+    ``codex --version`` prints ``version``; ``codex exec --help`` lists every option of the real
+    0.164 help except the flags named in ``missing``. Anything else exits 2. ``.calls`` records
+    every argv it was asked to run.
+    """
+    def run(argv, **kwargs):
+        argv = [str(item) for item in argv]
+        run.calls.append(argv)
+        if argv[1:] == ["--version"]:
+            return subprocess.CompletedProcess(argv, 0, version + "\n", "")
+        if argv[1:] == ["exec", "--help"]:
+            lines = ["Run Codex non-interactively", "", "Options:"]
+            for option in EXEC_HELP_FLAGS:
+                names = [name.split(" ")[0] for name in option.split(", ")]
+                if not set(names) & set(missing):
+                    lines += ["      " + option, "          (help text)", ""]
+            return subprocess.CompletedProcess(argv, 0, "\n".join(lines) + "\n", "")
+        return subprocess.CompletedProcess(argv, 2, "", "error: unexpected argument\n")
+
+    run.calls = []
+    return run
+
+
 def task_payload(repo, **overrides):
     payload = {"task_id": "task-1", "repo_path": str(Path(repo)), "base_ref": "main",
                "goal": "Make add() return the sum.", "acceptance_criteria": ["test_add passes"],
@@ -236,7 +271,8 @@ def job_options(root, repo, verify=True, omlx=None, max_attempts=1, apple_udid=N
     return lw.JobOptions(task=task, state_dir=Path(root) / "state", codex_bin="codex-mock",
                          settings_path=settings,
                          omlx_fetch=omlx if omlx is not None else FakeOmlx("one"),
-                         verify=verify, apple_simulator_udid=apple_udid)
+                         verify=verify, apple_simulator_udid=apple_udid,
+                         codex_run=fake_help())
 
 
 def run_clean_job(root, repo, *, omlx=None, fake_run=None, worker_edit=None,

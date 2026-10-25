@@ -86,7 +86,8 @@ process ID, and a result bundle with at least one passing test and no failures.
 
 A native job stays on the full-host backend: the opt-in pins scope, not confinement. One
 selected simulator UUID is held under an exclusive lease and the toolchain environment is
-pinned, while `HOME` and `CODEX_HOME` stay unchanged. The worker can call `xcrun`, `simctl`,
+pinned, while `HOME` stays unchanged (the worker's `CODEX_HOME` is the job's own, as for every
+job). The worker can call `xcrun`, `simctl`,
 `xcodebuild` and `xcresulttool` directly, so keep it bound to the selected device and its task
 scope. `--no-verify` cannot bypass this gate for a native task. A runner PID or suspended
 process is not a passing XCTest case. For startup hangs or cross-job asset-compiler failures,

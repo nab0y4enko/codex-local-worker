@@ -190,7 +190,8 @@ class RunJobOutcome(unittest.TestCase):
                                                     max_attempts=max_attempts))
         return lw.JobOptions(task=task, state_dir=self.root / ("state-" + tag),
                              codex_bin="codex-mock", settings_path=settings,
-                             omlx_fetch=sp.FakeOmlx("one"), verify=True)
+                             omlx_fetch=sp.FakeOmlx("one"), verify=True,
+                             codex_run=sp.fake_help())
 
     def test_worker_patch_that_verification_reverts_is_no_changes(self):
         report = self.run_job(VerifierActs(reverts=True, worker_edit=self.fix))
