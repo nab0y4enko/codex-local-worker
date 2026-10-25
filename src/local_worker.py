@@ -62,6 +62,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import apple_verification as apple
+import contract
 import codex_catalog
 import omlx_discovery
 import permissions
@@ -99,7 +100,7 @@ LEGACY_CODEX_BIN_ENV = "LOCAL_IMPLEMENT_CODEX_BIN"
 DEFAULT_STATE_DIR = "~/.local-implement"
 
 MIN_TIMEOUT_SECONDS = 30
-MAX_TIMEOUT_SECONDS = 3600
+MAX_TIMEOUT_SECONDS = 14400
 ALLOWED_ATTEMPTS = (1, 2)
 LOCK_TIMEOUT_SECONDS = 30.0
 PROBE_MARKER = "__LOCAL_WORKER_SANDBOX_OK__"
@@ -363,8 +364,7 @@ def reap_orphans(state_dir: Path) -> List[Dict[str, Any]]:
     return killed
 
 
-class ContractError(LauncherError):
-    status = "contract_invalid"
+ContractError = contract.ContractError
 
 
 class PreflightError(LauncherError):
@@ -438,163 +438,8 @@ def redact(text: str, secrets: Sequence[str]) -> str:
     return text
 
 
-# --------------------------------------------------------------------------------------
-# Task contract
-# --------------------------------------------------------------------------------------
-CONTRACT_FIELDS = (
-    "task_id", "repo_path", "base_ref", "goal", "acceptance_criteria", "allowed_paths",
-    "test_commands", "timeout_seconds", "max_attempts",
-)
-TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-REF_BAD_CHARS = re.compile(r"[\s~^:?*\[\]\\]|\.\.|@\{")
-
-
-class _Field:
-    def __init__(self, name: str) -> None:
-        self.name = name
-
-    def fail(self, message: str) -> None:
-        raise ContractError(f"{self.name}: {message}")
-
-    def string(self, value: Any, *, allow_empty: bool = False) -> str:
-        if not isinstance(value, str):
-            self.fail(f"must be a string, got {type(value).__name__}")
-        if not allow_empty and not value.strip():
-            self.fail("must be a non-empty string")
-        if "\x00" in value:
-            self.fail("must not contain NUL")
-        return value
-
-    def integer(self, value: Any) -> int:
-        if isinstance(value, bool) or not isinstance(value, int):
-            self.fail(f"must be an integer, got {value!r}")
-        return int(value)
-
-    def string_list(self, value: Any, *, allow_empty: bool = False) -> List[str]:
-        if not isinstance(value, list):
-            self.fail(f"must be an array of strings, got {type(value).__name__}")
-        if not allow_empty and not value:
-            self.fail("must not be empty")
-        return [self.string(item) for item in value]
-
-
-def normalize_relative_path(raw: str, field_name: str) -> str:
-    """Return a repo-relative path, refusing absolute, traversing and .git paths."""
-    _Field(field_name).string(raw)
-    if raw.startswith(("/", "~", "\\")) or re.match(r"^[A-Za-z]:[\\/]", raw):
-        raise ContractError(f"{field_name}: must be relative to the repo root, got {raw!r}")
-    parts = [part for part in raw.replace("\\", "/").split("/") if part not in ("", ".")]
-    if not parts:
-        raise ContractError(f"{field_name}: must not be empty or '.'")
-    if ".." in parts:
-        raise ContractError(f"{field_name}: parent traversal is not allowed ({raw!r})")
-    if parts[0] == ".git" or ".git" in parts:
-        raise ContractError(f"{field_name}: repository metadata paths are not allowed ({raw!r})")
-    return "/".join(parts)
-
-
-@dataclass
-class Task:
-    task_id: str
-    repo_path: Path
-    base_ref: str
-    goal: str
-    acceptance_criteria: List[str]
-    allowed_paths: List[str]
-    test_commands: List[List[str]]
-    timeout_seconds: int
-    max_attempts: int
-
-    @classmethod
-    def from_payload(cls, payload: Any) -> "Task":
-        if not isinstance(payload, dict):
-            raise ContractError(f"contract must be a JSON object, got {type(payload).__name__}")
-        unknown = sorted(set(payload) - set(CONTRACT_FIELDS))
-        if unknown:
-            raise ContractError(f"unknown contract field(s): {', '.join(unknown)}")
-        missing = [name for name in CONTRACT_FIELDS if name not in payload]
-        if missing:
-            raise ContractError(f"missing contract field(s): {', '.join(missing)}")
-
-        task_id = _Field("task_id").string(payload["task_id"])
-        if not TASK_ID_RE.match(task_id):
-            raise ContractError(
-                "task_id: must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ (no path separators)"
-            )
-
-        repo_raw = _Field("repo_path").string(payload["repo_path"])
-        repo_path = Path(repo_raw)
-        if not repo_path.is_absolute():
-            raise ContractError(f"repo_path: must be absolute, got {repo_raw!r}")
-        if not repo_path.is_dir():
-            raise ContractError(f"repo_path: no such directory: {repo_raw}")
-
-        base_ref = _Field("base_ref").string(payload["base_ref"])
-        if base_ref.startswith("-"):
-            raise ContractError("base_ref: must not start with '-'")
-        if REF_BAD_CHARS.search(base_ref):
-            raise ContractError(f"base_ref: invalid git revision specifier {base_ref!r}")
-
-        goal = _Field("goal").string(payload["goal"])
-        criteria = _Field("acceptance_criteria").string_list(payload["acceptance_criteria"])
-
-        allowed_raw = _Field("allowed_paths").string_list(payload["allowed_paths"])
-        allowed_paths: List[str] = []
-        for raw in allowed_raw:
-            normalized = normalize_relative_path(raw, "allowed_paths[]")
-            if normalized not in allowed_paths:
-                allowed_paths.append(normalized)
-        if not allowed_paths:
-            raise ContractError("allowed_paths: at least one path is required")
-
-        raw_commands = payload["test_commands"]
-        if not isinstance(raw_commands, list):
-            raise ContractError(
-                f"test_commands: must be an array of argv arrays, got {type(raw_commands).__name__}"
-            )
-        if not raw_commands:
-            raise ContractError("test_commands: must contain at least one argv array")
-        test_commands: List[List[str]] = []
-        for index, argv in enumerate(raw_commands):
-            if isinstance(argv, str) or not isinstance(argv, list):
-                raise ContractError(
-                    f"test_commands[{index}]: must be an argv array (no shell strings)"
-                )
-            if not argv:
-                raise ContractError(f"test_commands[{index}]: must not be empty")
-            cleaned = [str(_Field(f"test_commands[{index}][]").string(part)) for part in argv]
-            test_commands.append(cleaned)
-
-        timeout_seconds = _Field("timeout_seconds").integer(payload["timeout_seconds"])
-        if not MIN_TIMEOUT_SECONDS <= timeout_seconds <= MAX_TIMEOUT_SECONDS:
-            raise ContractError(
-                f"timeout_seconds: must be between {MIN_TIMEOUT_SECONDS} and "
-                f"{MAX_TIMEOUT_SECONDS}, got {timeout_seconds}"
-            )
-
-        max_attempts = _Field("max_attempts").integer(payload["max_attempts"])
-        if max_attempts not in ALLOWED_ATTEMPTS:
-            raise ContractError(f"max_attempts: must be one of {list(ALLOWED_ATTEMPTS)}, got {max_attempts}")
-
-        return cls(
-            task_id=task_id, repo_path=repo_path, base_ref=base_ref, goal=goal,
-            acceptance_criteria=criteria, allowed_paths=allowed_paths,
-            test_commands=test_commands, timeout_seconds=timeout_seconds,
-            max_attempts=max_attempts,
-        )
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "task_id": self.task_id,
-            "repo_path": str(self.repo_path),
-            "base_ref": self.base_ref,
-            "goal": self.goal,
-            "acceptance_criteria": self.acceptance_criteria,
-            "allowed_paths": self.allowed_paths,
-            "test_commands": self.test_commands,
-            "timeout_seconds": self.timeout_seconds,
-            "max_attempts": self.max_attempts,
-        }
+# The task's public name stays available for callers of the v1 API.
+Task = contract.Contract
 
 
 # --------------------------------------------------------------------------------------
@@ -1847,7 +1692,7 @@ def worker_argv(codex_bin: str, worktree: Path, profile: omlx_discovery.ServerPr
     return argv
 
 
-def worker_env(api_key: str, codex_home: Path
+def worker_env(api_key: str, codex_home: Path, environment_pass: Sequence[str] = ()
                ) -> Tuple[Dict[str, str], List[str], List[str]]:
     """Minimal child environment: loopback key present, proxies and cloud credentials gone, and
     ``CODEX_HOME`` the job's own home, never the caller's."""
@@ -1858,6 +1703,9 @@ def worker_env(api_key: str, codex_home: Path
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     env["CODEX_HOME"] = str(codex_home)
     env[API_KEY_ENV] = api_key
+    for name in environment_pass:
+        if name in cleaned:
+            env[name] = cleaned[name]
     return env, stripped, cloud
 
 
@@ -2920,7 +2768,8 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     report["catalog_sha256"] = catalog_sha
     catalog = (catalog_path, catalog_sha)
 
-    env, stripped_proxies, cloud_names = worker_env(api_key, codex_home)
+    env, stripped_proxies, cloud_names = worker_env(
+        api_key, codex_home, task.environment_pass)
     if options.apple_simulator_udid is not None:
         # Native toolchain pin for the worker itself: ibtool/actool run in-process. HOME stays
         # exactly as the job had it, so the real simctl/Xcode state is used; CODEX_HOME is the
@@ -3434,6 +3283,10 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
     # Collected before anything can fail: a credential the tools manifest names is redacted even
     # when the job is refused by preflight, policy or the manifest itself.
     secrets.extend(tools.redaction_secrets(options.tool_config, os.environ))
+    for name in options.task.environment_pass:
+        value = os.environ.get(name)
+        if value and len(value) >= 4 and value not in secrets:
+            secrets.append(value)
     stream = None
     claimed = False
     try:
@@ -3469,7 +3322,7 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
             if key_error is not None:
                 raise key_error
             _execute(options, report, deadline, lease, secrets=secrets)
-    except LauncherError as error:
+    except (LauncherError, ContractError) as error:
         report["status"] = error.status
         report["failure_reason"] = redact(str(error), secrets)
         if isinstance(error, PreflightError) and error.code:
@@ -3870,7 +3723,7 @@ def main(argv: Optional[Sequence[str]] = None, *,
         finally:
             for signum, handler in previous_handlers.items():
                 signal.signal(signum, handler)
-    except LauncherError as error:
+    except (LauncherError, ContractError) as error:
         print(json.dumps(refusal_payload(error), indent=2))
         return EXIT_CODES.get(error.status, 4)
     except permissions.PermissionsError as error:

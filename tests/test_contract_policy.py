@@ -41,7 +41,7 @@ class Contract(unittest.TestCase):
                              ("base_ref", "HEAD~1"), ("base_ref", "a..b"), ("goal", "  "),
                              ("acceptance_criteria", []), ("acceptance_criteria", "one"),
                              ("timeout_seconds", "60"), ("timeout_seconds", True),
-                             ("timeout_seconds", 29), ("timeout_seconds", 3601),
+                             ("timeout_seconds", 29), ("timeout_seconds", 14401),
                              ("max_attempts", 0), ("max_attempts", 3), ("max_attempts", "1"),
                              ("test_commands", []), ("test_commands", "pytest -x"),
                              ("test_commands", ["pytest -x"]), ("test_commands", [[]]),
