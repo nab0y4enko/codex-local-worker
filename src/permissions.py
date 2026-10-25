@@ -13,7 +13,13 @@ the user's primary checkout (spec §6.2, §6.14):
 
 Seatbelt applies the last matching rule, so the profile order below is the policy. Every path is
 ``expanduser`` then ``realpath``: Seatbelt matches the resolved path (``/private/var``, never
-``/var``).
+``/var``). It also matches case- and normalisation-insensitively on a default APFS volume, so
+every comparison here (conflicts, add/remove, reading denials) folds case and Unicode form.
+
+Seatbelt matches *paths*, and a rename is a write that ``(allow default)`` permits, so a denial
+on a path is void if the path, or any parent of it, can be moved away. Every hidden path and the
+primary checkout are therefore also guarded against being renamed, replaced or deleted
+(``_rename_protection``).
 
 The file is the user's. A malformed file, an unknown or missing key, or a mode that is not built
 is a ``PermissionsError`` that names the problem: nothing here ever falls back to the defaults
@@ -28,10 +34,11 @@ import os
 import re
 import sys
 import tempfile
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 __all__ = [
     "DEFAULT_DENY_READ", "LOG_FILE", "MODE_FULL_HOST", "PERMISSIONS_FILE", "SANDBOX_EXEC",
@@ -98,6 +105,13 @@ def _check_text(value: Any, what: str) -> str:
     if _CONTROL.search(value):
         raise PermissionsError(f"{what} contains a control character and cannot be placed in a "
                                f"profile: {value!r}")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        # A file name that is not UTF-8 reaches Python as a lone surrogate; a profile (UTF-8
+        # text) cannot name it.
+        raise PermissionsError(f"{what} is not valid UTF-8 text, so a profile cannot name it: "
+                               f"{value!r}") from None
     return value
 
 
@@ -131,9 +145,26 @@ def _path_forms(path: Any) -> List[str]:
     return forms
 
 
+def _fold(path: str) -> str:
+    """The comparison key of a path: Unicode-decomposed and case-folded.
+
+    Seatbelt and the default (case-insensitive, normalisation-insensitive) APFS volume treat
+    ``~/.SSH`` and ``~/.ssh``, or an accent typed as one character or two, as one path, so a
+    comparison that does not fold would miss a variant that names the same directory. On a
+    case-sensitive volume this errs towards more matches (extra refusals, a case variant counted
+    as the same entry), never fewer.
+    """
+    return unicodedata.normalize("NFD", path).casefold()
+
+
 def _covers(root: str, path: str) -> bool:
     """``path`` is ``root`` itself or lives under it (whole path components only)."""
+    root, path = _fold(root), _fold(path)
     return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def _same(first: str, second: str) -> bool:
+    return _fold(first) == _fold(second)
 
 
 def _validate(perms: Permissions, source: str) -> None:
@@ -324,25 +355,73 @@ def _quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def _ancestors(path: str) -> List[str]:
+    """Every parent of the absolute ``path``, nearest first, up to and including ``/``."""
+    if not os.path.isabs(path):
+        raise PermissionsError(f"cannot guard the parents of a relative path: {path!r}")
+    parents: List[str] = []
+    while True:
+        parent = os.path.dirname(path)
+        if parent == path:
+            return parents
+        parents.append(parent)
+        path = parent
+
+
+def _rename_protection(paths: Iterable[str]) -> List[str]:
+    """The statement that keeps every real path in ``paths``, and every parent of each, in place.
+
+    Seatbelt matches paths, so renaming (or deleting and replacing) a denied path, or a directory
+    above it, moves the thing somewhere the denial no longer reaches. Renaming ``D`` is a write
+    to ``D``'s own path, so a literal write denial on the path and on each of its parents (up to
+    ``/``) stops that while leaving everything *inside* those parents writable. Returns one
+    ``(deny file-write* (literal ...) ...)`` statement, or nothing for no paths. It must come after
+    any rule it has to outrank. Anything that must not be moved but is not denied wholesale (the
+    state directory's ``permissions.json``) is protected by passing it here.
+    """
+    guarded: Dict[str, str] = {}
+    for path in paths:
+        for item in [path, *_ancestors(path)]:
+            guarded.setdefault(_fold(item), item)
+    if not guarded:
+        return []
+    return ["(deny file-write* " + " ".join(f"(literal {_quote(item)})"
+                                            for item in sorted(guarded.values())) + ")"]
+
+
 def seatbelt_profile(perms: Permissions, *, primary_repo: Path) -> str:
     """The Seatbelt profile text for ``perms`` (write it as UTF-8).
 
     ``(allow default)`` first, then only denials, in the order that makes Seatbelt's last-match
-    rule do the right thing: the read denials; then the primary checkout is made read-only as a
-    whole, its ``.git`` is re-opened for writing, and the four files and the branch directory that
-    would move the user's HEAD, branches, index or config are closed again. A linked worktree
-    keeps its own index and HEAD under ``.git/worktrees/<name>``, which stay writable.
+    rule do the right thing:
+
+    1. the read denials;
+    2. the primary checkout is made read-only as a whole, its ``.git`` is re-opened for writing,
+       and the four files and the branch directory that would move the user's HEAD, branches,
+       index or config are closed again (a linked worktree keeps its own index and HEAD under
+       ``.git/worktrees/<name>``, which stay writable);
+    3. everything hidden is also write-denied, so a secret cannot be rewritten or replaced;
+    4. every hidden path, the checkout, ``.git`` and ``.git/refs`` (and every parent of those, up
+       to ``/``) are guarded against being renamed away, because a denial on a path is void once
+       the path has moved (``_rename_protection``). Their *contents* stay as writable as they
+       were, except where an earlier rule says otherwise.
+
+    Not covered: a primary checkout that uses the reftable ref backend (``.git/reftable/``)
+    keeps its branches outside ``.git/refs/heads`` and ``packed-refs``, and one whose ``.git`` is
+    a gitfile (a linked worktree or submodule used as the primary) keeps its HEAD, index and refs
+    elsewhere; branch protection assumes a plain ``.git`` directory with files-backend refs.
     """
     _validate(perms, "the permissions list")
     lines = ["(version 1)", "(allow default)"]
     hidden: List[str] = []
     for entry in perms.deny_read:
         real = _real(entry)
-        if real not in hidden:
+        if not any(_same(real, seen) for seen in hidden):
             hidden.append(real)
     if hidden:
         # Never emitted empty: ``(deny file-read*)`` without a filter would hide every file.
         lines.append("(deny file-read* " + " ".join(f"(subpath {_quote(path)})" for path in hidden) + ")")
+    guarded = list(hidden)
     if perms.protect_primary_checkout:
         repo = os.path.realpath(str(primary_repo))
         git_dir = os.path.join(repo, ".git")
@@ -351,6 +430,10 @@ def seatbelt_profile(perms: Permissions, *, primary_repo: Path) -> str:
         lines.append(f"(deny file-write* (subpath {_quote(repo)}))")
         lines.append(f"(allow file-write* (subpath {_quote(git_dir)}))")
         lines.append("(deny file-write* " + " ".join(protected) + ")")
+        guarded += [repo, git_dir, os.path.join(git_dir, "refs")]
+    if hidden:
+        lines.append("(deny file-write* " + " ".join(f"(subpath {_quote(path)})" for path in hidden) + ")")
+    lines.extend(_rename_protection(guarded))
     return "\n".join(lines) + "\n"
 
 
@@ -373,23 +456,80 @@ def wrap_argv(argv: Sequence[str], profile_path: Path) -> List[str]:
 
 # --------------------------------------------------------------------------- reading denials
 
-# What ends a path inside a line of tool output. A path is only followed past its prefix up to
-# one of these, so a quoted or colon-terminated path in an error message is cut where it ends.
-_PATH_END = "\\s\"'`:;,()<>\\[\\]{}|*?"
+_PHRASE = "operation not permitted"
+_NAME = "\\w\\u0300-\\u036f~"  # what continues a path component's name (folded, combining marks too)
+_CLOSERS = {")": "(", "]": "[", "}": "{", ">": "<"}
+_TRAILING = " \t.,;:"  # punctuation that follows a path in a sentence, never ends one
+
+
+def _fold_with_origin(text: str) -> Tuple[str, List[int]]:
+    """``text`` folded character by character, and for each folded character the index of the
+    character it came from, so a match found in the folded text can be cut from the original."""
+    folded: List[str] = []
+    origin: List[int] = []
+    for index, char in enumerate(text):
+        piece = unicodedata.normalize("NFD", char).casefold()
+        folded.append(piece)
+        origin.extend([index] * len(piece))
+    return "".join(folded), origin
 
 
 def _mention_pattern(root: str) -> "re.Pattern[str]":
-    """``root`` as a whole path (not the tail of another name or the head of a longer one), plus
-    whatever path continues below it."""
-    return re.compile(r"(?<![\w.~-])" + re.escape(root) + r"(?![\w~-]|\.\w)"
-                      r"(?P<below>(?:/[^" + _PATH_END + r"]*)?)")
+    """``root`` (already folded) as a whole path: not the tail of another name, not the head of a
+    longer one."""
+    return re.compile(r"(?<![" + _NAME + r".-])" + re.escape(root)
+                      + r"(?![" + _NAME + r"-]|\.[" + _NAME + r"-])")
 
 
-def _mentions(line: str, roots: Sequence[str]) -> Iterator[Tuple[int, str]]:
-    for root in roots:
-        for match in _mention_pattern(root).finditer(line):
-            # A sentence's closing period is not part of the path.
-            yield match.start(), root + match.group("below").rstrip(".")
+def _path_end(line: str, start: int) -> int:
+    """Where the path that continues from ``start`` in the (folded) ``line`` stops.
+
+    Spaces belong to a path (``Application Support``), so it does not stop at one. It stops at a
+    quote, at ``:`` before a space or the end (``<path>: Operation not permitted``), at the
+    message itself, at a space that begins another absolute path, and at a closing bracket that
+    nothing in the path opened.
+    """
+    openers: List[str] = []
+    index = start
+    while index < len(line):
+        char = line[index]
+        if char in "'\"`" or line.startswith(_PHRASE, index):
+            break
+        if char == ":" and (index + 1 == len(line) or line[index + 1].isspace()):
+            break
+        if char.isspace():
+            after = index
+            while after < len(line) and line[after].isspace():
+                after += 1
+            if line.startswith("/", after):
+                break
+        if char in _CLOSERS.values():
+            openers.append(char)
+        elif char in _CLOSERS:
+            if not openers or openers[-1] != _CLOSERS[char]:
+                break
+            openers.pop()
+        index += 1
+    return index
+
+
+def _mentions(line: str, folded: str, origin: Sequence[int],
+              patterns: Sequence["re.Pattern[str]"]) -> List[Tuple[int, str]]:
+    """``(start, path)`` for every place ``folded`` names a root (a ``_mention_pattern``) or
+    something under one.
+
+    The path is cut from the original ``line`` (its own spelling): the known root, then whatever
+    continues below it.
+    """
+    found: List[Tuple[int, str]] = []
+    for pattern in patterns:
+        for match in pattern.finditer(folded):
+            end = match.end()
+            below_end = _path_end(folded, end) if folded.startswith("/", end) else end
+            head = line[origin[match.start()]:origin[end - 1] + 1]
+            below = line[origin[end]:origin[below_end - 1] + 1].rstrip(_TRAILING) if below_end > end else ""
+            found.append((origin[match.start()], head + below))
+    return found
 
 
 def find_denials(text: str, perms: Permissions, primary_repo: Path) -> List[Dict[str, str]]:
@@ -397,21 +537,29 @@ def find_denials(text: str, perms: Permissions, primary_repo: Path) -> List[Dict
 
     A line saying ``Operation not permitted`` that names a denied-read entry (or a path under
     one) is a ``"read"`` denial, and one naming the primary checkout (or a path under it) is a
-    ``"write"`` denial when it is protected. ``path`` is the path as the line spells it, real or
-    ``~``-expanded. A longer sibling name (``~/.ssh-backup``) never matches. This is a reading of
-    tool output, not proof: ``EPERM`` has other causes, so callers word it as a likely cause.
+    ``"write"`` denial when it is protected. A path that is both (a hidden file inside the
+    checkout) is reported once, as a read. ``path`` is the path as the line spells it, real or
+    ``~``-expanded, whole even when it contains spaces. A longer sibling name (``~/.ssh-backup``)
+    never matches, and case and Unicode form do not matter. This is a reading of tool output,
+    not proof: ``EPERM`` has other causes, so callers word it as a likely cause.
     """
     reads: List[str] = []
     for entry in perms.deny_read:
         reads.extend(form for form in _forms(entry) if form not in reads)
     writes = _path_forms(primary_repo) if perms.protect_primary_checkout else []
+    read_patterns = [_mention_pattern(_fold_with_origin(root)[0]) for root in reads]
+    write_patterns = [_mention_pattern(_fold_with_origin(root)[0]) for root in writes]
     found: List[Dict[str, str]] = []
     seen = set()
     for line in text.splitlines():
-        if "operation not permitted" not in line.lower():
+        folded, origin = _fold_with_origin(line)
+        if _PHRASE not in folded:
             continue
-        hits = [(start, "read", path) for start, path in _mentions(line, reads)]
-        hits += [(start, "write", path) for start, path in _mentions(line, writes)]
+        read_hits = _mentions(line, folded, origin, read_patterns)
+        read_starts = {start for start, _ in read_hits}
+        hits = [(start, "read", path) for start, path in read_hits]
+        hits += [(start, "write", path) for start, path in _mentions(line, folded, origin, write_patterns)
+                 if start not in read_starts]
         for _, kind, path in sorted(hits, key=lambda hit: hit[0]):
             if (path, kind) not in seen:
                 seen.add((path, kind))
@@ -459,7 +607,7 @@ def add_deny_read(state_dir: Path, raw: str) -> Permissions:
     """Add ``raw`` to the deny list (a path already denied is left as it is and not logged)."""
     entry = normalize_entry(raw)
     perms = load_permissions(state_dir)
-    if any(_real(existing) == _real(entry) for existing in perms.deny_read):
+    if any(_same(_real(existing), _real(entry)) for existing in perms.deny_read):
         return perms
     perms.deny_read.append(entry)
     save_permissions(state_dir, perms)
@@ -476,7 +624,7 @@ def remove_deny_read(state_dir: Path, raw: str) -> Permissions:
     entry = normalize_entry(raw)
     perms = load_permissions(state_dir)
     target = _real(entry)
-    kept = [existing for existing in perms.deny_read if _real(existing) != target]
+    kept = [existing for existing in perms.deny_read if not _same(_real(existing), target)]
     if len(kept) == len(perms.deny_read):
         covering = [existing for existing in perms.deny_read if _covers(_real(existing), target)]
         if covering:
