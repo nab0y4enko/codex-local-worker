@@ -3,9 +3,9 @@
 ## Scope and evidence boundary
 
 This record covers the consolidated fixes for findings A1, A2, B1, B2, C1, C2, and the
-permission-history minor. It is separate from the live qualification record: the offline suite
-below passed against this tree, but no post-fix real local inference or native-device result is
-claimed here yet.
+permission-history minor. It is separate from the live qualification reports, which are retained in the external manifest
+listed below. The final offline suite and final post-fix real local/native qualification both
+passed against commit `7465273`.
 
 ## Git object isolation and audit
 
@@ -55,11 +55,11 @@ Command:
 python3 -m unittest discover -s tests -v
 ```
 
-Result on commit `a56c710`: **1007 tests total, 999 executed successfully, 8 live-only skips,
-168.118 seconds**. A follow-up run before the last signal-handler ordering change totaled 1011 tests
-with 1003 executed successfully and 8 skips in 201.319 seconds; the final full-suite result for
-the signal-handler ordering follow-up is pending. The skipped tests are opt-in live qualification
-cases and are not counted as executed passes. Syntax check
+Final result on commit `7465273`: **1013 tests total, 1005 executed successfully, 8 live-only
+skips, 214.097 seconds**. Earlier staged checks were 1007 total/999 executed/8 skipped on
+`a56c710` (168.118s) and 1011 total/1003 executed/8 skipped before the last signal-handler
+ordering change (201.319s). The skipped tests are opt-in live qualification cases and are not
+counted as executed passes. Syntax check
 passed with:
 
 ```sh
@@ -68,13 +68,28 @@ python3 -m py_compile src/local_worker.py src/process_supervisor.py src/worktree
 
 Diff whitespace check passed with `git diff --check`.
 
-## Initial post-fix live qualification
+## Live qualification
 
-On `a56c710`, before the cloud-catalog and final supervisor-signal follow-ups, the opt-in live
-suite passed **8/8 cases in 196.908 seconds**. It used real local write/read jobs and a native
-iPhone 17 simulator qualification; the forced capability-failure and context-overflow cases also
-passed their expected classification assertions. Cloud inference was not called. Full report and
-all job worktrees are retained under `/Users/oleksii.naboichenko/.local/share/codex-local-worker/
-core-fixwave-2026-10-25/live/qualification`; the simulator UDID was
-`4D3B2328-F90D-4703-9D83-956C7AFE5083`. The final follow-up live qualification is pending and
-will be added after rerunning on the completed commit.
+The initial post-fix run on `a56c710` passed **8/8 cases in 196.908 seconds**. The final follow-up
+run on `7465273` passed **8/8 cases in 165.160 seconds**. Both used the real
+`bin/local-worker run` path for local write/read jobs, covered expected capability-failure and
+context-overflow classifications, and qualified native build/install/launch/XCTest plus
+before/after/reference screenshots on the newly created iPhone 17 simulator. The final strict
+acceptance test `testAppShowsAfter` passed. Cloud inference was not called; the suite's cloud case
+only checked catalog/argv behavior. The final run used this command and environment:
+
+```sh
+LOCAL_WORKER_LIVE=1 \
+LOCAL_WORKER_QUALIFICATION_ROOT=/Users/oleksii.naboichenko/.local/share/codex-local-worker/core-fixwave-2026-10-25/final/qualification \
+LOCAL_WORKER_QUALIFICATION_RECORD=/Users/oleksii.naboichenko/.local/share/codex-local-worker/core-fixwave-2026-10-25/final/qualification/live-report.md \
+LOCAL_WORKER_LIVE_NATIVE_PLAN=/Users/oleksii.naboichenko/.local/share/codex-local-worker/core-fixwave-2026-10-25/final/native-pilot/native-plan.json \
+LOCAL_WORKER_LIVE_NATIVE_SIMULATOR_UDID=4D3B2328-F90D-4703-9D83-956C7AFE5083 \
+LOCAL_WORKER_LIVE_NATIVE_TASK=/Users/oleksii.naboichenko/.local/share/codex-local-worker/core-fixwave-2026-10-25/final/native-pilot/task.json \
+python3 -m unittest tests.live.test_live_qualification -v
+```
+
+The new simulator was `4D3B2328-F90D-4703-9D83-956C7AFE5083`; both previously booted tvOS
+simulators remained booted and untouched. All ten reports/worktrees across both post-fix live
+runs, both native fixtures, simulator identity, and run outcomes are listed in the external
+manifest at `/Users/oleksii.naboichenko/.local/share/codex-local-worker/core-fixwave-2026-10-25/live-job-manifest.json`.
+The manifest and complete job state remain available for parent review and archive verification.
