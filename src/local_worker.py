@@ -75,6 +75,7 @@ import permissions
 import plugin_setup
 import notify
 import read_answers
+import test_review
 import worker_pool as pool
 import native_readiness as native
 import worker_observability as observation
@@ -2438,6 +2439,9 @@ PROMPT_RULES = (
     "Create or modify files ONLY under the allowed paths listed below.",
     "Do not run git commit, git merge, git push, or git worktree commands.",
     "Do not read or print credentials, tokens, or environment secrets.",
+    "Each new or changed test must assert observable behavior or an expected exception; "
+    "computing result and expected values without comparing them is not a test. Do not remove "
+    "tests or weaken expectations to make verification pass.",
     "The launcher, not you, owns the verification commands listed below: it runs that full "
     "suite itself after you return. Run only the focused checks the goal asks for, then "
     "return with the verification time reserved for the launcher.",
@@ -2542,6 +2546,11 @@ def build_prompt(task: Task, worktree: Path, feedback: Optional[str] = None,
         lines += ["", APPLE_PROMPT_NOTE.format(udid=apple_udid)]
     if feedback:
         lines += ["", "Previous attempt feedback (fix this):", feedback.strip()]
+    lines += ["", "For each changed Python test file, run this advisory assertion review before "
+              "returning, then inspect and fix missing checks (helper-based tests may be valid):",
+              json.dumps(["python3", str(Path(__file__).with_name("test_review.py")),
+                          "--repo", str(worktree), "--path", "<changed-test-file.py>"]),
+              "This is a focused self-check, not the launcher-owned full verification suite."]
     return "\n".join(lines) + "\n"
 
 
@@ -3340,6 +3349,7 @@ def new_report(options: JobOptions) -> Dict[str, Any]:
         "auto_retries": [],
         "screenshots": [],
         "tests": [],
+        "review_findings": None,
         "changed_paths": [],
         "violations": [],
         "ignored_paths": [],
@@ -4987,6 +4997,17 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
                                              git_layout=report.get("_git_layout"),
                                              git_admin_before=report.get("_git_admin_before"))
                 report["changed_paths"] = final_audit.changed_paths
+                if options.task.kind == "write":
+                    try:
+                        report["review_findings"] = test_review.review_python_tests(
+                            Path(report["worktree"]), final_audit.changed_paths)
+                    except Exception as review_error:
+                        # Advisory tooling must not prevent the preservation audit/report.
+                        report["review_findings"] = [{
+                            "path": "", "line": 0, "test": "", "code": "review_unavailable",
+                            "message": "Advisory test review unavailable (%s); inspect tests manually."
+                                       % type(review_error).__name__,
+                        }]
                 report["violations"] = final_audit.violations
                 note_git_admin_tamper(report, Path(report["worktree"]))
                 report["head_commit"] = final_audit.head_commit
@@ -5326,6 +5347,7 @@ def planner_json(report: Dict[str, Any]) -> Dict[str, Any]:
         "patch_path": report.get("patch_path"),
         "screenshots": report.get("screenshots", []),
         "tests": report.get("tests", []),
+        "review_findings": report.get("review_findings"),
         "tokens": report.get("usage"),
         "durations": report.get("timing", {}),
         "report_path": str(Path(report_dir) / "report.json") if report_dir else None,

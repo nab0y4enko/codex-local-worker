@@ -103,7 +103,7 @@ class ClassifyTests(unittest.TestCase):
                                   "report_dir": "/tmp/report"})
         self.assertEqual(list(result), ["job_id", "kind", "tier", "model", "status",
                                         "classification", "answer", "answer_evidence", "patch_path", "screenshots",
-                                        "tests", "tokens", "durations", "report_path"])
+                                        "tests", "review_findings", "tokens", "durations", "report_path"])
 
     def test_classifier_ignores_worker_prose(self):
         result = classify.classify({"status": "worker_failed", "failure_reason": "I think the server was down"})
