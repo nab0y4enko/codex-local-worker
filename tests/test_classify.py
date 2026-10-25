@@ -1,3 +1,4 @@
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -8,10 +9,15 @@ import local_worker as lw
 import support as sp
 
 
+def terminal_error(event_type, message):
+    event = {"type": event_type, "error": {"message": message}}
+    return lw.typed_worker_error_text(json.dumps(event))
+
+
 CASES = [
     ({"status": "ok"}, ("ok", "done")),
-    ({"status": "worker_failed", "attempts": [{"stderr_excerpt": "error=unsupported call: apply_patch", "returncode": 1}]}, ("tool_unavailable", "retry_local")),
-    ({"status": "worker_failed", "attempts": [{"terminal_failures": ["turn.failed"], "error_text": "context length exceeded"}]}, ("context_overflow", "retry_local")),
+    ({"status": "worker_failed", "attempts": [{"error_text": terminal_error("error", "unsupported call: apply_patch"), "returncode": 1}]}, ("tool_unavailable", "retry_local")),
+    ({"status": "worker_failed", "attempts": [{"terminal_failures": ["turn.failed"], "error_text": terminal_error("turn.failed", "context length exceeded")}]}, ("context_overflow", "retry_local")),
     ({"status": "worker_failed", "attempts": [{"stalled": True}]}, ("stall", "retry_local")),
     ({"status": "tests_failed", "attempts": [{}, {}], "max_attempts": 2}, ("tests_failed", "escalate_cloud")),
     ({"status": "audit_violation", "violations": [{"path": "x", "reason": "outside allowed_paths"}]}, ("out_of_scope", "escalate_cloud")),
@@ -34,7 +40,8 @@ class ClassifyTests(unittest.TestCase):
                 self.assertEqual((result.code, result.next_action), expected)
 
     def test_server_crash_mid_attempt_is_environment(self):
-        report = {"status": "tests_failed", "attempts": [{"returncode": 1, "stderr_excerpt": "error sending request: Connection refused (os error 61)"}]}
+        error = terminal_error("error", "error sending request: Connection refused (os error 61)")
+        report = {"status": "tests_failed", "attempts": [{"returncode": 1, "error_text": error}]}
         result = classify.classify(report)
         self.assertEqual((result.cls, result.code, result.next_action), ("environment", "server_unreachable", "retry_local"))
 
@@ -73,6 +80,13 @@ class ClassifyTests(unittest.TestCase):
     def test_classifier_ignores_worker_prose(self):
         result = classify.classify({"status": "worker_failed", "failure_reason": "I think the server was down"})
         self.assertEqual(result.code, "verification_blocked")
+
+    def test_raw_stderr_infrastructure_phrases_are_not_classification_evidence(self):
+        report = {"status": "worker_failed", "attempts": [{"returncode": 1,
+                  "stderr_excerpt": "Connection refused; context length exceeded; unsupported call"}]}
+        result = classify.classify(report)
+        self.assertEqual((result.cls, result.code, result.next_action),
+                         ("environment", "verification_blocked", "needs_user"))
 
     def test_context_overflow_gets_one_lower_cap_retry(self):
         first = '{"type":"turn.failed","error":{"message":"context length exceeded"}}\n'

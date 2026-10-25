@@ -73,7 +73,7 @@ def _texts(report: Dict[str, Any]) -> List[str]:
     # The last attempt decides the current retry decision; an earlier failure remains in the
     # report's history but must not mask a new, distinct failure code.
     for attempt in attempts[-1:]:
-        for key in ("error_text", "typed_error_text", "stderr_excerpt"):
+        for key in ("error_text", "typed_error_text"):
             value = attempt.get(key)
             if isinstance(value, str):
                 values.append(value.lower())

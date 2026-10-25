@@ -10,11 +10,14 @@ Standard library only. Design rules:
   attempt: if the pinned model is gone or changed, that attempt does not start.
 * The oMLX key is loaded into the child environment only; it is excluded from the
   model's shell environment via shell_environment_policy and redacted from all logs.
-* Every job runs Codex in its own empty ``CODEX_HOME`` inside the report directory, in an
-  ephemeral session, on a model catalog generated for the discovered model
-  (``codex_catalog``) and kept in the report directory, which the worker cannot write: the
-  worker never sees the user's Codex home, and the self-check pins the catalog file's hash. An
-  installed Codex that is too old or lacks a required flag is a preflight refusal.
+* Local jobs run Codex in an empty per-job ``CODEX_HOME`` inside the report directory. Cloud
+  jobs use the selected native ``CODEX_HOME`` for Codex-managed authentication and refresh, with
+  the deny profile allowing metadata on the home directory, ``auth.json``, and its observed
+  temporary helper subtree. Both tiers run in ephemeral sessions; local jobs use a model catalog
+  generated for the discovered model (``codex_catalog``) and kept in the report directory, which
+  the worker cannot write. Local workers never see the user's Codex home, and the self-check pins
+  the catalog file's hash. An installed Codex that is too old or lacks a required flag is a
+  preflight refusal.
 * Every job runs in its own detached ``git worktree``. The primary checkout is never
   mutated. Failed worktrees are preserved, never auto-merged, never committed.
 * One job runs at a time by default. ``--max-workers`` 2-4 widens that to a bounded pool of
@@ -56,7 +59,7 @@ import tempfile
 import sys
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
@@ -700,7 +703,7 @@ def require_codex_compat(codex_bin: str, run: Callable[..., Any] = subprocess.ru
 
 
 def job_codex_home(report_dir: Path) -> Path:
-    """The job's own Codex home, ``<report_dir>/codex-home``, created empty and private.
+    """The local job's own Codex home, ``<report_dir>/codex-home``, empty and private.
 
     The worker and the tool probe run with ``CODEX_HOME`` set to it, so neither ever reads the
     user's ``AGENTS.md``, memories, skills, sessions or ``auth.json``. A path that already
@@ -720,29 +723,6 @@ def job_codex_home(report_dir: Path) -> Path:
     return home
 
 
-def _read_regular_nofollow(path: Path) -> bytes:
-    """Read one regular file without following a symlink."""
-    if path.is_symlink():
-        raise BlockedError("cloud auth file must not be a symlink")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(str(path), flags)
-    except OSError as error:
-        raise BlockedError("cannot safely open cloud auth file (%s)" % error.__class__.__name__) from None
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise BlockedError("cloud auth file must be a regular file")
-        chunks = []
-        while True:
-            block = os.read(descriptor, READ_CHUNK_BYTES)
-            if not block:
-                break
-            chunks.append(block)
-        return b"".join(chunks)
-    finally:
-        os.close(descriptor)
-
-
 def _auth_secret_values(value: Any, key: str = "") -> List[str]:
     secrets = []
     if isinstance(value, dict):
@@ -757,133 +737,55 @@ def _auth_secret_values(value: Any, key: str = "") -> List[str]:
     return secrets
 
 
-class CloudAuthSession:
-    """Copy only auth.json into the job home and safely write back token refreshes.
+class CloudAuthObservation:
+    """Redact credentials after Codex has used its native CODEX_HOME auth store.
 
-    Jobs in this launcher serialize on a state-local account lock. At completion, a changed
-    source file causes writeback refusal, preventing an older job from overwriting a concurrent
-    login or refresh performed outside the launcher.
+    The launcher never copies or writes auth.json. Codex owns its locking and refresh behavior;
+    this observer reads token values before execution for redaction and again after the worker
+    exits so refreshed values can scrub retained text evidence before the final report persists.
     """
 
-    def __init__(self, source_home: Path, job_home: Path, state_dir: Path,
-                 secrets: List[str]):
-        self.source_home = Path(source_home).expanduser().absolute()
-        self.source_path = self.source_home / "auth.json"
-        self.job_path = Path(job_home) / "auth.json"
-        self._lock = None
-        self._finished = None
+    def __init__(self, source_home: Path, report_dir: Path, secrets: List[str]):
+        self.source_home = Path(source_home)
+        self.auth_path = self.source_home / "auth.json"
+        self.report_dir = Path(report_dir)
         self.secrets = secrets
-        self.job_report_dir = Path(job_home).parent
-        if self.source_home.is_symlink() or not self.source_home.is_dir():
-            raise BlockedError("cloud auth home must be a real directory")
-        if Path(job_home).is_symlink() or not Path(job_home).is_dir():
-            raise BlockedError("cloud job home must be a real directory")
-        lock_root = Path(state_dir) / "cloud-auth-locks"
-        lock_root.mkdir(parents=True, exist_ok=True)
-        lock_id = hashlib.sha256(str(self.source_path).encode("utf-8")).hexdigest()
-        self.lock_path = lock_root / (lock_id + ".lock")
-        try:
-            self._lock = self.lock_path.open("a")
-            fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            self._release()
-            raise BlockedError("another cloud job is using this Codex login; retry after it finishes") from None
-        except OSError as error:
-            self._release()
-            raise BlockedError("cannot lock the cloud auth handoff (%s)" % error.__class__.__name__) from None
-        try:
-            payload = _read_regular_nofollow(self.source_path)
-            parsed = json.loads(payload.decode("utf-8"))
-            if not isinstance(parsed, dict):
-                raise BlockedError("cloud auth.json must contain a JSON object")
-            self.original = payload
-            self.original_sha = hashlib.sha256(payload).hexdigest()
-            for value in _auth_secret_values(parsed):
-                if value not in secrets:
-                    secrets.append(value)
-            descriptor = os.open(str(self.job_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            try:
-                with os.fdopen(descriptor, "wb") as target:
-                    target.write(payload)
-                    target.flush()
-                    os.fsync(target.fileno())
-            except BaseException:
-                with contextlib.suppress(OSError):
-                    self.job_path.unlink()
-                raise
-            self.job_path.chmod(0o600)
-        except (OSError, ValueError, UnicodeError) as error:
-            self._release()
-            raise BlockedError("cannot prepare the isolated cloud auth file (%s)" %
-                               error.__class__.__name__) from None
-        except BaseException:
-            self._release()
-            raise
 
-    def _release(self):
-        if self._lock is not None:
-            with contextlib.suppress(OSError):
-                fcntl.flock(self._lock, fcntl.LOCK_UN)
-                self._lock.close()
-            self._lock = None
+    def observe_initial(self) -> str:
+        """Read token values into the private redaction set before any worker output exists."""
+        try:
+            self._capture_secrets()
+            return "observed"
+        except (OSError, ValueError, UnicodeError, BlockedError):
+            return "unavailable"
+
+    def _capture_secrets(self) -> None:
+        payload = _read_auth_file_nofollow(self.auth_path)
+        auth = json.loads(payload.decode("utf-8"))
+        if not isinstance(auth, dict):
+            raise ValueError("auth.json must contain an object")
+        for value in _auth_secret_values(auth):
+            if value not in self.secrets:
+                self.secrets.append(value)
 
     def finish(self) -> Dict[str, Any]:
-        if self._finished is not None:
-            return dict(self._finished)
-        result = {"auth_file_copied": True, "refresh_writeback": "unchanged"}
-        temporary = None
+        result = {"credential_scrub": "unavailable", "retained_artifacts_scrubbed": 0}
         try:
-            updated = _read_regular_nofollow(self.job_path)
-            refreshed = json.loads(updated.decode("utf-8"))
-            if not isinstance(refreshed, dict):
-                raise BlockedError("refreshed cloud auth.json must contain a JSON object")
-            for value in _auth_secret_values(refreshed):
-                if value not in self.secrets:
-                    self.secrets.append(value)
+            self._capture_secrets()
+            result["credential_scrub"] = "observed after Codex exit"
             result["retained_artifacts_scrubbed"] = self._scrub_retained_artifacts()
-            if hashlib.sha256(updated).hexdigest() == self.original_sha:
-                self._finished = result
-                return dict(result)
-            current = _read_regular_nofollow(self.source_path)
-            if hashlib.sha256(current).hexdigest() != self.original_sha:
-                result["refresh_writeback"] = "concurrent-change-refused"
-                self._finished = result
-                return dict(result)
-            fd, temporary = tempfile.mkstemp(prefix=".auth-refresh-", dir=str(self.source_home))
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "wb") as target:
-                target.write(updated)
-                target.flush()
-                os.fsync(target.fileno())
-            # Recheck the source immediately before replace, closing the common time-of-check gap.
-            if hashlib.sha256(_read_regular_nofollow(self.source_path)).hexdigest() != self.original_sha:
-                result["refresh_writeback"] = "concurrent-change-refused"
-                return dict(result)
-            os.replace(temporary, self.source_path)
-            temporary = None
-            result["refresh_writeback"] = "updated"
         except (OSError, ValueError, UnicodeError, BlockedError) as error:
-            result["refresh_writeback"] = "refused"
-            result["refresh_writeback_reason"] = str(error)
-        finally:
-            if temporary and os.path.exists(temporary):
-                with contextlib.suppress(OSError):
-                    os.unlink(temporary)
-            self._release()
-            self._finished = result
-        return dict(result)
+            result["credential_scrub"] = "unavailable (%s)" % error.__class__.__name__
+        return result
 
     def _scrub_retained_artifacts(self) -> int:
-        """Scrub newly observed refresh tokens from text evidence already retained by the job."""
         count = 0
-        home = Path(self.job_path).parent
-        for root, dirs, files in os.walk(str(self.job_report_dir), followlinks=False):
+        for root, dirs, files in os.walk(str(self.report_dir), followlinks=False):
             dirs[:] = [name for name in dirs
-                       if not (Path(root) / name).is_symlink()
-                       and (Path(root) / name).absolute() != home.absolute()]
+                       if not (Path(root) / name).is_symlink()]
             for name in files:
                 path = Path(root) / name
-                if path.is_symlink() or path.absolute() == self.job_path.absolute():
+                if path.is_symlink():
                     continue
                 try:
                     if not stat.S_ISREG(path.lstat().st_mode):
@@ -904,6 +806,50 @@ class CloudAuthSession:
                         raise BlockedError("cannot scrub retained cloud evidence (%s)" %
                                            error.__class__.__name__) from None
         return count
+
+
+def _read_auth_file_nofollow(path: Path) -> bytes:
+    """Read one regular auth file at job completion without following a symlink."""
+    if path.is_symlink():
+        raise BlockedError("cloud auth file is a symlink")
+    try:
+        descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as error:
+        raise BlockedError("cannot inspect cloud auth file (%s)" % error.__class__.__name__) from None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise BlockedError("cloud auth file is not a regular file")
+        chunks = []
+        while True:
+            block = os.read(descriptor, READ_CHUNK_BYTES)
+            if not block:
+                return b"".join(chunks)
+            chunks.append(block)
+    finally:
+        os.close(descriptor)
+
+
+def resolve_cloud_codex_home(environment: Optional[Dict[str, str]] = None) -> Path:
+    """Select the native Codex auth home without reading credential contents."""
+    environment = os.environ if environment is None else environment
+    configured = environment.get("CODEX_HOME")
+    home = Path(configured).expanduser().absolute() if configured else Path.home() / ".codex"
+    if home.is_symlink() or not home.is_dir():
+        raise BlockedError("cloud CODEX_HOME must be an existing real directory")
+    auth_path = home / "auth.json"
+    if auth_path.is_symlink():
+        raise BlockedError("cloud auth.json must not be a symlink")
+    try:
+        if not stat.S_ISREG(auth_path.lstat().st_mode):
+            raise BlockedError("cloud auth.json must be a regular file")
+    except OSError as error:
+        raise BlockedError("cloud auth.json is unavailable (%s)" % error.__class__.__name__) from None
+    current = home
+    for component in ("tmp", "arg0-macos"):
+        current = current / component
+        if current.exists() and (current.is_symlink() or not current.is_dir()):
+            raise BlockedError("Codex temporary helper path must be a real directory")
+    return home
 
 
 def create_native_roots(report_dir: Path) -> List[Path]:
@@ -1959,7 +1905,7 @@ def worker_argv_for_tier(options: JobOptions, worktree: Path,
 
 
 def cloud_worker_env(codex_home: Path, environment_pass: Sequence[str] = ()) -> Tuple[Dict[str, str], List[str], List[str]]:
-    """Minimal cloud environment with only the explicitly prepared job auth file available."""
+    """Minimal cloud environment using Codex's native, narrowly exposed auth home."""
     cleaned, stripped = strip_proxy_env(dict(os.environ))
     cloud = cloud_credential_names(cleaned)
     env = {key: cleaned[key] for key in BASE_ENV_KEYS if key in cleaned}
@@ -2542,17 +2488,30 @@ def setup_deny_wrapper(options: "JobOptions", report: Dict[str, Any],
     blocked.
     """
     record = report["permissions"]
+    # Codex needs metadata on CODEX_HOME itself during startup; all child content stays hidden
+    # except for auth.json and the observed temporary helper subtree.
+    cloud_home = Path(report["cloud_auth"]["source_home"]) if report.get("cloud_auth") else None
+    helper_scratch = cloud_home / "tmp" / "arg0-macos" if cloud_home else None
+    profile_perms = (replace(perms, deny_read=list(perms.deny_read) + [str(cloud_home)])
+                     if cloud_home else perms)
     try:
         # The job worktree's own GIT_COMMON_DIR (read before any worker ran) is the primary's
         # real common dir whatever shape the primary is; the profile also resolves the primary's
         # own git dir (a linked-worktree primary has its admin dir apart from it).
         text = permissions.seatbelt_profile(
-            perms, primary_repo=options.task.repo_path, state_dir=options.state_dir,
+            profile_perms, primary_repo=options.task.repo_path, state_dir=options.state_dir,
             allowed_writes=job_writable_paths(report_dir, worktree, codex_home,
                                               options.task.max_attempts, env),
             protect_write_roots=job_write_roots(report_dir, worktree, codex_home),
             job_git_admin=git_layout["GIT_DIR"], job_worktree=worktree,
-            git_common_dir=git_layout["GIT_COMMON_DIR"])
+            git_common_dir=git_layout["GIT_COMMON_DIR"],
+            additional_deny_read=[cloud_home] if cloud_home else (),
+            allow_read_metadata=[cloud_home] if cloud_home else (),
+            allow_read=[cloud_home / "auth.json"] if cloud_home else (),
+            allow_read_subpaths=[helper_scratch] if helper_scratch else (),
+            allow_write=[cloud_home / "auth.json", cloud_home / "tmp",
+                         cloud_home / "tmp" / "arg0-macos"] if cloud_home else (),
+            allow_write_subpaths=[helper_scratch] if helper_scratch else ())
         primary_git_dirs = permissions.resolve_git_dirs(options.task.repo_path)
     except permissions.PermissionsError as error:
         raise PreflightError(f"the permissions deny profile cannot be built: {error}") from None
@@ -2560,7 +2519,7 @@ def setup_deny_wrapper(options: "JobOptions", report: Dict[str, Any],
     profile.write_text(text, encoding="utf-8")
     record.update(mode=perms.mode, profile=str(profile), deny_list_applied=False,
                   profile_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest())
-    wrapper = DenyWrapper(perms, options.task.repo_path, options.state_dir, record, worktree=worktree,
+    wrapper = DenyWrapper(profile_perms, options.task.repo_path, options.state_dir, record, worktree=worktree,
                           git_dirs=(Path(git_layout["GIT_COMMON_DIR"]),
                                     *(Path(path) for path in primary_git_dirs)))
     if not permissions.wrapper_available():
@@ -3024,6 +2983,7 @@ def _execute_read_job(options: JobOptions, report: Dict[str, Any], deadline: Dea
                "thread_id": evidence["thread_id"],
                "unsupported_tools": evidence["unsupported_tools"],
                "terminal_failures": evidence["terminal_failures"],
+               "error_text": typed_worker_error_text(stdout_text),
                "token_counts": evidence["token_counts"],
                "stderr_excerpt": _tail(stderr_text),
                "last_message_excerpt": "", "logs": [str(prompt_path), str(jsonl_path),
@@ -3267,23 +3227,30 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     report["_git_layout"] = git_layout
     report["_git_admin_before"] = git_admin_fingerprint(git_layout, worktree)
 
-    # The job's own Codex home and the model catalog generated for the pinned model. The catalog
+    # The job's own Codex home (local) or native authenticated Codex home (cloud), and the model
+    # catalog generated for the pinned local model. The catalog
     # sits in the report directory, which the worker cannot write, not in its writable Codex home;
     # the hash write_catalog returns is what every launch self-check compares the file against.
-    codex_home = job_codex_home(report_dir)
-    report["codex_home"] = str(codex_home)
     if is_cloud:
-        explicit_home = os.environ.get("CODEX_HOME")
-        source_home = Path(explicit_home).expanduser() if explicit_home else Path.home() / ".codex"
-        session = CloudAuthSession(source_home, codex_home, state_dir, secrets)
-        report["_cloud_auth"] = session
+        source_home = resolve_cloud_codex_home()
+        if (_inside(source_home, task.repo_path) or _inside(task.repo_path, source_home)
+                or _inside(source_home, state_dir) or _inside(state_dir, source_home)):
+            raise BlockedError("cloud CODEX_HOME must not overlap the repository or launcher state")
+        codex_home = source_home
+        auth_observer = CloudAuthObservation(source_home, report_dir, secrets)
+        report["_cloud_auth"] = auth_observer
         report["cloud_auth"] = {
-            "credential_source": "explicit CODEX_HOME" if explicit_home else "default Codex home",
-            "auth_file_copied": True,
-            "home_isolated": True,
-            "real_home_read": bool(source_home == Path.home() / ".codex"),
-            "refresh_writeback": "pending",
+            "credential_source": "native CODEX_HOME",
+            "home_isolated": False,
+            "source_home": str(source_home),
+            "auth_file": str(source_home / "auth.json"),
+            "visible_helper_scratch": str(source_home / "tmp" / "arg0-macos"),
+            "auth_management": "Codex CLI native locking and refresh",
+            "initial_credentials_observed": auth_observer.observe_initial(),
         }
+    else:
+        codex_home = job_codex_home(report_dir)
+    report["codex_home"] = str(codex_home)
     # The roots the wrapper re-opens and rename-protects must exist before the profile is built:
     # a protected path that is missing cannot be created inside the job (xcodebuild's
     # -derivedDataPath, a screenshot capture).
@@ -3965,14 +3932,13 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
         report["failure_reason"] = redact(f"unexpected {error.__class__.__name__}: {error}", secrets)
     finally:
         report.pop("_policy", None)
-        auth_session = report.pop("_cloud_auth", None)
-        if auth_session is not None:
+        auth_observer = report.pop("_cloud_auth", None)
+        if auth_observer is not None:
             try:
-                report.setdefault("cloud_auth", {}).update(auth_session.finish())
-            except Exception as auth_error:  # report the refusal without losing the job result
+                report.setdefault("cloud_auth", {}).update(auth_observer.finish())
+            except Exception as auth_error:  # report scrub status without losing the job result
                 report.setdefault("cloud_auth", {}).update(
-                    auth_file_copied=True, refresh_writeback="refused",
-                    refresh_writeback_reason=auth_error.__class__.__name__)
+                    credential_scrub="unavailable (%s)" % auth_error.__class__.__name__)
         unfinished = report.pop("_active_attempt", None)
         if report.get("worktree") and report.get("primary_fingerprint_before"):
             try:

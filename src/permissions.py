@@ -518,7 +518,13 @@ def _reals(entries: Iterable[str]) -> List[str]:
 def seatbelt_profile(perms: Permissions, *, primary_repo: Path, state_dir: Any = None,
                      allowed_writes: Iterable[Any] = (), protect_write_roots: Iterable[Any] = (),
                      job_git_admin: Any = None, job_worktree: Any = None,
-                     git_common_dir: Any = None) -> str:
+                     git_common_dir: Any = None,
+                     additional_deny_read: Iterable[Any] = (),
+                     allow_read_metadata: Iterable[Any] = (),
+                     allow_read: Iterable[Any] = (),
+                     allow_read_subpaths: Iterable[Any] = (),
+                     allow_write: Iterable[Any] = (),
+                     allow_write_subpaths: Iterable[Any] = ()) -> str:
     """The Seatbelt profile text for ``perms`` (write it as UTF-8).
 
     ``(allow default)`` first, then denials (and the re-openings named below), in the order that
@@ -558,6 +564,11 @@ def seatbelt_profile(perms: Permissions, *, primary_repo: Path, state_dir: Any =
        symlink the launcher would then follow. A guarded root has to exist when the profile is
        used: the launcher creates the native scratch and screenshots directories first.
 
+    The job-specific ``additional_deny_read`` and exception arguments are narrowly scoped
+    reopenings for integrations such as native Codex cloud auth. ``allow_read_metadata`` may name
+    only a directory that is itself denied; it permits metadata on that directory, not reads of
+    files below it. Other read/write exceptions must be strictly below a hidden path.
+
     Without ``state_dir`` there is no state rule (``allowed_writes`` is then unused).
 
     A side effect of 6: a parent of a hidden path that does not exist yet cannot be created
@@ -573,10 +584,34 @@ def seatbelt_profile(perms: Permissions, *, primary_repo: Path, state_dir: Any =
     """
     _validate(perms, "the permissions list")
     lines = ["(version 1)", "(allow default)"]
-    hidden = _reals(perms.deny_read)
+    hidden = _reals([*perms.deny_read,
+                     *[_check_text(str(path), "additional deny-read path")
+                       for path in additional_deny_read]])
+    read_metadata = _reals([_check_text(str(path), "read-metadata exception")
+                            for path in allow_read_metadata])
+    read_files = _reals([_check_text(str(path), "read exception") for path in allow_read])
+    read_subtrees = _reals([_check_text(str(path), "read exception subtree")
+                            for path in allow_read_subpaths])
+    write_files = _reals([_check_text(str(path), "write exception") for path in allow_write])
+    write_subtrees = _reals([_check_text(str(path), "write exception subtree")
+                             for path in allow_write_subpaths])
+    for exception in read_metadata:
+        is_denied_home = any(_same(root, exception) and Path(exception).is_dir() for root in hidden)
+        if not is_denied_home:
+            raise PermissionsError("a read-metadata exception must name a denied directory")
+    for exception in [*read_files, *read_subtrees, *write_files, *write_subtrees]:
+        if not any(_covers(root, exception) and not _same(root, exception) for root in hidden):
+            raise PermissionsError("an exception path must be strictly inside a denied path")
     if hidden:
         # Never emitted empty: ``(deny file-read*)`` without a filter would hide every file.
         lines.append("(deny file-read* " + " ".join(f"(subpath {_quote(path)})" for path in hidden) + ")")
+        if read_metadata:
+            lines.append("(allow file-read-metadata "
+                         + " ".join(f"(literal {_quote(path)})" for path in read_metadata) + ")")
+        if read_files or read_subtrees:
+            filters = ([f"(literal {_quote(path)})" for path in read_files]
+                       + [f"(subpath {_quote(path)})" for path in read_subtrees])
+            lines.append("(allow file-read* " + " ".join(filters) + ")")
     guarded = list(hidden)
     if state_dir is not None:
         state = os.path.realpath(_check_text(str(state_dir), "state directory"))
@@ -629,6 +664,10 @@ def seatbelt_profile(perms: Permissions, *, primary_repo: Path, state_dir: Any =
         lines.append("(deny file-clone "
                      + " ".join(f"(literal {_quote(parent)})" for parent in sorted(parents.values()))
                      + " " + " ".join(f"(subpath {_quote(path)})" for path in hidden) + ")")
+    if write_files or write_subtrees:
+        filters = ([f"(literal {_quote(path)})" for path in write_files]
+                   + [f"(subpath {_quote(path)})" for path in write_subtrees])
+        lines.append("(allow file-write* " + " ".join(filters) + ")")
     lines.extend(_rename_protection(guarded))
     return "\n".join(lines) + "\n"
 

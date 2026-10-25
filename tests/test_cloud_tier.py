@@ -32,11 +32,15 @@ class CloudTierTests(unittest.TestCase):
 
     def test_cloud_job_uses_the_same_pipeline_and_links_its_origin(self):
         fake = sp.FakeRun(worker_edit=sp.fix_add)
+        fake.worker_stderr = "synthetic-access-token-1234 synthetic-refresh-token-1234 " \
+                             "synthetic-refresh-token-refreshed"
         refreshed = json.dumps({"auth_mode": "chatgpt", "tokens": {
             "access_token": "synthetic-access-token-refreshed",
             "refresh_token": "synthetic-refresh-token-refreshed",
             "id_token": "synthetic.id.token.refreshed", "account_id": "fixture-account"}})
         fake.auth_refresh = refreshed
+        source_home = Path(self.root) / "synthetic-codex-home"
+        original_auth = self.write_synthetic_auth(source_home).read_bytes()
         report, fake = sp.run_clean_job(self.root, self.repo, fake_run=fake,
             tier={"cloud": "gpt-6-luna", "reasoning_effort": "low"}, escalates="J1")
         argv = fake.calls_of("exec")[0]["argv"]
@@ -49,14 +53,26 @@ class CloudTierTests(unittest.TestCase):
         self.assertIn('model_reasoning_effort="low"', argv)
         self.assertEqual(report["escalates"], "J1")
         self.assertEqual(report["tier"], "cloud")
-        self.assertFalse(report["cloud_auth"]["real_home_read"])
-        self.assertEqual(report["cloud_auth"]["refresh_writeback"], "updated")
-        source_auth = json.loads((Path(self.root) / "synthetic-codex-home" / "auth.json").read_text())
-        self.assertEqual(source_auth["tokens"]["refresh_token"],
-                         "synthetic-refresh-token-refreshed")
+        self.assertEqual(fake.calls_of("exec")[0]["env"]["CODEX_HOME"], str(source_home))
+        self.assertEqual(report["cloud_auth"]["source_home"], str(source_home))
+        self.assertEqual(report["cloud_auth"]["credential_scrub"], "observed after Codex exit")
+        source_bytes = (source_home / "auth.json").read_bytes()
+        self.assertEqual(source_bytes, refreshed.encode("utf-8"))
+        self.assertNotEqual(source_bytes, original_auth)
+        profile = (Path(report["report_dir"]) / "permissions.sb").read_text()
+        source_real = source_home.resolve()
+        self.assertIn(f'(subpath "{source_real}")', profile)
+        self.assertIn(f'(allow file-read* (literal "{source_real}/auth.json") '
+                      f'(subpath "{source_real}/tmp/arg0-macos"))', profile)
+        self.assertIn(f'(allow file-write* (literal "{source_real}/auth.json")', profile)
+        self.assertNotIn(f'(allow file-read* (subpath "{source_real}")', profile)
         saved_report = (Path(report["report_dir"]) / "report.json").read_text()
         self.assertNotIn("synthetic-access-token", saved_report)
         self.assertNotIn("synthetic-refresh-token", saved_report)
+        stderr_log = (Path(report["report_dir"]) / "worker-attempt-1.stderr.log").read_text()
+        self.assertNotIn("synthetic-access-token-1234", stderr_log)
+        self.assertNotIn("synthetic-refresh-token-1234", stderr_log)
+        self.assertNotIn("synthetic-refresh-token-refreshed", stderr_log)
         self.assertIn("tests", report)
         self.assertIn("violations", report)
 
@@ -76,90 +92,24 @@ class CloudTierTests(unittest.TestCase):
             "id_token": "synthetic.id.token", "account_id": "fixture-account"}}))
         return path
 
-    def test_auth_home_copies_only_auth_and_redacts_credential_values(self):
-        source = Path(self.root) / "auth-source"
-        source_file = self.write_synthetic_auth(source)
-        report_dir = Path(self.root) / "report"
-        job = report_dir / "codex-home"
-        report_dir.mkdir(mode=0o700)
-        job.mkdir(mode=0o700)
-        secrets = []
-        session = lw.CloudAuthSession(source, job, Path(self.root) / "state", secrets)
-        self.assertEqual(sorted(path.name for path in job.iterdir()), ["auth.json"])
-        self.assertEqual((job / "auth.json").stat().st_mode & 0o777, 0o600)
-        self.assertIn("synthetic-access-token-1234", secrets)
-        self.assertEqual(session.finish()["refresh_writeback"], "unchanged")
-        self.assertTrue(source_file.exists())
+    def test_cloud_home_is_preserved_when_codex_does_not_refresh(self):
+        source_home = Path(self.root) / "synthetic-codex-home"
+        auth_path = self.write_synthetic_auth(source_home)
+        original = auth_path.read_bytes()
+        report, fake = sp.run_clean_job(self.root, self.repo, fake_run=sp.FakeRun(
+            worker_edit=sp.fix_add), tier={"cloud": "gpt-6-luna", "reasoning_effort": "low"})
+        self.assertEqual(fake.calls_of("exec")[0]["env"]["CODEX_HOME"], str(source_home))
+        self.assertEqual(auth_path.read_bytes(), original)
+        self.assertFalse((Path(report["report_dir"]) / "codex-home").exists())
 
-    def test_refreshed_auth_is_written_back_only_when_source_is_unchanged(self):
-        source = Path(self.root) / "auth-source"
-        source_file = self.write_synthetic_auth(source)
-        report_dir = Path(self.root) / "report"
-        job = report_dir / "codex-home"
-        report_dir.mkdir(mode=0o700)
-        job.mkdir(mode=0o700)
-        session = lw.CloudAuthSession(source, job, Path(self.root) / "state", [])
-        refreshed = json.dumps({"auth_mode": "chatgpt", "tokens": {
-            "access_token": "synthetic-new-access-token",
-            "refresh_token": "synthetic-new-refresh-token"}})
-        (job / "auth.json").write_text(refreshed)
-        evidence = report_dir / "worker-attempt-1.jsonl"
-        evidence.write_text('refreshed synthetic-new-access-token synthetic-new-refresh-token')
-        result = session.finish()
-        self.assertEqual(result["refresh_writeback"], "updated")
-        self.assertEqual(result["retained_artifacts_scrubbed"], 1)
-        self.assertNotIn("synthetic-new-access-token", evidence.read_text())
-        self.assertNotIn("synthetic-new-refresh-token", evidence.read_text())
-        self.assertEqual(json.loads(source_file.read_text())["tokens"]["refresh_token"],
-                         "synthetic-new-refresh-token")
-
-        report_dir2 = Path(self.root) / "report-2"
-        job2 = report_dir2 / "codex-home"
-        report_dir2.mkdir(mode=0o700)
-        job2.mkdir(mode=0o700)
-        session2 = lw.CloudAuthSession(source, job2, Path(self.root) / "state", [])
-        source_file.write_text(json.dumps({"tokens": {"refresh_token": "external-change"}}))
-        (job2 / "auth.json").write_text(json.dumps({"tokens": {"refresh_token": "stale-refresh"}}))
-        self.assertEqual(session2.finish()["refresh_writeback"], "concurrent-change-refused")
-        self.assertEqual(json.loads(source_file.read_text())["tokens"]["refresh_token"],
-                         "external-change")
-
-    def test_active_job_lock_refuses_a_concurrent_cloud_auth_copy(self):
-        source = Path(self.root) / "auth-source"
-        self.write_synthetic_auth(source)
-        job1 = Path(self.root) / "report-1" / "codex-home"
-        job2 = Path(self.root) / "report-2" / "codex-home"
-        job1.parent.mkdir(mode=0o700)
-        job2.parent.mkdir(mode=0o700)
-        job1.mkdir(mode=0o700)
-        job2.mkdir(mode=0o700)
-        session = lw.CloudAuthSession(source, job1, Path(self.root) / "state", [])
-        with self.assertRaises(lw.BlockedError):
-            lw.CloudAuthSession(source, job2, Path(self.root) / "state", [])
-        session.finish()
-
-    def test_symlinked_source_or_destination_auth_file_is_refused(self):
+    def test_cloud_home_selector_rejects_symlinked_auth(self):
         source = Path(self.root) / "auth-source"
         source.mkdir()
         target = Path(self.root) / "target-auth.json"
         target.write_text('{"tokens": {"access_token": "synthetic-token"}}')
         (source / "auth.json").symlink_to(target)
-        report_dir = Path(self.root) / "report"
-        job = report_dir / "codex-home"
-        report_dir.mkdir(mode=0o700)
-        job.mkdir(mode=0o700)
         with self.assertRaises(lw.BlockedError):
-            lw.CloudAuthSession(source, job, Path(self.root) / "state", [])
-
-        source2 = Path(self.root) / "auth-source-2"
-        self.write_synthetic_auth(source2)
-        report_dir2 = Path(self.root) / "report-2"
-        job2 = report_dir2 / "codex-home"
-        report_dir2.mkdir(mode=0o700)
-        job2.mkdir(mode=0o700)
-        (job2 / "auth.json").symlink_to(target)
-        with self.assertRaises(lw.BlockedError):
-            lw.CloudAuthSession(source2, job2, Path(self.root) / "state", [])
+            lw.resolve_cloud_codex_home({"CODEX_HOME": str(source)})
 
     def test_cloud_model_listing_uses_the_live_codex_catalog(self):
         output = io.StringIO()

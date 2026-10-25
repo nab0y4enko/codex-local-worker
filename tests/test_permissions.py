@@ -315,6 +315,41 @@ class Profile(PermissionsCase):
         self.assertEqual(read_rule.count(f'(subpath "{real(target)}")'), 1)
         self.assertNotIn(str(self.root / "link"), text.replace(real(target), ""))
 
+    def test_cloud_codex_home_exceptions_are_limited_to_auth_and_observed_helper_scratch(self):
+        home = self.root / "synthetic-codex-home"
+        home.mkdir()
+        auth = home / "auth.json"
+        auth.write_text('{"synthetic":"auth"}')
+        scratch = home / "tmp" / "arg0-macos"
+        text = permissions.seatbelt_profile(
+            self.perms, primary_repo=self.repo, additional_deny_read=[home],
+            allow_read_metadata=[home],
+            allow_read=[auth], allow_read_subpaths=[scratch],
+            allow_write=[auth, home / "tmp", scratch], allow_write_subpaths=[scratch])
+        self.assertIn(f'(subpath "{real(home)}")', text)
+        self.assertIn(f'(allow file-read-metadata (literal "{real(home)}"))', text)
+        self.assertIn(f'(allow file-read* (literal "{real(auth)}") '
+                      f'(subpath "{real(scratch)}"))', text)
+        self.assertIn(f'(allow file-write* (literal "{real(auth)}") '
+                      f'(literal "{real(home / "tmp")}") '
+                      f'(literal "{real(scratch)}") (subpath "{real(scratch)}"))', text)
+        self.assertNotIn(f'(allow file-read* (subpath "{real(home)}")', text)
+        self.assertNotIn(f'(allow file-read* (literal "{real(home / "config.toml")}")', text)
+
+    def test_profile_refuses_an_exception_outside_a_denied_home(self):
+        home = self.root / "synthetic-codex-home"
+        home.mkdir()
+        with self.assertRaises(permissions.PermissionsError):
+            permissions.seatbelt_profile(self.perms, primary_repo=self.repo,
+                additional_deny_read=[home], allow_read=[self.root / "outside-auth.json"])
+
+    def test_profile_refuses_metadata_access_for_a_non_denied_directory(self):
+        home = self.root / "synthetic-codex-home"
+        home.mkdir()
+        with self.assertRaises(permissions.PermissionsError):
+            permissions.seatbelt_profile(self.perms, primary_repo=self.repo,
+                additional_deny_read=[home], allow_read_metadata=[self.root])
+
     def test_a_tilde_entry_is_expanded_from_the_current_home(self):
         with mock.patch.dict(os.environ, {"HOME": str(self.root)}):
             text = permissions.seatbelt_profile(
@@ -1131,6 +1166,43 @@ class RealWrapper(PermissionsCase):
         self.assertNotEqual(read.returncode, 0)
         self.assertNotEqual(write.returncode, 0)
         self.assertFalse((self.repo / "x").exists())
+
+    def test_cloud_home_profile_reads_auth_and_helper_scratch_but_hides_other_files(self):
+        home = self.root / "synthetic-codex-home"
+        home.mkdir()
+        auth = home / "auth.json"
+        auth.write_text('{"token":"synthetic-only"}')
+        secret = home / "config.toml"
+        secret.write_text("synthetic user config")
+        history = home / "sessions" / "session.jsonl"
+        history.parent.mkdir()
+        history.write_text("synthetic session history")
+        scratch = home / "tmp" / "arg0-macos"
+        profile = self.root / "cloud-home.sb"
+        profile.write_text(permissions.seatbelt_profile(
+            self.perms, primary_repo=self.repo, additional_deny_read=[home],
+            allow_read_metadata=[home],
+            allow_read=[auth], allow_read_subpaths=[scratch],
+            allow_write=[auth, home / "tmp", scratch], allow_write_subpaths=[scratch]),
+            encoding="utf-8")
+        auth_read = self.sandboxed(profile, ["/bin/cat", str(auth)])
+        config_read = self.sandboxed(profile, ["/bin/cat", str(secret)])
+        history_read = self.sandboxed(profile, ["/bin/cat", str(history)])
+        directory_list = self.sandboxed(profile, ["/bin/ls", "-la", str(home)])
+        scratch_parent = self.sandboxed(profile, ["/bin/mkdir", str(home / "tmp")])
+        scratch_create = self.sandboxed(profile, ["/bin/mkdir", str(scratch)])
+        scratch_write = self.sandboxed(profile, ["/bin/sh", "-c", 'echo helper > "$1"',
+                                                "sh", str(scratch / "apply_patch")])
+        scratch_read = self.sandboxed(profile, ["/bin/cat", str(scratch / "apply_patch")])
+        self.assertEqual(auth_read.returncode, 0, auth_read.stderr)
+        self.assertEqual(auth_read.stdout, b'{"token":"synthetic-only"}')
+        self.assertNotEqual(config_read.returncode, 0)
+        self.assertNotEqual(history_read.returncode, 0)
+        self.assertNotEqual(directory_list.returncode, 0)
+        self.assertEqual(scratch_parent.returncode, 0, scratch_parent.stderr)
+        self.assertEqual(scratch_create.returncode, 0, scratch_create.stderr)
+        self.assertEqual(scratch_write.returncode, 0, scratch_write.stderr)
+        self.assertEqual(scratch_read.stdout.strip(), b"helper")
 
     def test_the_denial_text_is_what_find_denials_reads(self):
         secret = self.root / "secret.txt"
