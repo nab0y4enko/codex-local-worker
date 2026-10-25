@@ -246,13 +246,31 @@ class McpEchoFixture(unittest.TestCase):
             return answer
 
     def start(self, env):
-        return subprocess.Popen([sys.executable, str(FIXTURE)], stdin=subprocess.PIPE,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        process = subprocess.Popen([sys.executable, str(FIXTURE)], stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        self.addCleanup(self.cleanup_process, process)
+        return process
+
+    @staticmethod
+    def cleanup_process(process):
+        if process.poll() is None:
+            if process.stdin and not process.stdin.closed:
+                process.stdin.close()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream and not stream.closed:
+                stream.close()
 
     def test_initialize_list_and_call_the_echo_tool(self):
         process = self.start({"TASK_TOOL_TOKEN": TOKEN, "PATH": os.environ.get("PATH", "/usr/bin")})
-        self.addCleanup(lambda: [stream.close() for stream in
-                                 (process.stdin, process.stdout, process.stderr)])
         first = self.exchange(process, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
                                        "params": {"protocolVersion": "2024-11-05",
                                                   "capabilities": {}}})
