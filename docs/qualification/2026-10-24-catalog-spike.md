@@ -411,3 +411,24 @@ The same job's profile was then exercised directly
 `find_denials` over the output of `mv <root>/repo/add.py <root>/repo/b.py` and
 `mv <state> <root>/x` under that profile returned exactly `<root>/repo/add.py`,
 `<root>/repo/b.py` and `<state>` (all `write`).
+
+### Wrapper smoke, fix round 1
+
+Re-run after the round-1 hardening (git-redirect protection, `deny_write` vectors, git-layout
+pinning in the audit), same commands, fresh pilot and state:
+
+| Status | Tests | Worker s | Job wall s | Tokens | `permissions` |
+| --- | --- | ---: | ---: | --- | --- |
+| ok, exit 0 | 1 passed, `deny_list_applied: true` | 23.1 | 24.6 | 17,250 / 15,393 / 569 | `deny_list_applied: true`, `reason: null`, `denials: []`, profile sha256 `fed25580…` |
+
+Model `Qwen3.5-9B-OptiQ-4bit`, launcher catalog `870e20c8…`; `primary_changed_during_job: false`,
+`git_admin_tampered` absent. The same job's profile was then exercised directly:
+
+| Command under the job's profile | Result |
+| --- | --- |
+| `echo gitdir:… > <worktree>/.git` (repoint the gitfile) | `Operation not permitted` |
+| `echo … > <admin>/commondir`, `<admin>/config.worktree` | `Operation not permitted` |
+| `echo x > <admin>/index.probe` (admin index, needed by commit) | allowed |
+| `echo x > <repo>/.git/refs/tags/evil` | `Operation not permitted` |
+| `echo evil >> ~/.zshrc`, `echo evil >> ~/.gitconfig` | `Operation not permitted` |
+| `git add` + `git commit` in the job worktree | rc 0, new commit created |

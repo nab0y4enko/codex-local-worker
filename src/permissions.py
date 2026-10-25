@@ -7,11 +7,15 @@ the user's primary checkout (spec §6.2, §6.14):
 
 * ``deny_read`` paths cannot be read at all (``file-read*``: contents and metadata);
 * with ``protect_primary_checkout`` the primary checkout's files, ``.git/HEAD``, ``.git/index``,
-  ``.git/packed-refs``, ``.git/config`` and ``.git/refs/heads`` cannot be written, and nothing
-  that would later run when the user uses git there can be planted (``.git/hooks``, ``.git/info``,
-  ``.git/modules``, ``.git/objects/info/alternates``), while the rest of ``.git`` (shared objects,
-  the linked worktrees' own metadata) stays writable, so a worker can still commit inside its
-  worktree;
+  ``.git/packed-refs``, ``.git/config`` and the whole ``.git/refs``, ``.git/logs`` and
+  ``.git/worktrees`` subtrees cannot be written, and nothing that would later run when the user
+  uses git there can be planted (``.git/hooks``, ``.git/info``, ``.git/modules``,
+  ``.git/objects/info/alternates``); the job's own linked-worktree admin dir is re-opened for its
+  commit, but its ``commondir``/``gitdir``/``config.worktree`` and the worktree's ``.git`` gitfile
+  stay denied so they cannot repoint the launcher's own git;
+* ``deny_write`` paths (persistence vectors: ``~/.gitconfig``, shell rc files,
+  ``~/Library/LaunchAgents`` by default) cannot be written, so nothing planted there runs the
+  next time the user opens a shell or runs git;
 * given the launcher's state directory, nothing in it can be written except the job's own paths
   (its worktree, its Codex home, its last-message files, its scratch), so a worker cannot rewrite
   this list, the profile it runs under, reports, leases, locks or another job's worktree.
@@ -48,11 +52,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 __all__ = [
-    "DEFAULT_DENY_READ", "LOG_FILE", "MODE_FULL_HOST", "PERMISSIONS_FILE", "SANDBOX_EXEC",
-    "SCHEMA_VERSION", "Permissions", "PermissionsError", "add_deny_read", "check_conflicts",
-    "default_permissions", "describe", "find_denials", "load_permissions", "normalize_entry",
-    "permissions_payload", "record_change", "remove_deny_read", "save_permissions",
-    "seatbelt_profile", "wrap_argv", "wrapper_available",
+    "DEFAULT_DENY_READ", "DEFAULT_DENY_WRITE", "LOG_FILE", "MODE_FULL_HOST", "PERMISSIONS_FILE",
+    "SANDBOX_EXEC", "SCHEMA_VERSION", "Permissions", "PermissionsError", "add_deny_read",
+    "add_deny_write", "check_conflicts", "default_permissions", "describe", "find_denials",
+    "load_permissions", "normalize_entry", "permissions_payload", "record_change",
+    "remove_deny_read", "remove_deny_write", "save_permissions", "seatbelt_profile", "wrap_argv",
+    "wrapper_available",
 ]
 
 PERMISSIONS_FILE = "permissions.json"
@@ -70,9 +75,22 @@ DEFAULT_DENY_READ = (
     "~/Library/Safari", "~/Library/Group Containers/2BUA8C4S2C.com.1password",
 )
 
+# Persistence vectors a worker must not write even though they live outside the primary checkout:
+# a planted entry here runs, unwrapped, the next time the user runs git or opens a shell (R19).
+# User-editable: ``deny-write``/``allow-write`` change this list. A file missing the key keeps
+# these defaults, so a file written before the key existed stays valid and still protected.
+DEFAULT_DENY_WRITE = (
+    "~/.gitconfig", "~/.config/git", "~/.zshrc", "~/.zprofile", "~/.zshenv", "~/.zlogin",
+    "~/.bashrc", "~/.bash_profile", "~/.profile", "~/Library/LaunchAgents",
+)
+
 # The files of the primary checkout's .git a worker must not write: moving HEAD or a branch,
 # rewriting the index, the packed refs or the repository config would change the user's checkout.
 GIT_PROTECTED_FILES = ("HEAD", "index", "packed-refs", "config")
+# Whole subtrees of the primary ``.git`` kept read-only: every ref (so no branch, tag, remote or
+# stash ref can be moved or created), the shared reflogs, and the linked-worktree admin area
+# (``worktrees/``) — the job's own admin dir is re-opened separately so its commit still works.
+GIT_PROTECTED_SUBTREES = ("refs", "logs", "worktrees")
 # What in that .git would run, or be trusted, the next time the user runs git in the checkout,
 # outside any wrapper: hooks, info/ (attributes, exclude), the submodule repositories under
 # modules/ (each with its own hooks and config) and an alternates file pointing the object store
@@ -80,9 +98,17 @@ GIT_PROTECTED_FILES = ("HEAD", "index", "packed-refs", "config")
 # .git/worktrees/<name>, so shutting these does not stop a worker committing in its worktree.
 GIT_PLANTING_DIRS = ("hooks", "info", "modules")
 GIT_PLANTING_FILES = (os.path.join("objects", "info", "alternates"),)
+# The admin files of a linked worktree that redirect where its git dir, common dir or config
+# come from. Writable they would point the launcher's own (unwrapped) git at a directory the
+# worker controls; the rest of the admin dir (index, HEAD, logs, ORIG_HEAD, …) stays writable so
+# a commit in the worktree still works.
+GIT_ADMIN_REDIRECTS = ("commondir", "gitdir", "config.worktree")
 
-_KEYS = ("schema_version", "mode", "deny_read", "protect_primary_checkout", "writable_roots",
-         "network")
+_KEYS = ("schema_version", "mode", "deny_read", "deny_write", "protect_primary_checkout",
+         "writable_roots", "network")
+# Keys a file may omit and still be valid; the loader fills each from the defaults. ``deny_write``
+# is new (R19), so a file written before it existed keeps the default persistence-vector list.
+_OPTIONAL_KEYS = ("deny_write",)
 _NETWORK_KEYS = ("allowed_domains",)
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -96,6 +122,8 @@ class Permissions:
     mode: str
     deny_read: List[str]
     protect_primary_checkout: bool
+    # Paths a worker must not write even outside the primary checkout (persistence vectors, R19).
+    deny_write: List[str] = field(default_factory=lambda: list(DEFAULT_DENY_WRITE))
     # Reserved for the sandboxed mode: stored and shown, not applied.
     writable_roots: List[str] = field(default_factory=list)
     allowed_domains: List[str] = field(default_factory=list)
@@ -104,7 +132,8 @@ class Permissions:
 def default_permissions() -> Permissions:
     """A fresh copy of the defaults: full host access, the secrets list, primary checkout safe."""
     return Permissions(mode=MODE_FULL_HOST, deny_read=list(DEFAULT_DENY_READ),
-                       protect_primary_checkout=True, writable_roots=[], allowed_domains=[])
+                       protect_primary_checkout=True, deny_write=list(DEFAULT_DENY_WRITE),
+                       writable_roots=[], allowed_domains=[])
 
 
 # --------------------------------------------------------------------------- validation
@@ -129,11 +158,11 @@ def _check_text(value: Any, what: str) -> str:
     return value
 
 
-def _expand(entry: str) -> str:
+def _expand(entry: str, label: str = "deny_read entry") -> str:
     """``~`` expanded; the result must be absolute, so a relative entry never means "the cwd"."""
-    expanded = os.path.expanduser(_check_text(entry, "deny_read entry"))
+    expanded = os.path.expanduser(_check_text(entry, label))
     if not os.path.isabs(expanded):
-        raise PermissionsError(f"deny_read entry {entry!r} must be an absolute path or start "
+        raise PermissionsError(f"{label} {entry!r} must be an absolute path or start "
                                f"with ~ (and the ~ must resolve)")
     return expanded
 
@@ -188,13 +217,15 @@ def _validate(perms: Permissions, source: str) -> None:
         raise PermissionsError(
             f"{source}: mode {perms.mode!r} is not available: only {MODE_FULL_HOST!r} is built, "
             f"sandboxed mode is reserved")
-    if not isinstance(perms.deny_read, list):
-        raise PermissionsError(f"{source}: deny_read must be a list of paths")
-    for entry in perms.deny_read:
-        try:
-            _expand(entry)
-        except PermissionsError as error:
-            raise PermissionsError(f"{source}: {error}") from None
+    for attribute, label in (("deny_read", "deny_read entry"), ("deny_write", "deny_write entry")):
+        entries = getattr(perms, attribute)
+        if not isinstance(entries, list):
+            raise PermissionsError(f"{source}: {attribute} must be a list of paths")
+        for entry in entries:
+            try:
+                _expand(entry, label)
+            except PermissionsError as error:
+                raise PermissionsError(f"{source}: {error}") from None
     if not isinstance(perms.protect_primary_checkout, bool):
         raise PermissionsError(f"{source}: protect_primary_checkout must be true or false, got "
                                f"{perms.protect_primary_checkout!r}")
@@ -212,6 +243,7 @@ def permissions_payload(perms: Permissions) -> Dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "mode": perms.mode,
         "deny_read": list(perms.deny_read),
+        "deny_write": list(perms.deny_write),
         "protect_primary_checkout": perms.protect_primary_checkout,
         "writable_roots": list(perms.writable_roots),
         "network": {"allowed_domains": list(perms.allowed_domains)},
@@ -237,7 +269,7 @@ def _parse(raw: bytes, source: str) -> Permissions:
     unknown = sorted(set(payload) - set(_KEYS))
     if unknown:
         raise PermissionsError(f"{source} has unknown key(s): {', '.join(unknown)}")
-    missing = [key for key in _KEYS if key not in payload]
+    missing = [key for key in _KEYS if key not in payload and key not in _OPTIONAL_KEYS]
     if missing:
         raise PermissionsError(f"{source} is missing key(s): {', '.join(missing)}")
     version = payload["schema_version"]
@@ -254,6 +286,7 @@ def _parse(raw: bytes, source: str) -> Permissions:
         raise PermissionsError(f"{source}: network is missing allowed_domains")
     perms = Permissions(mode=payload["mode"], deny_read=payload["deny_read"],
                         protect_primary_checkout=payload["protect_primary_checkout"],
+                        deny_write=payload.get("deny_write", list(DEFAULT_DENY_WRITE)),
                         writable_roots=payload["writable_roots"],
                         allowed_domains=network["allowed_domains"])
     _validate(perms, source)
@@ -418,12 +451,23 @@ def _inside_state(state: str, allowed_writes: Iterable[Any]) -> List[str]:
     return inside
 
 
+def _reals(entries: Iterable[str]) -> List[str]:
+    """Real paths of ``entries`` (expanding ``~``), deduplicated by fold, order preserved."""
+    out: List[str] = []
+    for entry in entries:
+        real = _real(entry)
+        if not any(_same(real, seen) for seen in out):
+            out.append(real)
+    return out
+
+
 def seatbelt_profile(perms: Permissions, *, primary_repo: Path, state_dir: Any = None,
-                     allowed_writes: Iterable[Any] = ()) -> str:
+                     allowed_writes: Iterable[Any] = (), protect_write_roots: Iterable[Any] = (),
+                     job_git_admin: Any = None, job_worktree: Any = None) -> str:
     """The Seatbelt profile text for ``perms`` (write it as UTF-8).
 
-    ``(allow default)`` first, then denials (and the two re-openings named below), in the order
-    that makes Seatbelt's last-match rule do the right thing:
+    ``(allow default)`` first, then denials (and the re-openings named below), in the order that
+    makes Seatbelt's last-match rule do the right thing:
 
     1. the read denials;
     2. with a ``state_dir`` (the launcher's state: this list, its log, reports, ledger, leases,
@@ -432,40 +476,44 @@ def seatbelt_profile(perms: Permissions, *, primary_repo: Path, state_dir: Any =
        last-message files, scratch). This comes before the rules below, so a job path can never
        re-open the primary checkout or a hidden path;
     3. the primary checkout is made read-only as a whole, its ``.git`` is re-opened for writing,
-       and the four files and the branch directory that would move the user's HEAD, branches,
-       index or config are closed again (a linked worktree keeps its own index and HEAD under
-       ``.git/worktrees/<name>``, which stay writable); then ``.git/hooks``, ``.git/info``,
-       ``.git/modules`` and ``.git/objects/info/alternates`` are closed, so nothing can be planted
-       that would run, unwrapped, the next time the user runs git in the checkout;
-    4. everything hidden is also write-denied, so a secret cannot be rewritten or replaced, and
+       then closed again around: the four files that move HEAD/index/packed-refs/config; the
+       whole ``refs``, ``logs`` and ``worktrees`` subtrees (no ref created or moved, no linked
+       worktree's admin touched); ``hooks``/``info``/``modules`` and ``objects/info/alternates``
+       (nothing planted that would run, unwrapped, the next time the user runs git). When the
+       job's own linked worktree is known, its admin dir under ``worktrees/<name>`` is re-opened
+       (so its commit still writes index/HEAD/logs) but its ``commondir``, ``gitdir`` and
+       ``config.worktree`` stay denied, and the worktree's ``.git`` gitfile is denied — otherwise
+       a worker could repoint the launcher's own (unwrapped) ``read-tree``/``add``/``diff`` at a
+       git directory it controls, whose config/attributes then run arbitrary filters;
+    4. the ``deny_write`` persistence vectors (``~/.gitconfig``, shell rc files,
+       ``~/Library/LaunchAgents`` by default) are write-denied;
+    5. everything hidden is also write-denied, so a secret cannot be rewritten or replaced, and
        cannot be cloned: ``clonefile(2)`` of a directory checks only that directory, so every
        parent of a hidden path is clone-denied too;
-    5. every hidden path, the checkout, ``.git`` and ``.git/refs``, the state directory, its
-       ``permissions.json`` and ``permissions.log`` (and every parent of those, up to ``/``) are
-       guarded against being renamed away, because a denial on a path is void once the path has
-       moved (``_rename_protection``). Their *contents* stay as writable as they were, except
-       where an earlier rule says otherwise.
+    6. every hidden path, the checkout, its ``.git`` subtrees and admin redirects, the deny_write
+       paths, the state directory, its ``permissions.json``/``permissions.log``, and the re-opened
+       job roots (``protect_write_roots``: the worktree, Codex home, scratch) -- and every parent
+       of each, up to ``/`` -- are guarded against being renamed, replaced or deleted
+       (``_rename_protection``). Their *contents* stay as writable as they were, except where an
+       earlier rule says otherwise, so the re-opened roots cannot be swapped for a symlink the
+       launcher would then follow.
 
     Without ``state_dir`` there is no state rule (``allowed_writes`` is then unused).
 
-    A side effect of 5: a parent of a hidden path that does not exist yet cannot be created
+    A side effect of 6: a parent of a hidden path that does not exist yet cannot be created
     inside a job, because the guard denies writing that exact path. With ``~/.docker`` absent,
     for example (``~/.docker/config.json`` is hidden by default), ``mkdir ~/.docker`` and so
     ``docker login`` fail under the wrapper; create the directory outside a job, or lift the
     entry with ``allow-read``.
 
     Not covered: a primary checkout that uses the reftable ref backend (``.git/reftable/``)
-    keeps its branches outside ``.git/refs/heads`` and ``packed-refs``, and one whose ``.git`` is
+    keeps its branches outside ``.git/refs`` and ``packed-refs``, and one whose ``.git`` is
     a gitfile (a linked worktree or submodule used as the primary) keeps its HEAD, index and refs
     elsewhere; branch protection assumes a plain ``.git`` directory with files-backend refs.
     """
     _validate(perms, "the permissions list")
     lines = ["(version 1)", "(allow default)"]
-    hidden: List[str] = []
-    for entry in perms.deny_read:
-        real = _real(entry)
-        if not any(_same(real, seen) for seen in hidden):
-            hidden.append(real)
+    hidden = _reals(perms.deny_read)
     if hidden:
         # Never emitted empty: ``(deny file-read*)`` without a filter would hide every file.
         lines.append("(deny file-read* " + " ".join(f"(subpath {_quote(path)})" for path in hidden) + ")")
@@ -477,18 +525,39 @@ def seatbelt_profile(perms: Permissions, *, primary_repo: Path, state_dir: Any =
         if reopened:
             lines.append("(allow file-write* " + " ".join(f"(subpath {_quote(path)})" for path in reopened) + ")")
         guarded += [state, os.path.join(state, PERMISSIONS_FILE), os.path.join(state, LOG_FILE)]
+    for root in protect_write_roots:
+        real = os.path.realpath(_check_text(str(root), "write-protected job root"))
+        if not any(_same(real, seen) for seen in guarded):
+            guarded.append(real)
     if perms.protect_primary_checkout:
         repo = os.path.realpath(str(primary_repo))
         git_dir = os.path.join(repo, ".git")
-        protected = [f"(literal {_quote(os.path.join(git_dir, name))})" for name in GIT_PROTECTED_FILES]
-        protected.append(f"(subpath {_quote(os.path.join(git_dir, 'refs', 'heads'))})")
-        planting = [f"(subpath {_quote(os.path.join(git_dir, name))})" for name in GIT_PLANTING_DIRS]
-        planting += [f"(literal {_quote(os.path.join(git_dir, name))})" for name in GIT_PLANTING_FILES]
+        closed = [f"(literal {_quote(os.path.join(git_dir, name))})" for name in GIT_PROTECTED_FILES]
+        closed += [f"(subpath {_quote(os.path.join(git_dir, name))})" for name in GIT_PROTECTED_SUBTREES]
+        closed += [f"(subpath {_quote(os.path.join(git_dir, name))})" for name in GIT_PLANTING_DIRS]
+        closed += [f"(literal {_quote(os.path.join(git_dir, name))})" for name in GIT_PLANTING_FILES]
         lines.append(f"(deny file-write* (subpath {_quote(repo)}))")
         lines.append(f"(allow file-write* (subpath {_quote(git_dir)}))")
-        lines.append("(deny file-write* " + " ".join(protected) + ")")
-        lines.append("(deny file-write* " + " ".join(planting) + ")")
-        guarded += [repo, git_dir, os.path.join(git_dir, "refs")]
+        lines.append("(deny file-write* " + " ".join(closed) + ")")
+        guarded += [repo, git_dir]
+        guarded += [os.path.join(git_dir, name) for name in GIT_PROTECTED_SUBTREES]
+        if job_git_admin is not None:
+            admin = os.path.realpath(str(job_git_admin))
+            # The job's own linked-worktree admin dir is re-opened (its commit needs index/HEAD/
+            # logs) but the files that redirect where git reads its dir/common-dir/config from
+            # stay denied, and cannot be renamed away.
+            redirects = [os.path.join(admin, name) for name in GIT_ADMIN_REDIRECTS]
+            lines.append(f"(allow file-write* (subpath {_quote(admin)}))")
+            lines.append("(deny file-write* " + " ".join(f"(literal {_quote(path)})" for path in redirects) + ")")
+            guarded += [admin, *redirects]
+        if job_worktree is not None:
+            gitfile = os.path.join(os.path.realpath(str(job_worktree)), ".git")
+            lines.append(f"(deny file-write* (literal {_quote(gitfile)}))")
+            guarded.append(gitfile)
+    denied_writes = _reals(perms.deny_write)
+    if denied_writes:
+        lines.append("(deny file-write* " + " ".join(f"(subpath {_quote(path)})" for path in denied_writes) + ")")
+        guarded += denied_writes
     if hidden:
         lines.append("(deny file-write* " + " ".join(f"(subpath {_quote(path)})" for path in hidden) + ")")
         parents: Dict[str, str] = {}
@@ -638,43 +707,76 @@ def _mentions(line: str, folded: str, origin: Sequence[int],
 
 
 def find_denials(text: str, perms: Permissions, primary_repo: Path, *,
-                 state_dir: Any = None) -> List[Dict[str, str]]:
+                 state_dir: Any = None, worktree: Any = None) -> List[Dict[str, str]]:
     """The wrapper denials visible in ``text``: ``{"path", "kind"}`` in order of appearance.
 
     A line saying ``Operation not permitted`` that names a denied-read entry (or a path under
-    one) is a ``"read"`` denial, and one naming the primary checkout (or a path under it) is a
-    ``"write"`` denial when it is protected; so is one naming the launcher's ``state_dir`` when
-    it is given (the profile shuts it whatever the list says). A path that is both (a hidden
-    file inside the checkout) is reported once, as a read. ``path`` is the path as the line
-    spells it, real or ``~``-expanded, whole even when it contains spaces, and without the words
-    of the message around it (``mv: rename <a> to <b>`` gives both paths). A longer sibling name
-    (``~/.ssh-backup``) never matches, and case and Unicode form do not matter. This is a
-    reading of tool output, not proof: ``EPERM`` has other causes, so callers word it as a
+    one) is a ``"read"`` denial; one naming the primary checkout, a ``deny_write`` entry, or
+    the launcher's ``state_dir`` (when given) is a ``"write"`` denial. A path that is both (a
+    hidden file inside the checkout) is reported once, as a read. ``path`` is the path as the
+    line spells it, real or ``~``-expanded, whole even when it contains spaces, and without the
+    words of the message around it (``mv: rename <a> to <b>`` gives both paths). A longer sibling
+    name (``~/.ssh-backup``) never matches, and case and Unicode form do not matter.
+
+    When ``worktree`` is given, every entry also carries a ``cause``: ``deny_read``,
+    ``primary_checkout``, ``persistence_vector`` or ``state_dir`` for a definite protected path,
+    and ``unknown`` for a refused write whose message names only a destination inside the job's
+    own worktree -- a refused hard link or rename *into* the worktree, where the tool reports the
+    (allowed) destination, not the protected source it was refused. Without ``worktree`` the
+    entries are the bare ``{"path", "kind"}`` and worktree-only denials are not reported. This is
+    a reading of tool output, not proof: ``EPERM`` has other causes, so callers word it as a
     likely cause.
     """
+    # Write groups in precedence order (first match wins the cause): the job's own worktree is
+    # the most specific (it sits inside the state dir), then the primary checkout, the deny_write
+    # vectors, and the state directory as a whole.
+    write_groups: List[Tuple[str, List[str]]] = []
+    if worktree is not None:
+        write_groups.append(("unknown", _path_forms(worktree)))
+    if perms.protect_primary_checkout:
+        write_groups.append(("primary_checkout", _path_forms(primary_repo)))
+    denied_writes: List[str] = []
+    for entry in perms.deny_write:
+        denied_writes.extend(form for form in _forms(entry) if form not in denied_writes)
+    if denied_writes:
+        write_groups.append(("persistence_vector", denied_writes))
+    if state_dir is not None:
+        write_groups.append(("state_dir", _path_forms(state_dir)))
     reads: List[str] = []
     for entry in perms.deny_read:
         reads.extend(form for form in _forms(entry) if form not in reads)
-    writes = _path_forms(primary_repo) if perms.protect_primary_checkout else []
-    if state_dir is not None:
-        writes.extend(form for form in _path_forms(state_dir) if form not in writes)
+
     read_patterns = [_mention_pattern(_fold_with_origin(root)[0]) for root in reads]
-    write_patterns = [_mention_pattern(_fold_with_origin(root)[0]) for root in writes]
+    group_patterns = [(cause, [_mention_pattern(_fold_with_origin(root)[0]) for root in roots])
+                      for cause, roots in write_groups]
     found: List[Dict[str, str]] = []
     seen = set()
+
+    def emit(path: str, kind: str, cause: str) -> None:
+        if (path, kind) in seen:
+            return
+        seen.add((path, kind))
+        entry = {"path": path, "kind": kind}
+        if worktree is not None:
+            entry["cause"] = cause
+        found.append(entry)
+
     for line in text.splitlines():
         folded, origin = _fold_with_origin(line)
         if _PHRASE not in folded:
             continue
         read_hits = _mentions(line, folded, origin, read_patterns)
         read_starts = {start for start, _ in read_hits}
-        hits = [(start, "read", path) for start, path in read_hits]
-        hits += [(start, "write", path) for start, path in _mentions(line, folded, origin, write_patterns)
-                 if start not in read_starts]
-        for _, kind, path in sorted(hits, key=lambda hit: hit[0]):
-            if (path, kind) not in seen:
-                seen.add((path, kind))
-                found.append({"path": path, "kind": kind})
+        # Each write start gets the cause of the first group (by precedence) that matched it.
+        write_cause: Dict[int, Tuple[str, str]] = {}
+        for cause, patterns in group_patterns:
+            for start, path in _mentions(line, folded, origin, patterns):
+                if start not in read_starts and start not in write_cause:
+                    write_cause[start] = (cause, path)
+        ordered = [(start, "read", path, "deny_read") for start, path in read_hits]
+        ordered += [(start, "write", path, cause) for start, (cause, path) in write_cause.items()]
+        for _, kind, path, cause in sorted(ordered, key=lambda hit: hit[0]):
+            emit(path, kind, cause)
     return found
 
 
@@ -714,40 +816,60 @@ def record_change(state_dir: Path, action: str, path: str) -> None:
                                f"{log} could not be written: {error}") from None
 
 
-def add_deny_read(state_dir: Path, raw: str) -> Permissions:
-    """Add ``raw`` to the deny list (a path already denied is left as it is and not logged)."""
+def _add_entry(state_dir: Path, raw: str, attribute: str, action: str) -> Permissions:
+    """Add ``raw`` to ``perms.<attribute>`` (a path already there is left as is, not logged)."""
     entry = normalize_entry(raw)
     perms = load_permissions(state_dir)
-    if any(_same(_real(existing), _real(entry)) for existing in perms.deny_read):
+    listing = getattr(perms, attribute)
+    if any(_same(_real(existing), _real(entry)) for existing in listing):
         return perms
-    perms.deny_read.append(entry)
+    listing.append(entry)
     save_permissions(state_dir, perms)
-    record_change(state_dir, "deny-read", entry)
+    record_change(state_dir, action, entry)
     return perms
+
+
+def _remove_entry(state_dir: Path, raw: str, attribute: str, action: str, label: str) -> Permissions:
+    """Take ``raw`` off ``perms.<attribute>``, whichever way it is spelled. Defaults are
+    removable (the file is the user's); a path only *under* a listed entry is refused with the
+    entry to lift, since the list is whole entries."""
+    entry = normalize_entry(raw)
+    perms = load_permissions(state_dir)
+    listing = getattr(perms, attribute)
+    target = _real(entry)
+    kept = [existing for existing in listing if not _same(_real(existing), target)]
+    if len(kept) == len(listing):
+        covering = [existing for existing in listing if _covers(_real(existing), target)]
+        if covering:
+            raise PermissionsError(
+                f"{entry} is not listed itself; it is hidden by {attribute} entry "
+                f"{', '.join(repr(item) for item in covering)}: run {action} on that entry to "
+                f"lift it")
+        raise PermissionsError(f"{entry} is not in the {attribute} list")
+    setattr(perms, attribute, kept)
+    save_permissions(state_dir, perms)
+    record_change(state_dir, action, entry)
+    return perms
+
+
+def add_deny_read(state_dir: Path, raw: str) -> Permissions:
+    """Add ``raw`` to the deny-read list (a path already denied is left as it is and not logged)."""
+    return _add_entry(state_dir, raw, "deny_read", "deny-read")
 
 
 def remove_deny_read(state_dir: Path, raw: str) -> Permissions:
-    """Take ``raw`` off the deny list, whichever way it is spelled (``~/.ssh`` or the full path).
+    """Take ``raw`` off the deny-read list, whichever way it is spelled (``~/.ssh`` or full)."""
+    return _remove_entry(state_dir, raw, "deny_read", "allow-read", "deny_read")
 
-    Defaults are removable: the file is the user's. A path that is only *under* a listed entry is
-    refused with the entry to lift, since the list is whole entries.
-    """
-    entry = normalize_entry(raw)
-    perms = load_permissions(state_dir)
-    target = _real(entry)
-    kept = [existing for existing in perms.deny_read if not _same(_real(existing), target)]
-    if len(kept) == len(perms.deny_read):
-        covering = [existing for existing in perms.deny_read if _covers(_real(existing), target)]
-        if covering:
-            raise PermissionsError(
-                f"{entry} is not listed itself; it is hidden by deny_read entry "
-                f"{', '.join(repr(item) for item in covering)}: run allow-read on that entry to "
-                f"lift it")
-        raise PermissionsError(f"{entry} is not in the deny_read list")
-    perms.deny_read = kept
-    save_permissions(state_dir, perms)
-    record_change(state_dir, "allow-read", entry)
-    return perms
+
+def add_deny_write(state_dir: Path, raw: str) -> Permissions:
+    """Add ``raw`` to the deny-write list (a path already denied is left as it is, not logged)."""
+    return _add_entry(state_dir, raw, "deny_write", "deny-write")
+
+
+def remove_deny_write(state_dir: Path, raw: str) -> Permissions:
+    """Take ``raw`` off the deny-write list, whichever way it is spelled."""
+    return _remove_entry(state_dir, raw, "deny_write", "allow-write", "deny_write")
 
 
 def describe(perms: Permissions) -> Dict[str, Any]:

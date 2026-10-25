@@ -97,24 +97,26 @@ class WrappedJobs(WrapperCase):
         text = Path(report["permissions"]["profile"]).read_text(encoding="utf-8")
         report_dir = Path(report["report_dir"])
         state = real(self.state)
-        self.assertIn(f'(deny file-write* (subpath "{state}"))', text)
-        reopened = [line for line in text.splitlines() if line.startswith("(allow file-write* ")
-                    and "/.git\")" not in line]
-        self.assertEqual(len(reopened), 1, text)
+        lines = text.splitlines()
+        self.assertIn(f'(deny file-write* (subpath "{state}"))', lines)
+        # The state re-open is the allow statement directly after the state deny.
+        state_deny = lines.index(f'(deny file-write* (subpath "{state}"))')
+        reopen = lines[state_deny + 1]
+        self.assertTrue(reopen.startswith("(allow file-write* "))
         for path in (report["worktree"], report["codex_home"],
                      report_dir / "attempt-1.last-message.txt",
                      report_dir / lw.NATIVE_SCRATCH_NAME, report_dir / lw.SCREENSHOTS_DIR_NAME):
             with self.subTest(path=str(path)):
-                self.assertIn(f'(subpath "{real(path)}")', reopened[0])
+                self.assertIn(f'(subpath "{real(path)}")', reopen)
         for evidence in ("report.json", "progress.json", sp.DENY_PROFILE_NAME,
                          "attempt-1.jsonl", "changes.patch"):
             with self.subTest(evidence=evidence):
-                self.assertNotIn(f"{real(report_dir)}/{evidence}", reopened[0])
+                self.assertNotIn(f"{real(report_dir)}/{evidence}", reopen)
                 self.assertFalse(sp.seatbelt_write_allowed(text, report_dir / evidence))
         # The user's permissions list and its log cannot be rewritten or moved away.
-        self.assertIn(f'(literal "{state}/permissions.json")', text.splitlines()[-1])
-        self.assertIn(f'(literal "{state}/permissions.log")', text.splitlines()[-1])
-        self.assertIn(f'(literal "{state}")', text.splitlines()[-1])
+        self.assertIn(f'(literal "{state}/permissions.json")', lines[-1])
+        self.assertIn(f'(literal "{state}/permissions.log")', lines[-1])
+        self.assertIn(f'(literal "{state}")', lines[-1])
 
     def test_verification_entries_say_the_deny_list_was_applied(self):
         report, _ = self.run_clean_job()
@@ -229,10 +231,12 @@ class Denials(WrapperCase):
                                           " Operation not permitted\n")
         report, _ = self.run_clean_job(fake_run=fake)
         denials = report["permissions"]["denials"]
-        self.assertIn({"path": secret, "kind": "read", "source": "worker attempt 1"}, denials)
-        self.assertIn({"path": f"{real(self.state)}/permissions.json", "kind": "write",
+        self.assertIn({"path": secret, "kind": "read", "cause": "deny_read",
                        "source": "worker attempt 1"}, denials)
+        self.assertIn({"path": f"{real(self.state)}/permissions.json", "kind": "write",
+                       "cause": "state_dir", "source": "worker attempt 1"}, denials)
         self.assertIn({"path": f"{primary}/generated.txt", "kind": "write",
+                       "cause": "primary_checkout",
                        "source": "verification attempt 1 command 1"}, denials)
         self.assertNotIn(f"{primary}/quoted.py", json.dumps(denials))
         self.assertEqual(len(denials), 3, denials)
@@ -367,6 +371,206 @@ class RealWrappedJob(WrapperCase):
         self.assertTrue(self.state.is_dir())
         self.assertEqual(report["tests"][0]["status"], "passed")
         self.assertIs(report["tests"][0]["deny_list_applied"], True)
+
+
+class JobWritablePaths(WrapperCase):
+    def test_a_tmpdir_that_covers_the_report_directory_is_not_reopened(self):
+        report_dir = self.state / "reports" / "job-1"
+        report_dir.mkdir(parents=True)
+        worktree = self.state / "worktrees" / "job-1"
+        codex_home = report_dir / "codex-home"
+        # TMPDIR is the report directory itself: re-opening it would re-open the report directory.
+        paths = lw.job_writable_paths(report_dir, worktree, codex_home, 1, {"TMPDIR": str(report_dir)})
+        self.assertNotIn(Path(str(report_dir)), paths)
+        self.assertIn(worktree, paths)
+        # A TMPDIR elsewhere is kept.
+        elsewhere = self.state / "tmp"
+        kept = lw.job_writable_paths(report_dir, worktree, codex_home, 1, {"TMPDIR": str(elsewhere)})
+        self.assertIn(elsewhere, kept)
+
+
+class SafeJobRead(WrapperCase):
+    def setUp(self):
+        super().setUp()
+        self.report_dir = self.root / "report"
+        self.report_dir.mkdir()
+
+    def test_a_regular_file_inside_the_report_dir_is_read(self):
+        target = self.report_dir / "attempt-1.last-message.txt"
+        target.write_text("done\n")
+        text, tampered = lw.safe_read_job_text(target, self.report_dir, [])
+        self.assertEqual((text, tampered), ("done\n", None))
+
+    def test_a_symlink_in_place_of_the_file_is_not_followed(self):
+        secret = self.root / "secret"
+        secret.write_text("SECRET\n")
+        target = self.report_dir / "attempt-1.last-message.txt"
+        target.symlink_to(secret)
+        text, tampered = lw.safe_read_job_text(target, self.report_dir, [])
+        self.assertEqual(text, "")
+        self.assertIsNotNone(tampered)
+        self.assertNotIn("SECRET", text)
+
+    def test_a_file_whose_real_path_leaves_the_report_dir_is_rejected(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        link_dir = self.report_dir / "sub"
+        link_dir.symlink_to(outside)
+        (outside / "f").write_text("SECRET\n")
+        text, tampered = lw.safe_read_job_text(link_dir / "f", self.report_dir, [])
+        self.assertEqual(text, "")
+        self.assertIsNotNone(tampered)
+
+    def test_a_missing_file_is_reported_not_raised(self):
+        text, tampered = lw.safe_read_job_text(self.report_dir / "nope", self.report_dir, [])
+        self.assertEqual(text, "")
+        self.assertIsNotNone(tampered)
+
+    def test_a_symlink_to_a_sibling_inside_the_report_dir_is_still_not_followed(self):
+        # O_NOFOLLOW refuses even a symlink whose target is inside the report dir (so the realpath
+        # check alone would pass): evidence is never read through a swap.
+        sibling = self.report_dir / "real.txt"
+        sibling.write_text("sibling\n")
+        target = self.report_dir / "attempt-1.last-message.txt"
+        target.symlink_to(sibling)
+        text, tampered = lw.safe_read_job_text(target, self.report_dir, [])
+        self.assertEqual(text, "")
+        self.assertIsNotNone(tampered)
+
+
+class UnwrappedAdminTamper(WrapperCase):
+    """Item 1(b): when the deny list is not applied the worker CAN repoint the gitfile, but the
+    launcher pins its own git layout, so the audit is not steered, reads the real HEAD, and flags
+    the change as a violation."""
+
+    def build_attacker(self, sentinel):
+        attacker = self.root / "attacker"
+        sp.git(self.root, "init", "-q", str(attacker))
+        (attacker / "x.txt").write_text("a\n")
+        sp.git(attacker, "add", "x.txt")
+        sp.git(attacker, "commit", "-qm", "attacker commit")  # a DIFFERENT HEAD than the job base
+        gitdir = attacker / ".git"
+        sp.git(attacker, "config", "filter.pwn.clean", f"sh -c 'echo tampered > {sentinel}; cat'")
+        (gitdir / "info").mkdir(exist_ok=True)
+        (gitdir / "info" / "attributes").write_text("* filter=pwn\n")
+        (gitdir / "objects" / "info").mkdir(parents=True, exist_ok=True)
+        (gitdir / "objects" / "info" / "alternates").write_text(
+            str(self.repo / ".git" / "objects") + "\n")
+        return gitdir
+
+    def test_a_repointed_gitfile_in_an_unwrapped_job_is_caught_not_followed(self):
+        sentinel = self.root / "sentinel"
+
+        def edit(cwd, attempt):
+            self.fix(cwd)
+            gitdir = self.build_attacker(sentinel)
+            (Path(cwd) / ".git").write_text(f"gitdir: {gitdir}\n")
+
+        with mock.patch.object(permissions, "wrapper_available", return_value=False):
+            report, run = self.run_clean_job(worker_edit=edit)
+        self.assertFalse(report["permissions"]["deny_list_applied"])
+        self.assertFalse(sentinel.exists(), "the attacker filter ran in the launcher's git")
+        self.assertEqual(report["git_admin_tampered"], ["gitfile"])
+        self.assertEqual(report["status"], "audit_violation")
+        self.assertEqual(report["head_commit"], report["base_commit"])  # real HEAD, pinned
+        self.assertTrue(any(v["path"] == ".git" for v in report["violations"]))
+
+
+@unittest.skipUnless(sys.platform == "darwin" and permissions.wrapper_available(), "Seatbelt only")
+class RealAuditRegression(WrapperCase):
+    """Item 1: a wrapped worker must not make the launcher's unwrapped git run its code, via the
+    worktree gitfile (variant a) or the linked worktree's commondir (variant b)."""
+
+    def setUp(self):
+        super().setUp()
+        self.worktree = self.state / "worktrees" / "job-1"
+        self.report_dir = self.state / "reports" / "job-1"
+        (self.report_dir / "codex-home").mkdir(parents=True)
+        sp.git(self.repo, "worktree", "add", "-q", "--detach", str(self.worktree))
+        self.layout = lw.worktree_git_layout(self.worktree)
+        self.base = sp.git(self.worktree, "rev-parse", "HEAD").stdout.decode().strip()
+        self.sentinel = self.root / "sentinel"
+
+    def profile(self):
+        text = permissions.seatbelt_profile(
+            permissions.default_permissions(), primary_repo=self.repo, state_dir=self.state,
+            allowed_writes=lw.job_writable_paths(self.report_dir, self.worktree,
+                                                 self.report_dir / "codex-home", 1, {}),
+            protect_write_roots=lw.job_write_roots(self.report_dir, self.worktree,
+                                                   self.report_dir / "codex-home"),
+            job_git_admin=self.layout["GIT_DIR"], job_worktree=self.worktree)
+        path = self.report_dir / sp.DENY_PROFILE_NAME
+        path.write_text(text, encoding="utf-8")
+        probe = subprocess.run(permissions.wrap_argv(["/usr/bin/true"], path), capture_output=True)
+        if probe.returncode == NESTED_SANDBOX:
+            self.skipTest("already inside a sandbox")
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        return path
+
+    def sandboxed(self, profile, argv):
+        env = dict(os.environ, **sp.GIT_ID)
+        return subprocess.run(permissions.wrap_argv(argv, profile), capture_output=True, env=env)
+
+    def make_attacker(self, kind):
+        """A standalone git dir with a clean filter + attributes that would write the sentinel."""
+        evil = self.root / ("evil-" + kind)
+        subprocess.run(["git", "init", "-q", str(evil)], capture_output=True,
+                       env=dict(os.environ, **sp.GIT_ID), check=True)
+        gitdir = evil / ".git"
+        subprocess.run(["git", "-C", str(evil), "config", "filter.pwn.clean",
+                        f"sh -c 'echo tampered > {self.sentinel}; cat'"], check=True,
+                       capture_output=True)
+        (gitdir / "info").mkdir(exist_ok=True)
+        (gitdir / "info" / "attributes").write_text("* filter=pwn\n")
+        (gitdir / "HEAD").write_text(f"{self.base}\n")
+        (gitdir / "objects" / "info").mkdir(parents=True, exist_ok=True)
+        (gitdir / "objects" / "info" / "alternates").write_text(str(self.repo / ".git" / "objects") + "\n")
+        return gitdir
+
+    def test_the_profile_denies_repointing_the_gitfile_or_the_commondir(self):
+        profile = self.profile()
+        admin = Path(self.layout["GIT_DIR"])
+        attempts = {
+            "gitfile": (self.worktree / ".git", "gitdir: /tmp/evil"),
+            "commondir": (admin / "commondir", "/tmp/evil"),
+            "gitdir": (admin / "gitdir", "/tmp/evil"),
+        }
+        for name, (target, content) in attempts.items():
+            with self.subTest(name=name):
+                outcome = self.sandboxed(profile, ["/bin/sh", "-c", 'echo "$2" > "$1"', "sh",
+                                                   str(target), content])
+                self.assertNotEqual(outcome.returncode, 0)
+                self.assertIn(b"Operation not permitted", outcome.stderr)
+
+    def _run_audit_after_tamper(self, kind):
+        """Simulate the pre-fix hole: repoint a redirect file directly (unwrapped), then run the
+        launcher's audit with the pinned layout and confirm the filter never ran."""
+        before = lw.git_admin_fingerprint(self.layout, self.worktree)
+        gitdir = self.make_attacker(kind)
+        (self.worktree / "add.py").write_text("def add(a, b):\n    return a + b\n")
+        if kind == "gitfile":
+            (self.worktree / ".git").write_text(f"gitdir: {gitdir}\n")
+        else:
+            Path(self.layout["GIT_DIR"], "commondir").write_text(f"{gitdir}\n")
+        report = {"_git_layout": self.layout, "_git_admin_before": before, "violations": []}
+        if self.sentinel.exists():
+            self.sentinel.unlink()
+        audit = lw.audit_worktree(self.worktree, self.base, ["add.py"], [],
+                                  scratch_dir=self.report_dir, git_layout=self.layout)
+        changed = lw.note_git_admin_tamper(report, self.worktree)
+        return report, audit, changed
+
+    def test_a_repointed_gitfile_does_not_steer_the_audit_and_is_flagged(self):
+        report, audit, changed = self._run_audit_after_tamper("gitfile")
+        self.assertFalse(self.sentinel.exists(), "the attacker filter ran in the launcher's git")
+        self.assertIn("gitfile", changed)
+        self.assertTrue(any(v["path"] == ".git" for v in report["violations"]))
+
+    def test_a_repointed_commondir_does_not_steer_the_audit_and_is_flagged(self):
+        report, audit, changed = self._run_audit_after_tamper("commondir")
+        self.assertFalse(self.sentinel.exists(), "the attacker filter ran in the launcher's git")
+        self.assertIn("commondir", changed)
+        self.assertTrue(any(v["path"] == ".git" for v in report["violations"]))
 
 
 if __name__ == "__main__":

@@ -84,8 +84,23 @@ class DefaultsAndFile(PermissionsCase):
         payload = json.loads(self.file.read_text(encoding="utf-8"))
         self.assertEqual(payload["schema_version"], permissions.SCHEMA_VERSION)
         self.assertEqual(payload["network"], {"allowed_domains": []})
-        self.assertEqual(set(payload), {"schema_version", "mode", "deny_read",
+        self.assertEqual(set(payload), {"schema_version", "mode", "deny_read", "deny_write",
                                         "protect_primary_checkout", "writable_roots", "network"})
+
+    def test_the_default_file_has_the_deny_write_vectors(self):
+        payload = json.loads(self.file.read_text(encoding="utf-8"))
+        self.assertEqual(payload["deny_write"], list(permissions.DEFAULT_DENY_WRITE))
+
+    def test_a_file_without_deny_write_keeps_the_default_vectors(self):
+        # R19: deny_write is new, so a file written before it existed stays valid and protected.
+        self.write_file(deny_write=None)
+        perms = permissions.load_permissions(self.state)
+        self.assertEqual(perms.deny_write, list(permissions.DEFAULT_DENY_WRITE))
+        self.assertEqual((self.state / permissions.PERMISSIONS_FILE).read_text().count("deny_write"), 0)
+
+    def test_an_explicit_empty_deny_write_is_honoured_not_defaulted(self):
+        self.write_file(deny_write=[])
+        self.assertEqual(permissions.load_permissions(self.state).deny_write, [])
 
     def test_an_existing_file_is_never_overwritten_by_default_creation(self):
         self.write_file(deny_read=["~/.only-this"], protect_primary_checkout=False)
@@ -149,8 +164,8 @@ class RefusedFiles(PermissionsCase):
         return str(caught.exception)
 
     def test_an_unknown_top_level_key_is_refused_by_name(self):
-        self.write_file(deny_write=["~/x"])
-        self.refused("deny_write")
+        self.write_file(surprise=["~/x"])
+        self.refused("surprise")
 
     def test_an_unknown_network_key_is_refused_by_name(self):
         self.write_file(network={"allowed_domains": [], "proxy": "x"})
@@ -253,7 +268,7 @@ class Profile(PermissionsCase):
                      text.index(f'(deny file-write* (literal "{repo}/.git/HEAD")')]
         self.assertEqual(positions, sorted(positions))
         self.assertIn(f'(literal "{repo}/.git/index")', text)
-        self.assertIn(f'(subpath "{repo}/.git/refs/heads"))', text)
+        self.assertIn(f'(subpath "{repo}/.git/refs")', text)
 
     def test_every_default_entry_is_listed_by_its_real_path(self):
         text = permissions.seatbelt_profile(self.perms, primary_repo=self.repo)
@@ -269,7 +284,8 @@ class Profile(PermissionsCase):
 
     def test_protection_off_leaves_the_primary_checkout_writable(self):
         text = permissions.seatbelt_profile(
-            dataclasses.replace(self.perms, protect_primary_checkout=False), primary_repo=self.repo)
+            dataclasses.replace(self.perms, protect_primary_checkout=False, deny_write=[]),
+            primary_repo=self.repo)
         self.assertNotIn(real(self.repo), text)
         self.assertIn("file-read", text)
         # What is hidden still cannot be changed or moved, whether or not the checkout is protected.
@@ -278,7 +294,8 @@ class Profile(PermissionsCase):
 
     def test_nothing_to_protect_writes_no_write_rule_at_all(self):
         text = permissions.seatbelt_profile(
-            dataclasses.replace(self.perms, deny_read=[], protect_primary_checkout=False),
+            dataclasses.replace(self.perms, deny_read=[], protect_primary_checkout=False,
+                                deny_write=[]),
             primary_repo=self.repo)
         self.assertEqual(text, "(version 1)\n(allow default)\n")
 
@@ -484,11 +501,15 @@ class PlantingAndCloning(PermissionsCase):
         lines = permissions.seatbelt_profile(self.perms, primary_repo=self.repo).splitlines()
         git = real(self.repo) + "/.git"
         reopen = lines.index(f'(allow file-write* (subpath "{git}"))')
-        (planting,) = [i for i, line in enumerate(lines) if f'(subpath "{git}/hooks")' in line]
-        self.assertGreater(planting, reopen)
-        self.assertEqual(lines[planting], f'(deny file-write* (subpath "{git}/hooks") '
-                                          f'(subpath "{git}/info") (subpath "{git}/modules") '
-                                          f'(literal "{git}/objects/info/alternates"))')
+        # The planting dirs and alternates are closed in the one deny statement that re-closes the
+        # re-opened .git, which also carries the refs/logs/worktrees subtrees and the four files.
+        (closed,) = [i for i, line in enumerate(lines) if f'(subpath "{git}/hooks")' in line]
+        self.assertGreater(closed, reopen)
+        for shut in (f'(subpath "{git}/hooks")', f'(subpath "{git}/info")',
+                     f'(subpath "{git}/modules")', f'(literal "{git}/objects/info/alternates")',
+                     f'(subpath "{git}/refs")', f'(subpath "{git}/logs")',
+                     f'(subpath "{git}/worktrees")'):
+            self.assertIn(shut, lines[closed])
 
     def test_no_planting_rule_without_primary_protection(self):
         text = permissions.seatbelt_profile(
@@ -511,6 +532,46 @@ class PlantingAndCloning(PermissionsCase):
         text = permissions.seatbelt_profile(dataclasses.replace(self.perms, deny_read=[]),
                                             primary_repo=self.repo)
         self.assertNotIn("file-clone", text)
+
+
+class DenyWriteAndGitAdmin(PermissionsCase):
+    """R19 deny_write vectors, and item 1's worktree-gitfile / linked-admin protection."""
+
+    def test_deny_write_vectors_are_write_denied_and_rename_protected(self):
+        with mock.patch.dict(os.environ, {"HOME": str(self.root)}):
+            perms = dataclasses.replace(self.perms, deny_read=[], deny_write=["~/.zshrc", "~/.config/git"])
+            text = permissions.seatbelt_profile(perms, primary_repo=self.repo)
+        (rule,) = [line for line in text.splitlines()
+                   if line.startswith("(deny file-write* (subpath") and ".zshrc" in line]
+        self.assertIn(f'(subpath "{real(self.root / ".zshrc")}")', rule)
+        self.assertIn(f'(subpath "{real(self.root / ".config/git")}")', rule)
+        # Rename protection (last line) guards each vector and its parents, so none can be moved.
+        self.assertIn(f'(literal "{real(self.root / ".zshrc")}")', text.splitlines()[-1])
+        self.assertIn(f'(literal "{real(self.root / ".config")}")', text.splitlines()[-1])
+
+    def test_an_empty_deny_write_emits_no_vector_rule(self):
+        text = permissions.seatbelt_profile(dataclasses.replace(self.perms, deny_write=[]),
+                                            primary_repo=self.repo)
+        self.assertNotIn(".zshrc", text)
+
+    def test_the_job_admin_dir_is_reopened_but_its_redirects_stay_denied(self):
+        admin = self.repo / ".git" / "worktrees" / "job-1"
+        worktree = self.state / "worktrees" / "job-1"
+        text = permissions.seatbelt_profile(self.perms, primary_repo=self.repo,
+                                            job_git_admin=admin, job_worktree=worktree)
+        lines = text.splitlines()
+        reopen = lines.index(f'(allow file-write* (subpath "{real(self.repo)}/.git/worktrees/job-1"))')
+        # The whole worktrees subtree is denied earlier, the job's admin re-opened after it.
+        subtree_deny = next(i for i, line in enumerate(lines)
+                            if f'(subpath "{real(self.repo)}/.git/worktrees")' in line)
+        self.assertLess(subtree_deny, reopen)
+        redirect_deny = lines[reopen + 1]
+        for name in ("commondir", "gitdir", "config.worktree"):
+            self.assertIn(f'(literal "{real(self.repo)}/.git/worktrees/job-1/{name}")', redirect_deny)
+        # The worktree's own .git gitfile is denied, and everything is rename-protected.
+        self.assertIn(f'(deny file-write* (literal "{real(worktree)}/.git"))', lines)
+        self.assertIn(f'(literal "{real(worktree)}/.git")', lines[-1])
+        self.assertIn(f'(literal "{real(self.repo)}/.git/worktrees/job-1/commondir")', lines[-1])
 
 
 class Conflicts(PermissionsCase):
@@ -833,6 +894,39 @@ class FindDenials(PermissionsCase):
         self.assertEqual(permissions.find_denials(line, unprotected, self.repo, state_dir=self.state),
                          [{"path": f"{state}/permissions.json", "kind": "write"}])
 
+    def test_a_deny_write_vector_is_reported_as_a_write(self):
+        with mock.patch.dict(os.environ, {"HOME": str(self.root)}):
+            perms = dataclasses.replace(self.perms, deny_write=["~/.gitconfig"])
+            target = f"{self.root}/.gitconfig"
+            self.assertEqual(permissions.find_denials(
+                f"error: could not write {target}: Operation not permitted", perms, self.repo),
+                [{"path": target, "kind": "write"}])
+
+    def test_with_a_worktree_every_entry_carries_a_cause(self):
+        worktree = self.root / "wt"
+        secret = f"{self.vault}/token"
+        primary = f"{real(self.repo)}/a.py"
+        state = f"{real(self.state)}/leases/x"
+        found = permissions.find_denials(
+            "\n".join([f"cat: {secret}: Operation not permitted",
+                       f"touch: {primary}: Operation not permitted",
+                       f"touch: {state}: Operation not permitted"]) + "\n",
+            self.perms, self.repo, state_dir=self.state, worktree=worktree)
+        self.assertEqual(found, [{"path": secret, "kind": "read", "cause": "deny_read"},
+                                 {"path": primary, "kind": "write", "cause": "primary_checkout"},
+                                 {"path": state, "kind": "write", "cause": "state_dir"}])
+
+    def test_a_refused_hard_link_into_the_worktree_is_a_write_with_cause_unknown(self):
+        # ``ln <secret> <worktree>/hl`` is refused on the source, but the tool often names only the
+        # destination (inside the job's own worktree); without the worktree it is missed.
+        worktree = self.root / "state" / "worktrees" / "job-1"
+        dest = f"{real(self.root)}/state/worktrees/job-1/hl-key"
+        line = f"ln: {dest}: Operation not permitted"
+        self.assertEqual(self.find(line), [])  # no worktree given: nothing matches
+        self.assertEqual(permissions.find_denials(line, self.perms, self.repo,
+                                                  state_dir=self.state, worktree=worktree),
+                         [{"path": dest, "kind": "write", "cause": "unknown"}])
+
 
 @unittest.skipUnless(sys.platform == "darwin" and permissions.wrapper_available(), "Seatbelt only")
 class RealWrapper(PermissionsCase):
@@ -840,9 +934,17 @@ class RealWrapper(PermissionsCase):
         env = dict(os.environ, **sp.GIT_ID)
         return subprocess.run(permissions.wrap_argv(argv, profile), capture_output=True, env=env, **kwargs)
 
-    def write_profile(self, perms):
+    def write_profile(self, perms, worktree=None):
+        """Write the job profile. When ``worktree`` is a linked worktree of the primary, its admin
+        dir is re-opened (as the launcher does) so a commit in it still works."""
+        kwargs = {}
+        if worktree is not None:
+            admin = sp.git(worktree, "rev-parse", "--absolute-git-dir").stdout.decode().strip()
+            kwargs = {"job_git_admin": admin, "job_worktree": str(worktree),
+                      "protect_write_roots": [str(worktree)]}
         profile = self.root / "p.sb"
-        profile.write_text(permissions.seatbelt_profile(perms, primary_repo=self.repo), encoding="utf-8")
+        profile.write_text(permissions.seatbelt_profile(perms, primary_repo=self.repo, **kwargs),
+                           encoding="utf-8")
         probe = subprocess.run(permissions.wrap_argv(["/usr/bin/true"], profile), capture_output=True)
         if probe.returncode == NESTED_SANDBOX:
             self.skipTest("already inside a sandbox")
@@ -887,7 +989,7 @@ class RealWrapper(PermissionsCase):
     def test_a_linked_worktree_commits_while_the_primary_checkout_is_protected(self):
         worktree = self.root / "wt"
         sp.git(self.repo, "worktree", "add", "-q", "--detach", str(worktree))
-        profile = self.write_profile(dataclasses.replace(self.perms, deny_read=[]))
+        profile = self.write_profile(dataclasses.replace(self.perms, deny_read=[]), worktree=worktree)
         (worktree / "new.txt").write_text("n")
         git = ["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"]
         add = self.sandboxed(profile, git + ["-C", str(worktree), "add", "new.txt"])
@@ -1030,7 +1132,7 @@ class RealWrapper(PermissionsCase):
         perms, vault, _, _ = self.hidden_tree()
         worktree = self.root / "wt"
         sp.git(self.repo, "worktree", "add", "-q", "--detach", str(worktree))
-        profile = self.write_profile(perms)
+        profile = self.write_profile(perms, worktree=worktree)
         (worktree / "new.txt").write_text("n")
         git = ["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"]
         add = self.sandboxed(profile, git + ["-C", str(worktree), "add", "new.txt"])
@@ -1127,7 +1229,7 @@ class RealWrapper(PermissionsCase):
     def test_no_hook_can_be_planted_while_a_linked_worktree_still_commits(self):
         worktree = self.root / "wt"
         sp.git(self.repo, "worktree", "add", "-q", "--detach", str(worktree))
-        profile = self.write_profile(dataclasses.replace(self.perms, deny_read=[]))
+        profile = self.write_profile(dataclasses.replace(self.perms, deny_read=[]), worktree=worktree)
         git_dir = self.repo / ".git"
         (git_dir / "modules").mkdir(exist_ok=True)
         write = ["/bin/sh", "-c", 'mkdir -p "$(dirname "$1")" ; echo "#!/bin/sh" > "$1"', "sh"]
@@ -1148,6 +1250,79 @@ class RealWrapper(PermissionsCase):
         self.assertEqual((add.returncode, commit.returncode), (0, 0), (add.stderr, commit.stderr))
         self.assertNotEqual(sp.git(worktree, "rev-parse", "HEAD").stdout,
                             sp.git(self.repo, "rev-parse", "main").stdout)
+
+    def test_a_deny_write_persistence_vector_cannot_be_planted(self):
+        home = self.root / "home"
+        (home / ".config" / "git").mkdir(parents=True)
+        zshrc = home / ".zshrc"
+        zshrc.write_text("# user rc\n")
+        perms = dataclasses.replace(self.perms, deny_read=[],
+                                    deny_write=[str(zshrc), str(home / ".config" / "git")])
+        profile = self.write_profile(perms)
+        write = ["/bin/sh", "-c", 'echo "evil" >> "$1"', "sh"]
+        for target in (zshrc, home / ".config" / "git" / "config"):
+            with self.subTest(target=str(target)):
+                outcome = self.sandboxed(profile, write + [str(target)])
+                self.assertNotEqual(outcome.returncode, 0)
+                self.assertIn(b"Operation not permitted", outcome.stderr)
+        swap = self.sandboxed(profile, ["/bin/sh", "-c",
+            'echo evil > "$2" && mv "$2" "$1"', "sh", str(zshrc), str(self.root / "decoy")])
+        self.assertNotEqual(swap.returncode, 0)
+        self.assertEqual(zshrc.read_text(), "# user rc\n")
+        # A different file in the same HOME stays writable: deny_write is a list, not the home.
+        self.assertEqual(self.sandboxed(profile, write + [str(home / ".other")]).returncode, 0)
+
+    def test_tags_and_reflogs_of_the_primary_checkout_cannot_be_written(self):
+        profile = self.write_profile(dataclasses.replace(self.perms, deny_read=[]))
+        git_dir = self.repo / ".git"
+        for parent in ("refs/tags", "refs/remotes", "logs"):
+            (git_dir / parent).mkdir(parents=True, exist_ok=True)  # parents exist, so writing the
+        write = ["/bin/sh", "-c", 'echo x > "$1"', "sh"]            # leaf is the denied operation
+        for target in (git_dir / "refs" / "tags" / "evil", git_dir / "refs" / "remotes" / "x",
+                       git_dir / "logs" / "HEAD"):
+            with self.subTest(target=str(target.relative_to(git_dir))):
+                outcome = self.sandboxed(profile, write + [str(target)])
+                self.assertNotEqual(outcome.returncode, 0)
+                self.assertIn(b"Operation not permitted", outcome.stderr)
+
+    def test_another_jobs_linked_worktree_admin_dir_cannot_be_written(self):
+        mine = self.root / "wt-mine"
+        other = self.root / "wt-other"
+        sp.git(self.repo, "worktree", "add", "-q", "--detach", str(mine))
+        sp.git(self.repo, "worktree", "add", "-q", "--detach", str(other))
+        profile = self.write_profile(dataclasses.replace(self.perms, deny_read=[]), worktree=mine)
+        other_admin = Path(sp.git(other, "rev-parse", "--absolute-git-dir").stdout.decode().strip())
+        write = ["/bin/sh", "-c", 'echo "ref: refs/heads/x" > "$1"', "sh"]
+        for target in (other_admin / "HEAD", other_admin / "commondir", other_admin / "index"):
+            with self.subTest(target=target.name):
+                outcome = self.sandboxed(profile, write + [str(target)])
+                self.assertNotEqual(outcome.returncode, 0)
+                self.assertIn(b"Operation not permitted", outcome.stderr)
+        # My own worktree still commits.
+        (mine / "new.txt").write_text("n")
+        git = ["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"]
+        add = self.sandboxed(profile, git + ["-C", str(mine), "add", "new.txt"])
+        commit = self.sandboxed(profile, git + ["-C", str(mine), "commit", "-q", "-m", "mine"])
+        self.assertEqual((add.returncode, commit.returncode), (0, 0), (add.stderr, commit.stderr))
+
+    def test_a_refused_hard_link_to_a_protected_file_is_denied_and_attributed(self):
+        worktree = self.root / "wt"
+        sp.git(self.repo, "worktree", "add", "-q", "--detach", str(worktree))
+        secret = self.root / "netrc"
+        secret.write_text("machine x password SECRET\n")
+        perms = dataclasses.replace(self.perms, deny_read=[str(secret)])
+        profile = self.write_profile(perms, worktree=worktree)
+        dest = worktree / "hl-netrc"
+        outcome = self.sandboxed(profile, ["/bin/ln", str(secret), str(dest)])
+        self.assertNotEqual(outcome.returncode, 0)
+        self.assertFalse(dest.exists())
+        # This ``ln`` names the source (the hidden file), so it is attributed as a read denial;
+        # the destination-only case (where only the worktree path is named) is covered offline by
+        # ``FindDenials.test_a_refused_hard_link_into_the_worktree_is_a_write_with_cause_unknown``.
+        found = permissions.find_denials(outcome.stderr.decode("utf-8", "replace"), perms, self.repo,
+                                        worktree=worktree)
+        self.assertEqual(found, [{"path": str(secret), "kind": "read", "cause": "deny_read"}],
+                         outcome.stderr)
 
     def test_an_awkward_path_is_escaped_so_seatbelt_parses_and_still_denies(self):
         parent = self.root / 'with space "quote" ü'
@@ -1281,6 +1456,35 @@ class Cli(PermissionsCase):
                 self.assertIn(str(self.file), refusal["failure_reason"])
         self.assertEqual(self.file.read_text(encoding="utf-8"), "{broken")
         self.assertEqual(self.log_lines(), [])
+
+    def test_deny_write_adds_the_path_and_logs_it(self):
+        target = str(self.root / "sensitive")
+        code, shown = self.run_cli("deny-write", target)
+        self.assertEqual(code, 0)
+        self.assertIn(target, shown["deny_write"])
+        self.assertIn(target, permissions.load_permissions(self.state).deny_write)
+        self.assertEqual([(i["action"], i["path"]) for i in self.log_lines()],
+                         [("deny-write", target)])
+
+    def test_allow_write_removes_a_default_vector_either_spelling(self):
+        for spelling in ("~/.zshrc", os.path.expanduser("~/.zshrc")):
+            with self.subTest(spelling=spelling):
+                permissions.save_permissions(self.state, permissions.default_permissions())
+                code, shown = self.run_cli("allow-write", spelling)
+                self.assertEqual(code, 0)
+                self.assertNotIn("~/.zshrc", shown["deny_write"])
+                self.assertIn("~/.gitconfig", shown["deny_write"])
+        self.assertEqual([i["action"] for i in self.log_lines()], ["allow-write"] * 2)
+
+    def test_allow_write_of_an_unlisted_path_is_refused(self):
+        code, refusal = self.run_cli("allow-write", str(self.root / "never"))
+        self.assertEqual(code, 2)
+        self.assertIn("not in the deny_write list", refusal["failure_reason"])
+
+    def test_show_includes_the_deny_write_defaults(self):
+        code, shown = self.run_cli("show")
+        self.assertEqual(code, 0)
+        self.assertEqual(shown["deny_write"], list(permissions.DEFAULT_DENY_WRITE))
 
     def test_a_subcommand_is_required(self):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
