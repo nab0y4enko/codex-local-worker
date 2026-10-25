@@ -3,6 +3,8 @@
 Current status: [2026-10-25 readiness](2026-10-25-readiness.md), including the actual local-model
 results, reviewed fixes, recovery cleanup, and the deferred dashboard desktop gate (Tasks 27-28, future work).
 
+Second model (`Qwen3.5-9B-OptiQ-4bit`) live results: [2026-10-25 second model](2026-10-25-second-model.md).
+
 `test_live_qualification.py` is the opt-in, end-to-end suite for the installed launcher. It uses
 `bin/local-worker` for every local inference job and records one dated host report from actual
 launcher output. Offline unit tests remain under `tests/` and use `python3 -m unittest`.
