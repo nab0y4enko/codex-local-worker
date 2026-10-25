@@ -645,6 +645,34 @@ def stall_limit(profile: omlx_discovery.ServerProfile, context_window: int) -> D
     return {"seconds": seconds, "basis": "measured", "inputs": inputs}
 
 
+def server_busy(settings_path: Path, fetch: omlx_discovery.HttpFetch,
+                deadline_at: float) -> bool:
+    """Check oMLX activity without letting the production HTTP probe outlive its cutoff.
+
+    Injected legacy fetchers keep the established three-argument call contract. The default
+    HTTP implementation accepts a timeout and gets only the time remaining to the attempt
+    cutoff; callers set that cutoff no later than the job deadline minus verification reserve.
+    """
+    remaining = deadline_at - time.monotonic()
+    if remaining <= .001:
+        return False
+    try:
+        settings = omlx_discovery.read_server_settings(settings_path)
+        remaining = deadline_at - time.monotonic()
+        if remaining <= .001:
+            return False
+        if fetch is omlx_discovery.http_fetch:
+            code, body = fetch(settings, "/api/status", True, timeout=remaining)
+        else:
+            code, body = fetch(settings, "/api/status", True)
+        if code != 200 or not isinstance(body, dict):
+            return False
+        return any(type(body.get(name)) is int and body[name] > 0
+                   for name in ("active_requests", "waiting_requests"))
+    except Exception:
+        return False
+
+
 def strip_proxy_env(env: Dict[str, str]) -> Tuple[Dict[str, str], List[str]]:
     removed = sorted(name for name in env if name in PROXY_ENV_VARS)
     cleaned = {name: value for name, value in env.items() if name not in PROXY_ENV_VARS}
@@ -3059,19 +3087,17 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
             if stream is not None:
                 stream.start_attempt(report["job_id"])
             report["_active_attempt"] = {"before_patch": patch_before}
-            def server_busy():
-                try:
-                    settings = omlx_discovery.read_server_settings(options.settings_path)
-                    code, body = options.omlx_fetch(settings, "/api/status", True)
-                    if code != 200 or not isinstance(body, dict):
-                        return False
-                    return any(type(body.get(name)) is int and body[name] > 0
-                               for name in ("active_requests", "waiting_requests"))
-                except Exception:
-                    return False
+            # Bound a synchronous busy-server check by both this attempt's remaining
+            # allowance and the job cutoff that preserves verification time.
+            attempt_deadline = min(deadline.end - reserve,
+                                   time.monotonic() + attempt_timeout)
+            runner_timeout = max(0.0, attempt_deadline - time.monotonic())
             result = run_bounded(wrapper.wrap(argv), cwd=worktree, env=env,
-                                 timeout=attempt_timeout, stdin_data=prompt.encode("utf-8"),
-                                 stall_seconds=stall["seconds"], on_stall=server_busy)
+                                 timeout=runner_timeout, stdin_data=prompt.encode("utf-8"),
+                                 stall_seconds=stall["seconds"],
+                                 on_stall=lambda: server_busy(options.settings_path,
+                                                              options.omlx_fetch,
+                                                              attempt_deadline))
         except BaseException:
             observer.finish(status="failed")
             snapshot = observer.snapshot()

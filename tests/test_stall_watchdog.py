@@ -53,6 +53,35 @@ class StallWatchdog(unittest.TestCase):
                                     timeout=3.25)
         self.assertEqual(load.call_args.kwargs["timeout"], 3.25)
 
+    def test_server_busy_probe_uses_remaining_deadline_as_http_timeout(self):
+        root = sp.tmpdir()
+        self.addCleanup(sp.cleanup, root)
+        settings = sp.write_settings(root / "settings.json")
+        fetch = mock.Mock(return_value=(200, {"active_requests": 1}))
+        cutoff = time.monotonic() + 0.25
+        with mock.patch.object(discovery, "http_fetch", fetch):
+            self.assertTrue(lw.server_busy(settings, fetch, cutoff))
+        timeout = fetch.call_args.kwargs["timeout"]
+        self.assertGreater(timeout, 0)
+        self.assertLessEqual(timeout, 0.25)
+
+    def test_server_busy_probe_preserves_legacy_injected_fetch_signature(self):
+        root = sp.tmpdir()
+        self.addCleanup(sp.cleanup, root)
+        settings = sp.write_settings(root / "settings.json")
+        calls = []
+        def fetch(server_settings, path, auth):
+            calls.append((path, auth))
+            return 200, {"waiting_requests": 1}
+        self.assertTrue(lw.server_busy(settings, fetch, time.monotonic() + 2.0))
+        self.assertEqual(calls, [("/api/status", True)])
+
+    def test_server_busy_probe_skips_when_attempt_deadline_has_passed(self):
+        fetch = mock.Mock()
+        self.assertFalse(lw.server_busy(Path("missing-settings.json"), fetch,
+                                        time.monotonic() - 1.0))
+        fetch.assert_not_called()
+
     def test_attempt_report_records_stall_inputs_and_job_budget(self):
         root = sp.tmpdir()
         self.addCleanup(sp.cleanup, root)
