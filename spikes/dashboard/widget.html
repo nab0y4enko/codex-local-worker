@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local Worker dashboard spike</title>
+  <style>
+    :root { color-scheme: light dark; font: 14px/1.45 system-ui, sans-serif; }
+    body { margin: 0; padding: 18px; color: var(--color-text-primary, CanvasText); background: var(--color-background-primary, Canvas); }
+    header { display: flex; align-items: center; gap: 14px; }
+    header img { width: 52px; height: 52px; border-radius: 10px; }
+    h1 { margin: 0; font-size: 1.2rem; }
+    #revision, #mode { color: var(--color-text-secondary, GrayText); }
+    table { width: 100%; margin-top: 16px; border-collapse: collapse; }
+    th, td { padding: 8px; text-align: left; border-bottom: 1px solid var(--color-border-primary, #8886); }
+    button { margin: 12px 8px 0 0; padding: 7px 10px; }
+  </style>
+</head>
+<body>
+  <header>
+    <img alt="Embedded demo image" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNQjVrwHwAD5gIffhG29QAAAABJRU5ErkJggg==">
+    <div>
+      <h1>Local Worker · demo dashboard</h1>
+      <div id="revision">Waiting for tool result</div>
+      <div id="app-modes">App modes: inline, fullscreen, pip</div>
+      <div id="mode">Checking host capabilities…</div>
+      <div id="pip-result"></div>
+    </div>
+  </header>
+  <table>
+    <thead><tr><th>Job</th><th>Status</th><th>Tier</th></tr></thead>
+    <tbody id="rows"><tr><td colspan="3">Waiting for data</td></tr></tbody>
+  </table>
+  <button id="refresh" type="button">Refresh demo data</button>
+  <button id="pip" type="button" hidden>Request PiP</button>
+  <script>
+    (() => {
+      let nextId = 1;
+      let hostContext = {};
+      const pending = new Map();
+      const rows = document.getElementById("rows");
+      const revision = document.getElementById("revision");
+      const mode = document.getElementById("mode");
+      const pipResult = document.getElementById("pip-result");
+      const pipButton = document.getElementById("pip");
+
+      function request(method, params) {
+        const id = nextId++;
+        window.parent.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
+        return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+      }
+
+      function render(result) {
+        const data = result && (result.structuredContent || result);
+        if (!data || !Array.isArray(data.rows)) return;
+        revision.textContent = "Revision " + String(data.revision || "unknown");
+        rows.replaceChildren();
+        for (const item of data.rows) {
+          const tr = document.createElement("tr");
+          for (const value of [item.job, item.status, item.tier]) {
+            const td = document.createElement("td");
+            td.textContent = String(value || "—");
+            tr.appendChild(td);
+          }
+          rows.appendChild(tr);
+        }
+      }
+
+      window.addEventListener("message", (event) => {
+        const message = event.data;
+        if (!message || message.jsonrpc !== "2.0") return;
+        if (message.id !== undefined && pending.has(message.id)) {
+          const entry = pending.get(message.id);
+          pending.delete(message.id);
+          if (message.error) entry.reject(new Error(message.error.message || "Host request failed"));
+          else entry.resolve(message.result);
+          return;
+        }
+        if (message.method === "ui/notifications/tool-result") render(message.params);
+        if (message.method === "ui/notifications/host-context-changed") {
+          hostContext = { ...hostContext, ...(message.params || {}) };
+          updateModeControls();
+        }
+      });
+
+      function updateModeControls() {
+        const supported = Array.isArray(hostContext.availableDisplayModes) ? hostContext.availableDisplayModes : [];
+        pipButton.hidden = !supported.includes("pip");
+        mode.textContent = "Current mode: " + (hostContext.displayMode || "unknown") +
+          " · host modes: " + (supported.length ? supported.join(", ") : "not advertised");
+      }
+
+      document.getElementById("refresh").addEventListener("click", async () => {
+        try { render(await request("tools/call", { name: "open_dashboard", arguments: {} })); }
+        catch (error) { revision.textContent = "Refresh failed: " + error.message; }
+      });
+
+      pipButton.addEventListener("click", async () => {
+        try {
+          const result = await request("ui/request-display-mode", { mode: "pip" });
+          pipResult.textContent = "PiP request response: " + String((result && result.mode) || "no mode returned");
+          hostContext.displayMode = result && result.mode;
+          updateModeControls();
+        } catch (error) { pipResult.textContent = "PiP request failed: " + error.message; }
+      });
+
+      request("ui/initialize", {
+        protocolVersion: "2026-01-26",
+        appInfo: { name: "local-worker-dashboard-spike", version: "0.1.0" },
+        appCapabilities: { availableDisplayModes: ["inline", "fullscreen", "pip"] },
+      }).then((result) => {
+        hostContext = (result && result.hostContext) || {};
+        window.parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} }, "*");
+        updateModeControls();
+      }).catch((error) => {
+        mode.textContent = "MCP Apps handshake failed: " + error.message;
+      });
+    })();
+  </script>
+</body>
+</html>
