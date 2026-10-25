@@ -276,7 +276,8 @@ def _terminate(process):
 
 
 def run_streaming(argv, *, cwd, env, timeout, stdin_data=None, observer=None,
-                  terminate_group=None, capture_limit_bytes=None):
+                  terminate_group=None, capture_limit_bytes=None, stall_seconds=None,
+                  on_stall=None):
     """Drain both pipes and feed stdin concurrently, bounded even with orphaned pipes.
 
     The callback receives raw bytes and must sanitize before persistence. Returned
@@ -298,9 +299,13 @@ def run_streaming(argv, *, cwd, env, timeout, stdin_data=None, observer=None,
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     termination = {"terminated": False, "force_killed": False, "survivors": False}
     timed_out = False
+    stalled = False
     output_limit_exceeded = False
     drain_deadline = None
     pending = memoryview(stdin_data or b"")
+    stall_timeout = (float(stall_seconds) if stall_seconds is not None and
+                     float(stall_seconds) > 0 else None)
+    stall_deadline = started + stall_timeout if stall_timeout is not None else None
 
     def stop():
         outcome = terminate_group(process) if terminate_group else _terminate(process)
@@ -333,12 +338,28 @@ def run_streaming(argv, *, cwd, env, timeout, stdin_data=None, observer=None,
         while selector.get_map() or process.poll() is None:
             now = time.monotonic()
             if now >= deadline:
+                if stalled:
+                    break
                 if not timed_out:
                     timed_out = True
                     termination = stop()
                     deadline = time.monotonic() + .5
                 else:
                     break
+            if stall_deadline is not None and now >= stall_deadline and not timed_out:
+                extend = False
+                if callable(on_stall):
+                    try:
+                        extend = bool(on_stall())
+                    except Exception:
+                        extend = False
+                if extend:
+                    stall_deadline = now + stall_timeout
+                else:
+                    stalled = True
+                    termination = stop()
+                    deadline = time.monotonic() + .5
+                    stall_deadline = None
             wait = min(.05, max(0, deadline - time.monotonic()))
             if drain_deadline is not None:
                 if time.monotonic() >= drain_deadline:
@@ -362,6 +383,8 @@ def run_streaming(argv, *, cwd, env, timeout, stdin_data=None, observer=None,
                 if not chunk:
                     close(pipe)
                     continue
+                if stall_timeout is not None:
+                    stall_deadline = time.monotonic() + stall_timeout
                 retained = limit - len(buffers[name])
                 if retained > 0:
                     buffers[name].extend(chunk[:retained])
@@ -390,6 +413,7 @@ def run_streaming(argv, *, cwd, env, timeout, stdin_data=None, observer=None,
         with contextlib.suppress(subprocess.TimeoutExpired):
             process.wait(timeout=.5)
     return {"argv": list(argv), "returncode": process.returncode, "timed_out": timed_out,
+            "stalled": stalled,
             "elapsed_seconds": round(time.monotonic() - started, 2),
             "stdout": bytes(buffers["stdout"]), "stderr": bytes(buffers["stderr"]),
             "termination": termination, "output_limit_exceeded": output_limit_exceeded}

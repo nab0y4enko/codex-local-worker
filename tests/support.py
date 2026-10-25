@@ -474,12 +474,14 @@ class FakeRun:
         """What a verification command prints (a subclass can change it)."""
         return "Ran 1 test OK\n"
 
-    def __call__(self, argv, *, cwd, env, timeout, stdin_data=None):
+    def __call__(self, argv, *, cwd, env, timeout, stdin_data=None, stall_seconds=None,
+                 on_stall=None):
         raw = [str(item) for item in argv]
         argv, wrapped = deny_wrapped(raw)
         call = {"argv": argv, "raw_argv": raw, "wrapped": wrapped,
                 "cwd": Path(cwd) if cwd else None, "env": dict(env), "timeout": timeout,
-                "stdin": (stdin_data or b"").decode("utf-8", "replace")}
+                "stdin": (stdin_data or b"").decode("utf-8", "replace"),
+                "stall_seconds": stall_seconds}
         self.calls.append(call)
         if wrapped and argv == WRAPPER_PROBE:
             call["kind"] = "wrapper_probe"

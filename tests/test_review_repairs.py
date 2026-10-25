@@ -95,11 +95,13 @@ class VerdictFollowsTheLastAttempt(unittest.TestCase):
 class TerminalRun(sp.FakeRun):
     """A worker that documents a terminal failure and still exits 0."""
 
-    def __call__(self, argv, *, cwd, env, timeout, stdin_data=None):
+    def __call__(self, argv, *, cwd, env, timeout, stdin_data=None, stall_seconds=None,
+                 on_stall=None):
         inner, _ = sp.deny_wrapped([str(item) for item in argv])
         if inner[1:2] != ["exec"]:
             return super().__call__(argv, cwd=cwd, env=env, timeout=timeout,
-                                    stdin_data=stdin_data)
+                                    stdin_data=stdin_data, stall_seconds=stall_seconds,
+                                    on_stall=on_stall)
         self.exec_calls += 1
         if self.worker_edit:
             self.worker_edit(Path(cwd), self.exec_calls)
@@ -287,14 +289,13 @@ class PromptStatesTheEffectiveCutoff(unittest.TestCase):
     def test_effective_cutoff_replaces_the_bare_total(self):
         task, worktree = self.task_and_worktree()
         prompt = lw.build_prompt(task, worktree, deadline=self.fixed(300.0),
-                                 attempt_timeout=180.0, reserve=60.0, attempt_cap=1200.0)
+                                 attempt_timeout=180.0, reserve=60.0)
         self.assertEqual(CUTOFF_LINE.search(prompt).group(1), "180.0")
-        self.assertIn("min(remaining 300.0s - verification reserve 60.0s, "
-                      "per-attempt cap 1200.0s)", prompt)
+        self.assertIn("That cutoff is remaining 300.0s - verification reserve 60.0s.", prompt)
 
     def test_cutoff_without_a_live_deadline_still_renders(self):
         task, worktree = self.task_and_worktree()
-        prompt = lw.build_prompt(task, worktree, attempt_timeout=42.5, attempt_cap=300.0)
+        prompt = lw.build_prompt(task, worktree, attempt_timeout=42.5)
         self.assertEqual(CUTOFF_LINE.search(prompt).group(1), "42.5")
 
     def test_no_cutoff_claim_without_an_attempt_budget(self):

@@ -450,8 +450,8 @@ class JobReport(LauncherCase):
 
     def test_job_options_use_discovery_fields_only(self):
         fields = set(lw.JobOptions.__dataclass_fields__)
-        self.assertLessEqual({"requested_model", "context_cap", "omlx_fetch", "load_model",
-                              "attempt_timeout_cap"}, fields)
+        self.assertLessEqual({"requested_model", "context_cap", "omlx_fetch", "load_model"}, fields)
+        self.assertNotIn("attempt_timeout_cap", fields)
         for gone in ("list_models", "canonical_model", "api_model", "context_window",
                      "model_settings_path"):
             self.assertNotIn(gone, fields)

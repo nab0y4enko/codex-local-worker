@@ -176,7 +176,8 @@ def _decode_body(raw: bytes) -> Any:
     return json.loads(raw.decode("utf-8"))
 
 
-def http_fetch(settings: ServerSettings, path: str, auth: bool) -> Tuple[int, Any]:
+def http_fetch(settings: ServerSettings, path: str, auth: bool,
+               timeout: Optional[float] = None) -> Tuple[int, Any]:
     """One request to the oMLX server: ``(status, parsed JSON body)``.
 
     GET, except the one blocking model-load endpoint, which is a POST. No proxies, no
@@ -191,7 +192,8 @@ def http_fetch(settings: ServerSettings, path: str, auth: bool) -> Tuple[int, An
         headers["Authorization"] = "Bearer " + settings.api_key
     request = urllib.request.Request(settings.base_url + path, headers=headers,
                                      method="POST" if loading else "GET")
-    timeout = LOAD_TIMEOUT_SECONDS if loading else HTTP_TIMEOUT_SECONDS
+    timeout = (LOAD_TIMEOUT_SECONDS if loading else HTTP_TIMEOUT_SECONDS) \
+        if timeout is None else max(.001, float(timeout))
     try:
         with build_opener().open(request, timeout=timeout) as response:
             status, raw = response.status, response.read()
@@ -439,14 +441,18 @@ def recheck(profile: ServerProfile, settings_path: Path,
     return "model_changed"
 
 
-def load_model(settings_path: Path, model_id: str, fetch: HttpFetch = http_fetch) -> None:
+def load_model(settings_path: Path, model_id: str, fetch: HttpFetch = http_fetch,
+               timeout: Optional[float] = None) -> None:
     """Ask oMLX to load a discovered model (the call blocks until it is in memory)."""
     settings = read_server_settings(settings_path)
     if not SAFE_MODEL_NAME.fullmatch(model_id):
         raise DiscoveryError("model_unknown", "%s is not a safe model name; refusing to ask "
                              "oMLX to load it" % _shown(model_id))
-    status, body = fetch(settings, "/v1/models/%s/load" % urllib.parse.quote(model_id, safe=""),
-                         True)
+    path = "/v1/models/%s/load" % urllib.parse.quote(model_id, safe="")
+    if timeout is not None and fetch is http_fetch:
+        status, body = fetch(settings, path, True, timeout=timeout)
+    else:
+        status, body = fetch(settings, path, True)
     if status == 200:
         return None
     detail = body.get("detail") if isinstance(body, dict) else None

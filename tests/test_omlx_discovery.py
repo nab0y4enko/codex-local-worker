@@ -906,6 +906,24 @@ class HttpFetchBehaviour(DiscoveryCase):
             self.assertIsNone(d.load_model(self.settings, QWEN))
         self.assertEqual(seen, [("POST", "/v1/models/%s/load" % QWEN, 900)])
 
+    def test_load_model_can_be_bounded_by_a_job_deadline(self):
+        seen = []
+
+        class Answer:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *exc): return False
+            def read(self): return b'{"status": "ok"}'
+
+        class Opener:
+            def open(self, request, timeout=None):
+                seen.append(timeout)
+                return Answer()
+
+        with mock.patch.object(d, "build_opener", return_value=Opener()):
+            self.assertIsNone(d.load_model(self.settings, QWEN, timeout=4.25))
+        self.assertEqual(seen, [4.25])
+
     def test_the_key_never_appears_in_any_error(self):
         stub, settings = self.serve({
             ("GET", "/unauthorised"): (401, {"detail": "bad key"}, {}),

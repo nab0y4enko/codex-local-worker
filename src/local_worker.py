@@ -116,6 +116,9 @@ MIN_ATTEMPT_BUDGET_SECONDS = 5.0
 FULL_HOST_BACKEND = "full-host-access"
 # No confining profile: the command is the contract argv (behind the deny wrapper, if applied).
 FULL_HOST_PROFILE = "none"
+STALL_FLOOR_SECONDS = 120.0
+STALL_UNKNOWN_RATES_SECONDS = 900.0
+STALL_SAFETY = 1.5
 FULL_HOST_PROBE_ARGV = ["/bin/echo", PROBE_MARKER]
 FULL_HOST_CONFINEMENT = "none (full host: launcher permissions, network enabled)"
 FULL_HOST_DENY_CONFINEMENT = ("full host minus the permissions deny list (sandbox-exec deny "
@@ -623,6 +626,25 @@ def profile_endpoint(profile: omlx_discovery.ServerProfile) -> str:
     return validate_endpoint(profile.base_url + API_PREFIX)
 
 
+def stall_limit(profile: omlx_discovery.ServerProfile, context_window: int) -> Dict[str, Any]:
+    """Derive the no-output watchdog from measured server rates, or use the fallback."""
+    prefill = profile.prefill_tps
+    generation = profile.generation_tps
+    output_tokens = min(profile.model.max_output_tokens or 8192, 8192)
+    inputs = {"context_window": int(context_window), "prefill_tps": prefill,
+              "generation_tps": generation, "max_output_tokens": profile.model.max_output_tokens,
+              "prompt_tokens": context_window * .8, "generation_tokens": output_tokens,
+              "safety": STALL_SAFETY, "floor_seconds": STALL_FLOOR_SECONDS}
+    if (type(prefill) not in (int, float) or prefill <= 0 or
+            type(generation) not in (int, float) or generation <= 0):
+        return {"seconds": STALL_UNKNOWN_RATES_SECONDS, "basis": "unknown_rates",
+                "inputs": dict(inputs, fallback_seconds=STALL_UNKNOWN_RATES_SECONDS)}
+    seconds = max(STALL_FLOOR_SECONDS,
+                  STALL_SAFETY * (inputs["prompt_tokens"] / float(prefill) +
+                                  output_tokens / float(generation)))
+    return {"seconds": seconds, "basis": "measured", "inputs": inputs}
+
+
 def strip_proxy_env(env: Dict[str, str]) -> Tuple[Dict[str, str], List[str]]:
     removed = sorted(name for name in env if name in PROXY_ENV_VARS)
     cleaned = {name: value for name, value in env.items() if name not in PROXY_ENV_VARS}
@@ -681,10 +703,14 @@ def policy_pins(profile: omlx_discovery.ServerProfile, context_window: int) -> D
 
 
 def load_requested_model(settings_path: Path, model: str,
-                         fetch: omlx_discovery.HttpFetch) -> Dict[str, Any]:
+                         fetch: omlx_discovery.HttpFetch,
+                         timeout: Optional[float] = None) -> Dict[str, Any]:
     """Explicitly ask oMLX to load ``model`` (``--load``); evidence for the report."""
     try:
-        omlx_discovery.load_model(Path(settings_path), model, fetch=fetch)
+        if timeout is not None and fetch is omlx_discovery.http_fetch:
+            omlx_discovery.load_model(Path(settings_path), model, fetch=fetch, timeout=timeout)
+        else:
+            omlx_discovery.load_model(Path(settings_path), model, fetch=fetch)
     except omlx_discovery.DiscoveryError as error:
         raise _discovery_failure(error) from error
     return {"requested": model, "loaded": True}
@@ -1514,7 +1540,8 @@ def _terminate_group(process: subprocess.Popen) -> Dict[str, Any]:
 
 
 def run_bounded(argv: Sequence[str], *, cwd: Optional[Path], env: Dict[str, str],
-                timeout: float, stdin_data: Optional[bytes] = None) -> Dict[str, Any]:
+                timeout: float, stdin_data: Optional[bytes] = None, stall_seconds=None,
+                on_stall=None) -> Dict[str, Any]:
     """Run argv in its own process group and kill the whole group on deadline.
 
     One runner does all of it. ``observation.run_streaming`` drains both pipes concurrently so
@@ -1528,6 +1555,7 @@ def run_bounded(argv: Sequence[str], *, cwd: Optional[Path], env: Dict[str, str]
     return observation.run_streaming(
         argv, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data,
         observer=_RUN_OBSERVER.get() if stdin_data is not None else None,
+        stall_seconds=stall_seconds, on_stall=on_stall,
         terminate_group=_terminate_group)
 
 
@@ -1832,11 +1860,11 @@ APPLE_PROMPT_NOTE = (
 
 
 def _attempt_budget_lines(deadline: Optional[Deadline], attempt_timeout: Optional[float],
-                          reserve: Optional[float], attempt_cap: Optional[float]) -> List[str]:
+                          reserve: Optional[float]) -> List[str]:
     """What the worker is actually allowed to spend on *this* attempt, in its own words.
 
     The total job budget alone is not actionable: the worker is killed much earlier, at
-    ``min(remaining - verification reserve, per-attempt cap)``.
+    the remaining budget after the verification reserve.
     """
     if attempt_timeout is None:
         return []
@@ -1848,19 +1876,16 @@ def _attempt_budget_lines(deadline: Optional[Deadline], attempt_timeout: Optiona
             parts.append(f"remaining {left:.1f}s")
         else:
             parts.append(f"remaining {left:.1f}s - verification reserve {float(reserve):.1f}s")
-    if attempt_cap is not None:
-        parts.append(f"per-attempt cap {float(attempt_cap):.1f}s")
     line = (f"- This attempt: the worker and its whole process group are killed at "
             f"{effective:.1f}s.")
     if parts:
-        line += f" That effective cutoff is min({', '.join(parts)})."
+        line += f" That cutoff is {', '.join(parts)}."
     return [line, "- Budget each step against that cutoff, not against the total above."]
 
 
 def _budget_section(task: Task, deadline: Optional[Deadline],
                     attempt_timeout: Optional[float] = None,
-                    reserve: Optional[float] = None,
-                    attempt_cap: Optional[float] = None) -> List[str]:
+                    reserve: Optional[float] = None) -> List[str]:
     """Total job budget and, when a live Deadline is handed in, what is actually left of it.
 
     The remainder is read from the shared job Deadline at prompt-construction time, so a retry
@@ -1879,12 +1904,12 @@ def _budget_section(task: Task, deadline: Optional[Deadline],
     if deadline is None:
         lines.append("- Remaining now: not measured by this render; the launcher tracks the "
                      "shared budget itself.")
-        lines.extend(_attempt_budget_lines(deadline, attempt_timeout, reserve, attempt_cap))
+        lines.extend(_attempt_budget_lines(deadline, attempt_timeout, reserve))
         return lines
     left = max(0.0, deadline.remaining())
     ends_at = (datetime.now(timezone.utc) + timedelta(seconds=left)).strftime("%Y-%m-%dT%H:%M:%SZ")
     lines.append(f"- Remaining now: {left:.1f}s of that total (hard deadline {ends_at} UTC).")
-    lines.extend(_attempt_budget_lines(deadline, attempt_timeout, reserve, attempt_cap))
+    lines.extend(_attempt_budget_lines(deadline, attempt_timeout, reserve))
     return lines
 
 
@@ -1892,8 +1917,7 @@ def build_prompt(task: Task, worktree: Path, feedback: Optional[str] = None,
                  apple_udid: Optional[str] = None,
                  deadline: Optional[Deadline] = None,
                  attempt_timeout: Optional[float] = None,
-                 reserve: Optional[float] = None,
-                 attempt_cap: Optional[float] = None) -> str:
+                 reserve: Optional[float] = None) -> str:
     lines = [
         f"Task {task.task_id} (base commit {task.base_ref}).",
         *PROMPT_RULES,
@@ -1910,8 +1934,7 @@ def build_prompt(task: Task, worktree: Path, feedback: Optional[str] = None,
         "Launcher-owned verification commands (argv arrays, run from the worktree root by the "
         "launcher after you return):",
         *[f"- {json.dumps(argv)}" for argv in task.test_commands],
-        *_budget_section(task, deadline, attempt_timeout=attempt_timeout, reserve=reserve,
-                         attempt_cap=attempt_cap),
+        *_budget_section(task, deadline, attempt_timeout=attempt_timeout, reserve=reserve),
         "",
         f"Worktree: {worktree}",
     ]
@@ -2690,7 +2713,6 @@ class JobOptions:
     load_model: bool = False
     omlx_fetch: omlx_discovery.HttpFetch = omlx_discovery.http_fetch
     verify: bool = True
-    attempt_timeout_cap: Optional[float] = policy.ATTEMPT_SECONDS
     apple_simulator_udid: Optional[str] = None
     maximum: int = 1
     native_preflight_plan: Optional[Path] = None
@@ -2718,7 +2740,6 @@ def new_report(options: JobOptions) -> Dict[str, Any]:
         "api_model": None,
         "model_profile": {},
         "context_window": None,
-        "attempt_timeout_cap_seconds": options.attempt_timeout_cap,
         "model_fallback": False,
         "provider": PROVIDER_ID,
         # The installed Codex CLI's compatibility evidence, the job's own Codex home and the
@@ -2952,8 +2973,10 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     if options.load_model:
         if not options.requested_model:
             raise ContractError("--load requires --model")
+        load_timeout = deadline.require("model load")
         report["model_load"] = load_requested_model(options.settings_path,
-                                                    options.requested_model, options.omlx_fetch)
+                                                    options.requested_model, options.omlx_fetch,
+                                                    timeout=load_timeout)
     profile, context_window = discover_job_profile(
         options.settings_path, options.requested_model, options.context_cap, options.omlx_fetch)
     report["preflight"] = preflight_receipt(profile, context_window)
@@ -3149,15 +3172,11 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         if remaining <= reserve + 1:
             report["failure_reason"] = "worker admission stopped to preserve independent verification time"
             break
-        attempt_cap = (float(options.attempt_timeout_cap)
-                       if options.attempt_timeout_cap is not None else None)
         attempt_timeout = deadline.cap(remaining - reserve)
-        if attempt_cap is not None:
-            attempt_timeout = min(attempt_timeout, attempt_cap)
+        stall = stall_limit(profile, context_window)
         prompt = build_prompt(task, worktree, feedback,
                               apple_udid=options.apple_simulator_udid, deadline=deadline,
-                              attempt_timeout=attempt_timeout, reserve=reserve,
-                              attempt_cap=attempt_cap)
+                              attempt_timeout=attempt_timeout, reserve=reserve)
         if loaded["prompt"]:
             prompt += "\n" + loaded["prompt"] + "\n"
 
@@ -3187,8 +3206,19 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
             if stream is not None:
                 stream.start_attempt(report["job_id"])
             report["_active_attempt"] = {"before_patch": patch_before}
+            def server_busy():
+                try:
+                    settings = omlx_discovery.read_server_settings(options.settings_path)
+                    code, body = options.omlx_fetch(settings, "/api/status", True)
+                    if code != 200 or not isinstance(body, dict):
+                        return False
+                    return any(type(body.get(name)) is int and body[name] > 0
+                               for name in ("active_requests", "waiting_requests"))
+                except Exception:
+                    return False
             result = run_bounded(wrapper.wrap(argv), cwd=worktree, env=env,
-                                 timeout=attempt_timeout, stdin_data=prompt.encode("utf-8"))
+                                 timeout=attempt_timeout, stdin_data=prompt.encode("utf-8"),
+                                 stall_seconds=stall["seconds"], on_stall=server_busy)
         except BaseException:
             observer.finish(status="failed")
             snapshot = observer.snapshot()
@@ -3246,10 +3276,12 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
             "attempt": attempt_number,
             "returncode": result["returncode"],
             "timed_out": result["timed_out"],
+            "stalled": bool(result.get("stalled")),
             "output_limit_exceeded": bool(result.get("output_limit_exceeded")),
             "elapsed_seconds": result["elapsed_seconds"],
             "verification_reserve_seconds": reserve,
             "worker_timeout_seconds": attempt_timeout,
+            "limits": {"stall": stall, "budget_seconds": attempt_timeout},
             "has_scoped_patch": has_patch,
             "usage": evidence["usage"],
             "termination": result["termination"],
@@ -3324,6 +3356,7 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         report["violations"] = audit.violations
 
         worker_ok = (result["returncode"] == 0 and not result["timed_out"]
+                     and not result.get("stalled")
                      and not result.get("output_limit_exceeded")
                      and routing != "mismatch" and not evidence["terminal_failure"])
         tests_ok = (all(test.get("status") == "passed" for test in tests) if options.verify else True)
@@ -3752,8 +3785,7 @@ def summary_lines(report: Dict[str, Any]) -> List[str]:
     model = (report.get("model_profile") or {}).get("model") or {}
     if report.get("api_model"):
         model_line = (f"model: {model.get('canonical_id')} -> {report.get('api_model')} @ "
-                      f"{report.get('endpoint')} (context {report.get('context_window')}, "
-                      f"attempt cap {report.get('attempt_timeout_cap_seconds')}s)")
+                      f"{report.get('endpoint')} (context {report.get('context_window')})")
     else:
         model_line = "model: not discovered"
     lines = [

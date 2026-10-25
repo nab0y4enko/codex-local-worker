@@ -18,7 +18,6 @@ import time
 EMPTY_LIMIT = 2
 REPAIR_ATTEMPTS = 2
 REPAIR_SECONDS = 1200.0
-ATTEMPT_SECONDS = 300.0
 
 class PolicyStop(RuntimeError):
     pass
