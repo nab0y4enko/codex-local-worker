@@ -102,7 +102,7 @@ class ClassifyTests(unittest.TestCase):
                                   "classification": {"class": "none", "code": "ok"},
                                   "report_dir": "/tmp/report"})
         self.assertEqual(list(result), ["job_id", "kind", "tier", "model", "status",
-                                        "classification", "answer", "patch_path", "screenshots",
+                                        "classification", "answer", "answer_evidence", "patch_path", "screenshots",
                                         "tests", "tokens", "durations", "report_path"])
 
     def test_classifier_ignores_worker_prose(self):

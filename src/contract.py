@@ -156,7 +156,7 @@ class Contract:
         elif kind == "read":
             question = _string(payload["question"], "question")
             scope_paths = [_relative_path(item, "scope_paths[]") for item in
-                           _string_list(payload["scope_paths"], "scope_paths", allow_empty=True)]
+                           _string_list(payload["scope_paths"], "scope_paths", allow_empty=False)]
             schema = payload["answer_schema"]
             _validate_schema_keywords(schema)
             max_bytes = _integer(payload["max_answer_bytes"], "max_answer_bytes")

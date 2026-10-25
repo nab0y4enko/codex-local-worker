@@ -3453,11 +3453,51 @@ def read_output_schema(tier_kind: str, schema_path: Path) -> Optional[Path]:
 
 
 def _read_prompt(task: Task, worktree: Path) -> str:
+    if task.scope_paths:
+        import shlex
+
+        helper = Path(__file__).resolve().parent / "source_citations.py"
+        scope_args = " ".join("--scope " + shlex.quote(path) for path in task.scope_paths)
+        first_scope = task.scope_paths[0]
+        if (worktree / first_scope).is_file():
+            example_path = first_scope
+        else:
+            example_path = "<file-within-scope>"
+        citation_instructions = [
+            "Then use the numbered source helper to obtain blank-line-aware line numbers and ready "
+            "citation entries. Repeat --scope for every contract scope, and replace the example path "
+            "with a file inside one of those scopes:",
+            "python3 %s --repo %s %s --path %s --start 1 --count 40" % (
+                shlex.quote(str(helper)), shlex.quote(str(worktree)), scope_args,
+                shlex.quote(example_path)),
+        ]
+    else:
+        citation_instructions = [
+            "There are no declared source scopes, so no repository source can be read or cited. "
+            "Do not invent a citation or read outside a declared scope.",
+        ]
+    if task.scope_paths:
+        source_read_instructions = [
+            "List relevant files within the declared scopes first. For directory scopes, select "
+            "relevant files instead of trying to cat the directory or read every file. Then cat "
+            "the selected files as text before answering. Cite only lines read from the current worktree.",
+        ]
+    else:
+        source_read_instructions = [
+            "No source files are declared as readable. Cite only lines read from the current worktree.",
+        ]
     return "\n".join([
         f"Read task {task.task_id} (base commit {task.base_ref}).",
         "Answer the question using only the current worktree. Do not modify any files.",
-        "Start with cat on the listed paths and read each scoped source file as text before answering. "
-        "Cite only lines read from the current worktree.",
+        *source_read_instructions,
+        *citation_instructions,
+        "Copy a ready citation entry exactly, without changing its path, line numbers or quote. "
+        "The launcher still independently verifies every citation against the worktree.",
+        "Separate explicit source facts from inferences. If a requested command is absent "
+        "from the scoped sources, report it as not specified. Do not present inferred commands "
+        "as verified: label suggestions unverified unless you executed them successfully in "
+        "this worktree without violating the read-only scope. A valid citation alone does not "
+        "prove an inferred command is installed or runnable.",
         "Return JSON matching this schema. Include at least one citation and quote the cited "
         "source lines exactly apart from whitespace normalization. Your final message must be "
         "only the JSON object, with no other text.",
@@ -3646,6 +3686,11 @@ def _execute_read_job(options: JobOptions, report: Dict[str, Any], deadline: Dea
     if routing == "mismatch":
         errors.append("worker model routing did not match the pinned model")
     report["status"] = "answer_invalid" if errors else "ok"
+    report["answer_evidence"] = {
+        "checked": "schema_and_source_citations_only",
+        "semantic_review": "answer_withheld" if errors else "required",
+        "commands_independently_verified": False,
+    }
     if errors:
         report.pop("answer", None)
         report["citations"] = []
@@ -5277,6 +5322,7 @@ def planner_json(report: Dict[str, Any]) -> Dict[str, Any]:
         "status": report.get("status"),
         "classification": report.get("classification"),
         "answer": report.get("answer"),
+        "answer_evidence": report.get("answer_evidence"),
         "patch_path": report.get("patch_path"),
         "screenshots": report.get("screenshots", []),
         "tests": report.get("tests", []),

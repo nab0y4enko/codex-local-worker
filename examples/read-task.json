@@ -1,0 +1,42 @@
+{
+  "task_id": "inspect-conventions",
+  "kind": "read",
+  "repo_path": "/absolute/path/to/repository",
+  "base_ref": "main",
+  "goal": "Inspect existing repository conventions",
+  "timeout_seconds": 180,
+  "workstream": "inspect-conventions",
+  "environment": {
+    "pass": []
+  },
+  "tier": {
+    "local": true
+  },
+  "question": "Summarize the implementation and test conventions relevant to the requested change. Cite every factual claim with exact source lines.",
+  "scope_paths": [
+    "src",
+    "tests"
+  ],
+  "answer_schema": {
+    "type": "object",
+    "required": [
+      "summary",
+      "conventions"
+    ],
+    "additionalProperties": false,
+    "properties": {
+      "summary": {
+        "type": "string",
+        "maxLength": 500
+      },
+      "conventions": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "maxLength": 200
+        }
+      }
+    }
+  },
+  "max_answer_bytes": 4096
+}

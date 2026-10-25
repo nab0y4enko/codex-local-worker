@@ -52,6 +52,19 @@ class ContractV2Tests(unittest.TestCase):
             contract.Contract.from_payload({**self.read_payload(), "answer_schema": {
                 "type": "object", "patternProperties": {}}})
 
+    def test_read_contract_requires_a_source_scope_for_mandatory_citations(self):
+        with self.assertRaisesRegex(lw.ContractError, "scope_paths"):
+            contract.Contract.from_payload({**self.read_payload(), "scope_paths": []})
+
+    def test_read_example_is_accepted_by_the_contract_parser(self):
+        example_path = Path(__file__).resolve().parents[1] / "examples" / "read-task.json"
+        payload = json.loads(example_path.read_text(encoding="utf-8"))
+        payload["repo_path"] = str(self.repo)
+        parsed = contract.Contract.from_payload(payload)
+        self.assertEqual(parsed.kind, "read")
+        self.assertEqual(parsed.goal, "Inspect existing repository conventions")
+        self.assertEqual(parsed.scope_paths, ["src", "tests"])
+
     def test_environment_pass_refuses_routing_names_and_redacts_values(self):
         with self.assertRaises(lw.ContractError):
             contract.Contract.from_payload(self.write_payload(environment={"pass": ["OPENAI_API_KEY"]}))

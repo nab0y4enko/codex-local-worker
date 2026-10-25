@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -83,18 +84,64 @@ class ReadJobTests(unittest.TestCase):
         self.assertNotIn("--output-schema", worker)
         self.assertEqual(run.verification_calls(), [])
 
+    def test_valid_citations_do_not_claim_semantic_or_command_verification(self):
+        report, _ = self.run_read_job()
+        self.assertEqual(report["status"], "ok")
+        evidence = lw.planner_json(report).get("answer_evidence")
+        self.assertEqual(evidence, {
+            "checked": "schema_and_source_citations_only",
+            "semantic_review": "required",
+            "commands_independently_verified": False,
+        })
+
     def test_read_prompt_requests_textual_file_access_before_answering(self):
         task = contract.Contract.from_payload(self.payload())
         prompt = lw._read_prompt(task, self.repo)
-        self.assertIn("Start with cat on the listed paths", prompt)
+        self.assertIn("For directory scopes, select relevant files instead of trying to cat the directory", prompt)
+        self.assertIn("cat the selected files as text", prompt)
         self.assertIn("Cite only lines read from the current worktree", prompt)
+        self.assertIn("source_citations.py", prompt)
+        self.assertIn("--scope add.py", prompt)
+        self.assertIn("--path add.py --start 1 --count 40", prompt)
+        self.assertIn("Copy a ready citation entry", prompt)
         self.assertIn('"citations"', prompt)
         self.assertIn('"answer"', prompt)
+
+    def test_directory_scope_prompt_selects_files_before_reading(self):
+        payload = self.payload()
+        payload["scope_paths"] = ["src"]
+        task = contract.Contract.from_payload(payload)
+        prompt = lw._read_prompt(task, self.repo)
+        self.assertIn("For directory scopes, select relevant files instead of trying to cat the directory", prompt)
+        self.assertIn("cat the selected files as text", prompt)
+        self.assertIn("--scope src", prompt)
+        self.assertIn("--path '<file-within-scope>'", prompt)
+
+    def test_read_prompt_shell_quotes_scope_paths(self):
+        payload = self.payload()
+        payload["scope_paths"] = ["dir with space"]
+        task = contract.Contract.from_payload(payload)
+        prompt = lw._read_prompt(task, self.repo)
+        self.assertIn("--scope 'dir with space'", prompt)
+        self.assertIn("--path '<file-within-scope>'", prompt)
+
+    def test_read_prompt_does_not_offer_an_unrunnable_helper_without_scope(self):
+        task = replace(contract.Contract.from_payload(self.payload()), scope_paths=[])
+        prompt = lw._read_prompt(task, self.repo)
+        self.assertNotIn("source_citations.py", prompt)
+        self.assertIn("no declared source scopes", prompt)
 
     def test_read_prompt_asks_for_only_the_json_object_as_the_final_message(self):
         task = contract.Contract.from_payload(self.payload())
         prompt = lw._read_prompt(task, self.repo)
         self.assertIn("final message must be only the JSON object", prompt)
+
+    def test_read_prompt_distinguishes_source_facts_from_unverified_commands(self):
+        task = contract.Contract.from_payload(self.payload())
+        prompt = lw._read_prompt(task, self.repo)
+        self.assertIn("Separate explicit source facts from inferences", prompt)
+        self.assertIn("Do not present inferred commands as verified", prompt)
+        self.assertIn("not specified", prompt)
 
     def test_only_cloud_reads_use_the_native_output_schema(self):
         schema = Path("/tmp/answer.schema.json")
