@@ -6,6 +6,7 @@ with the profile generated from the user's permissions list. The mocked runner s
 wrapper and records ``wrapped``/``raw_argv``, so these tests read what really would have run.
 One class drives a real job through the real ``sandbox-exec`` with a stand-in Codex executable.
 """
+import errno
 import hashlib
 import json
 import os
@@ -18,6 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import support as sp  # noqa: E402
+import codex_catalog  # noqa: E402
 import permissions  # noqa: E402
 
 lw = sp.lw
@@ -141,6 +143,144 @@ class WrappedJobs(WrapperCase):
         report, _ = self.run_clean_job()
         self.assertIs(report["primary_changed_during_job"], False)
         self.assertTrue(report["primary_unchanged"])
+
+
+class CatalogAndLastMessage(WrapperCase):
+    """R23: the model catalog is the launcher's file (report dir, not the worker's Codex home),
+    and a missing ``-o`` file is a missing file, not tampering."""
+
+    def test_the_catalog_lives_in_the_report_dir_and_not_in_the_workers_codex_home(self):
+        report, run = self.run_clean_job()
+        self.assertEqual(report["status"], "ok", report.get("failure_reason"))
+        report_dir, codex_home = Path(report["report_dir"]), Path(report["codex_home"])
+        catalog = report_dir / codex_catalog.CATALOG_NAME
+        self.assertTrue(catalog.is_file())
+        self.assertFalse((codex_home / codex_catalog.CATALOG_NAME).exists())
+        self.assertEqual(report["catalog_sha256"], hashlib.sha256(catalog.read_bytes()).hexdigest())
+        pin = lw.config_overrides_map(run.calls_of("exec")[0]["argv"])[lw.CATALOG_PIN_KEY]
+        self.assertEqual(pin, json.dumps(str(catalog)))
+
+    def test_the_profile_does_not_reopen_the_catalog_but_reopens_the_codex_home(self):
+        report, _ = self.run_clean_job()
+        text = Path(report["permissions"]["profile"]).read_text(encoding="utf-8")
+        report_dir = Path(report["report_dir"])
+        self.assertFalse(sp.seatbelt_write_allowed(text, report_dir / codex_catalog.CATALOG_NAME))
+        self.assertTrue(sp.seatbelt_write_allowed(text, Path(report["codex_home"]) / "session.log"))
+
+    def test_a_changed_catalog_is_still_refused_by_the_self_check(self):
+        profile = sp.discovered_profile()
+        root = sp.tmpdir()
+        self.addCleanup(sp.cleanup, root)
+        path = root / codex_catalog.CATALOG_NAME
+        sha = codex_catalog.write_catalog(path, codex_catalog.build_local_entry(profile.model, 32768))
+        argv = lw.worker_argv("codex", root, profile, 32768, root / "o.txt", catalog_path=path)
+        self.assertEqual(lw.missing_config_pins(argv, profile, 32768, (path, sha)), [])
+        path.write_text("{}\n")
+        (problem,) = lw.missing_config_pins(argv, profile, 32768, (path, sha))
+        self.assertIn("changed after it was generated", problem)
+
+    def test_a_catalog_swapped_for_a_symlink_is_refused_without_reading_through_it(self):
+        profile = sp.discovered_profile()
+        root = sp.tmpdir()
+        self.addCleanup(sp.cleanup, root)
+        path = root / codex_catalog.CATALOG_NAME
+        sha = codex_catalog.write_catalog(path, codex_catalog.build_local_entry(profile.model, 32768))
+        secret = root / "secret.txt"
+        secret.write_text("not for the launcher\n")
+        path.unlink()
+        path.symlink_to(secret)
+        argv = lw.worker_argv("codex", root, profile, 32768, root / "o.txt", catalog_path=path)
+        (problem,) = lw.missing_config_pins(argv, profile, 32768, (path, sha))
+        self.assertIn("can no longer be read", problem)
+        self.assertNotIn(hashlib.sha256(secret.read_bytes()).hexdigest(), problem)
+
+    def test_a_missing_last_message_file_is_recorded_as_missing(self):
+        report, _ = self.run_clean_job()  # the mocked worker never writes its -o file
+        (attempt,) = report["attempts"]
+        self.assertIn("No such file", attempt["last_message_missing"])
+        self.assertNotIn("last_message_tampered", attempt)
+        self.assertEqual(attempt["last_message_excerpt"], "")
+
+    def test_a_symlink_at_the_last_message_path_is_tampering_and_never_read(self):
+        secret = self.root / "secret.txt"
+        secret.write_text("TOP-SECRET-CONTENT\n")
+
+        def edit(cwd, attempt):
+            self.fix(cwd)
+            link = Path(next(iter(self.report_dirs()))) / "attempt-1.last-message.txt"
+            link.symlink_to(secret)
+
+        report, _ = self.run_clean_job(worker_edit=edit)
+        (attempt,) = report["attempts"]
+        self.assertIn("symlink", attempt["last_message_tampered"])
+        self.assertNotIn("last_message_missing", attempt)
+        self.assertNotIn("TOP-SECRET", json.dumps(report))
+
+    def report_dirs(self):
+        return sorted((self.state / "reports").iterdir())
+
+
+class NativeRoots(WrapperCase):
+    """NB1: the roots the profile re-opens and rename-protects are made by the launcher."""
+
+    def test_both_roots_are_created_private_and_reused_when_present(self):
+        report_dir = self.root / "report"
+        report_dir.mkdir()
+        roots = lw.create_native_roots(report_dir)
+        self.assertEqual([root.name for root in roots], [lw.NATIVE_SCRATCH_NAME, lw.SCREENSHOTS_DIR_NAME])
+        for root in roots:
+            self.assertTrue(root.is_dir())
+            self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+        (roots[0] / "keep").write_text("x")
+        lw.create_native_roots(report_dir)  # idempotent: nothing is replaced
+        self.assertTrue((roots[0] / "keep").exists())
+
+    def test_a_link_or_file_in_the_way_is_refused(self):
+        report_dir = self.root / "report"
+        report_dir.mkdir()
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (report_dir / lw.NATIVE_SCRATCH_NAME).symlink_to(elsewhere)
+        with self.assertRaises(lw.BlockedError):
+            lw.create_native_roots(report_dir)
+        (report_dir / lw.NATIVE_SCRATCH_NAME).unlink()
+        (report_dir / lw.NATIVE_SCRATCH_NAME).write_text("a file")
+        with self.assertRaises(lw.BlockedError):
+            lw.create_native_roots(report_dir)
+
+    def test_a_job_creates_them_before_the_profile_is_built(self):
+        report, _ = self.run_clean_job()
+        report_dir = Path(report["report_dir"])
+        self.assertTrue((report_dir / lw.NATIVE_SCRATCH_NAME).is_dir())
+        self.assertTrue((report_dir / lw.SCREENSHOTS_DIR_NAME).is_dir())
+        text = Path(report["permissions"]["profile"]).read_text(encoding="utf-8")
+        self.assertTrue(sp.seatbelt_write_allowed(text, report_dir / lw.NATIVE_SCRATCH_NAME / "derived" / "x"))
+        self.assertTrue(sp.seatbelt_write_allowed(text, report_dir / lw.SCREENSHOTS_DIR_NAME / "a.png"))
+
+
+class DenyWriteConflicts(WrapperCase):
+    def test_a_deny_write_entry_covering_the_state_directory_refuses_the_job(self):
+        self.write_permissions(deny_write=[str(self.state)])
+        report, run = self.run_clean_job()
+        self.assertEqual(report["status"], "preflight_failed")
+        self.assertIn("deny_write entry", report["failure_reason"])
+        self.assertIn("allow-write", report["failure_reason"])
+        self.assertEqual(run.calls_of("exec"), [])
+        self.assertIsNone(report["worktree"])
+
+    def test_a_deny_write_entry_covering_the_report_directory_refuses_the_job(self):
+        # The job id (so the report dir) is not known until the job starts: an entry above every
+        # report dir is the one a user can write, and it is caught like the state directory.
+        self.write_permissions(deny_write=[str(self.state / "reports")])
+        report, run = self.run_clean_job()
+        self.assertEqual(report["status"], "preflight_failed")
+        self.assertIn("report directory", report["failure_reason"])
+        self.assertEqual(run.calls_of("exec"), [])
+
+    def test_the_default_deny_write_list_refuses_nothing(self):
+        report, _ = self.run_clean_job()
+        self.assertEqual(report["status"], "ok", report.get("failure_reason"))
+
 
 
 class WrapperRefusals(WrapperCase):
@@ -328,6 +468,22 @@ STUB_CODEX = textwrap.dedent('''\
     attempt("profile", lambda: write(os.path.join(report_dir, "permissions.sb"), "", "a"))
     attempt("other_job", lambda: os.mkdir(os.path.join(state, "worktrees", "planted")))
     attempt("state_moved", lambda: os.rename(state, state + "-moved"))
+    # R23: the catalog is the launcher's file, not the worker's.
+    attempt("catalog", lambda: write(os.path.join(report_dir, "local-model-catalog.json"), "{}", "a"))
+    attempt("catalog_replaced", lambda: (os.unlink(os.path.join(report_dir, "local-model-catalog.json")),))
+    # NB1: native tools create their own directories under the two pre-made roots.
+    attempt("scratch_mkdir", lambda: os.makedirs(os.path.join(report_dir, "apple-scratch", "derived", "Build")))
+    attempt("scratch_write", lambda: write(os.path.join(report_dir, "apple-scratch", "derived", "Build", "f")))
+    attempt("screenshot", lambda: write(os.path.join(report_dir, "screenshots", "shot.png")))
+    attempt("scratch_root_moved", lambda: os.rename(os.path.join(report_dir, "apple-scratch"),
+                                                    os.path.join(report_dir, "scratch-moved")))
+    # R22: the resolved common dir of the primary, wherever it is (read from the gitfile).
+    admin = open(os.path.join(cwd, ".git")).read().split("gitdir:", 1)[1].strip()
+    common = os.path.realpath(os.path.join(admin, open(os.path.join(admin, "commondir")).read().strip()))
+    attempt("common_config", lambda: write(os.path.join(common, "config"), "[core]\\n", "a"))
+    attempt("common_attributes", lambda: write(os.path.join(common, "info", "attributes"), "* filter=x\\n"))
+    attempt("common_merge_head", lambda: write(os.path.join(common, "MERGE_HEAD"), "0" * 40))
+    attempt("common_objects", lambda: write(os.path.join(common, "objects", "zz-job-object")))
     write(out, json.dumps(results, sort_keys=True))
     print(json.dumps({"type": "turn.completed", "model": model,
                       "usage": {"input_tokens": 3, "output_tokens": 2}}))
@@ -372,6 +528,58 @@ class RealWrappedJob(WrapperCase):
         self.assertEqual(report["tests"][0]["status"], "passed")
         self.assertIs(report["tests"][0]["deny_list_applied"], True)
 
+    def run_stub_job(self, repo):
+        codex = self.stub_codex()
+        options = sp.job_options(self.root, repo, test_commands=[[sys.executable, "-c", "print('checked')"]])
+        options.codex_bin = str(codex)
+        report = lw.run_job(options)
+        if not report["permissions"]["deny_list_applied"]:
+            self.skipTest("sandbox-exec cannot apply a profile here: " + str(report["permissions"]["reason"]))
+        self.assertEqual(report["status"], "ok", report.get("failure_reason"))
+        return report, json.loads(Path(report["report_dir"], "attempt-1.last-message.txt").read_text())
+
+    def test_the_catalog_is_read_only_and_the_native_roots_are_creatable_in_a_real_job(self):
+        report, results = self.run_stub_job(self.repo)
+        # R23: the worker can neither rewrite nor replace the launcher's catalog.
+        self.assertEqual(results["catalog"], "Operation not permitted")
+        self.assertEqual(results["catalog_replaced"], "Operation not permitted")
+        catalog = Path(report["report_dir"]) / codex_catalog.CATALOG_NAME
+        self.assertEqual(report["catalog_sha256"], hashlib.sha256(catalog.read_bytes()).hexdigest())
+        # NB1: apple-scratch and screenshots are pre-created, so tools can build under them, but
+        # the roots themselves cannot be moved away.
+        for name in ("scratch_mkdir", "scratch_write", "screenshot"):
+            with self.subTest(name=name):
+                self.assertEqual(results[name], "ok")
+        self.assertEqual(results["scratch_root_moved"], "Operation not permitted")
+        self.assertTrue((Path(report["report_dir"]) / lw.NATIVE_SCRATCH_NAME / "derived" / "Build" / "f").is_file())
+        self.assertTrue((Path(report["report_dir"]) / lw.SCREENSHOTS_DIR_NAME / "shot.png").is_file())
+
+    def test_a_job_on_a_primary_with_a_separate_git_dir_cannot_write_its_common_dir(self):
+        primary = self.root / "sep-primary"
+        sep = self.root / "gitdirs" / "sep.git"
+        sep.parent.mkdir()
+        sp.git(self.root, "init", "-q", "--initial-branch=main", "--separate-git-dir", str(sep), str(primary))
+        for name, text in sp.BASE_FILES.items():
+            (primary / name).write_text(text)
+        sp.git(primary, "add", "-A")
+        sp.git(primary, "commit", "-q", "-m", "base")
+        config_before = (sep / "config").read_bytes()
+        report, results = self.run_stub_job(primary)
+        for name in ("common_config", "common_attributes", "common_merge_head"):
+            with self.subTest(name=name):
+                self.assertEqual(results[name], "Operation not permitted")
+        self.assertEqual(results["common_objects"], "ok")  # objects/ stays writable for commits
+        self.assertEqual((sep / "config").read_bytes(), config_before)
+        self.assertFalse((sep / "info" / "attributes").exists())
+        self.assertFalse((sep / "MERGE_HEAD").exists())
+
+    def test_a_job_on_a_plain_primary_cannot_write_its_common_dir_either(self):
+        report, results = self.run_stub_job(self.repo)
+        for name in ("common_config", "common_attributes", "common_merge_head"):
+            with self.subTest(name=name):
+                self.assertEqual(results[name], "Operation not permitted")
+        self.assertFalse((self.repo / ".git" / "MERGE_HEAD").exists())
+
 
 class JobWritablePaths(WrapperCase):
     def test_a_tmpdir_that_covers_the_report_directory_is_not_reopened(self):
@@ -389,7 +597,21 @@ class JobWritablePaths(WrapperCase):
         self.assertIn(elsewhere, kept)
 
 
+FIFO_PROBE = textwrap.dedent('''\
+    import json, sys
+    sys.path.insert(0, sys.argv[1])
+    import local_worker as lw
+    from pathlib import Path
+    path, report_dir = Path(sys.argv[2]), Path(sys.argv[3])
+    print(json.dumps({"read": list(lw.safe_read_job_text(path, report_dir, [])),
+                      "sha": lw.job_file_sha256(path)}))
+''')
+
+
 class SafeJobRead(WrapperCase):
+    """R23: one ``O_NOFOLLOW|O_NONBLOCK`` regular-file read serves every job file the launcher
+    reads after the worker ran."""
+
     def setUp(self):
         super().setUp()
         self.report_dir = self.root / "report"
@@ -398,17 +620,17 @@ class SafeJobRead(WrapperCase):
     def test_a_regular_file_inside_the_report_dir_is_read(self):
         target = self.report_dir / "attempt-1.last-message.txt"
         target.write_text("done\n")
-        text, tampered = lw.safe_read_job_text(target, self.report_dir, [])
-        self.assertEqual((text, tampered), ("done\n", None))
+        self.assertEqual(lw.safe_read_job_text(target, self.report_dir, []), ("done\n", None, None))
 
     def test_a_symlink_in_place_of_the_file_is_not_followed(self):
         secret = self.root / "secret"
         secret.write_text("SECRET\n")
         target = self.report_dir / "attempt-1.last-message.txt"
         target.symlink_to(secret)
-        text, tampered = lw.safe_read_job_text(target, self.report_dir, [])
+        text, missing, tampered = lw.safe_read_job_text(target, self.report_dir, [])
         self.assertEqual(text, "")
-        self.assertIsNotNone(tampered)
+        self.assertIsNone(missing)
+        self.assertIn("symlink", tampered)
         self.assertNotIn("SECRET", text)
 
     def test_a_file_whose_real_path_leaves_the_report_dir_is_rejected(self):
@@ -417,14 +639,16 @@ class SafeJobRead(WrapperCase):
         link_dir = self.report_dir / "sub"
         link_dir.symlink_to(outside)
         (outside / "f").write_text("SECRET\n")
-        text, tampered = lw.safe_read_job_text(link_dir / "f", self.report_dir, [])
+        text, missing, tampered = lw.safe_read_job_text(link_dir / "f", self.report_dir, [])
         self.assertEqual(text, "")
+        self.assertIsNone(missing)
         self.assertIsNotNone(tampered)
 
-    def test_a_missing_file_is_reported_not_raised(self):
-        text, tampered = lw.safe_read_job_text(self.report_dir / "nope", self.report_dir, [])
+    def test_a_missing_file_is_missing_not_tampered(self):
+        text, missing, tampered = lw.safe_read_job_text(self.report_dir / "nope", self.report_dir, [])
         self.assertEqual(text, "")
-        self.assertIsNotNone(tampered)
+        self.assertIn("No such file", missing)
+        self.assertIsNone(tampered)
 
     def test_a_symlink_to_a_sibling_inside_the_report_dir_is_still_not_followed(self):
         # O_NOFOLLOW refuses even a symlink whose target is inside the report dir (so the realpath
@@ -433,9 +657,72 @@ class SafeJobRead(WrapperCase):
         sibling.write_text("sibling\n")
         target = self.report_dir / "attempt-1.last-message.txt"
         target.symlink_to(sibling)
-        text, tampered = lw.safe_read_job_text(target, self.report_dir, [])
+        text, missing, tampered = lw.safe_read_job_text(target, self.report_dir, [])
         self.assertEqual(text, "")
+        self.assertIsNone(missing)
         self.assertIsNotNone(tampered)
+
+    def probe(self, path):
+        """Run the readers on ``path`` in a child that is killed after 15s: a hang is a failure."""
+        outcome = subprocess.run([sys.executable, "-I", "-c", FIFO_PROBE, str(Path(lw.__file__).parent),
+                                  str(path), str(self.report_dir)],
+                                 capture_output=True, timeout=15)
+        self.assertEqual(outcome.returncode, 0, outcome.stderr)
+        return json.loads(outcome.stdout)
+
+    def test_a_fifo_at_the_path_is_refused_without_hanging(self):
+        fifo = self.report_dir / "attempt-1.last-message.txt"
+        os.mkfifo(str(fifo))
+        found = self.probe(fifo)
+        self.assertEqual(found["read"][0], "")
+        self.assertIsNone(found["read"][1])
+        self.assertIn("not a regular file", found["read"][2])
+        self.assertIsNone(found["sha"])
+
+    def test_a_symlink_to_a_fifo_is_refused_without_hanging(self):
+        fifo = self.report_dir / "pipe"
+        os.mkfifo(str(fifo))
+        link = self.report_dir / "attempt-1.last-message.txt"
+        link.symlink_to(fifo)
+        found = self.probe(link)
+        self.assertEqual(found["read"][0], "")
+        self.assertIn("symlink", found["read"][2])
+        self.assertIsNone(found["sha"])
+
+    def test_the_hash_helper_never_reads_through_a_link(self):
+        secret = self.root / "secret"
+        secret.write_text("SECRET\n")
+        plain = self.report_dir / "catalog.json"
+        plain.write_text("{}\n")
+        link = self.report_dir / "link.json"
+        link.symlink_to(secret)
+        self.assertEqual(lw.job_file_sha256(plain), hashlib.sha256(b"{}\n").hexdigest())
+        self.assertIsNone(lw.job_file_sha256(link))
+        self.assertIsNone(lw.job_file_sha256(self.report_dir / "absent.json"))
+
+    def test_read_regular_file_names_what_was_wrong(self):
+        # (A FIFO is covered above in a child process with a timeout: opening one here with a
+        # regression in the helper would hang the whole run instead of failing it.)
+        with self.assertRaises(lw.NotRegularFile):
+            lw.read_regular_file(self.report_dir)  # a directory
+        target = self.report_dir / "real.txt"
+        target.write_text("x")
+        self.assertEqual(lw.read_regular_file(target), b"x")
+        link = self.report_dir / "link"
+        link.symlink_to(target)
+        with self.assertRaises(OSError) as caught:
+            lw.read_regular_file(link)
+        self.assertIn(caught.exception.errno, (errno.ELOOP, errno.EMLINK))
+
+    def test_the_digest_of_a_path_state_does_not_block_on_a_fifo(self):
+        fifo = self.report_dir / "pipe"
+        os.mkfifo(str(fifo))
+        outcome = subprocess.run([sys.executable, "-I", "-c",
+                                  "import sys; sys.path.insert(0, sys.argv[1]); import local_worker as lw; "
+                                  "from pathlib import Path; print(lw.path_state(Path(sys.argv[2])))",
+                                  str(Path(lw.__file__).parent), str(fifo)], capture_output=True, timeout=15)
+        self.assertEqual(outcome.returncode, 0, outcome.stderr)
+        self.assertIn("unreadable:NotRegularFile", outcome.stdout.decode())
 
 
 class UnwrappedAdminTamper(WrapperCase):
@@ -472,8 +759,131 @@ class UnwrappedAdminTamper(WrapperCase):
         self.assertFalse(sentinel.exists(), "the attacker filter ran in the launcher's git")
         self.assertEqual(report["git_admin_tampered"], ["gitfile"])
         self.assertEqual(report["status"], "audit_violation")
-        self.assertEqual(report["head_commit"], report["base_commit"])  # real HEAD, pinned
+        # R24: once a redirect file differs the audit runs no git at all, so no HEAD is read from
+        # the repointed repository and none is reported.
+        self.assertEqual(report["head_commit"], "")
         self.assertTrue(any(v["path"] == ".git" for v in report["violations"]))
+
+    def test_a_planted_config_worktree_is_caught_before_git_runs_it(self):
+        """R24: with ``extensions.worktreeConfig`` pinning the layout does not stop a planted
+        ``<admin>/config.worktree``, so the audit compares the redirect fingerprint before every
+        git call and skips git (recording the violation) when it differs."""
+        sentinel = self.root / "sentinel"
+        sp.git(self.repo, "config", "extensions.worktreeConfig", "true")
+
+        def edit(cwd, attempt):
+            self.fix(cwd)
+            admin = Path(sp.git(cwd, "rev-parse", "--absolute-git-dir").stdout.decode().strip())
+            sp.git(cwd, "config", "--file", str(admin / "config.worktree"), "filter.pwn.clean",
+                   f"sh -c 'echo tampered > {sentinel}; cat'")
+            (Path(cwd) / ".gitattributes").write_text("* filter=pwn\n")
+
+        with mock.patch.object(permissions, "wrapper_available", return_value=False):
+            report, run = self.run_clean_job(worker_edit=edit)
+        self.assertFalse(sentinel.exists(), "the planted config.worktree filter ran in the launcher's git")
+        self.assertEqual(report["git_admin_tampered"], ["config.worktree"])
+        self.assertEqual(report["status"], "audit_violation")
+        (violation,) = [v for v in report["violations"] if v["path"] == ".git"]
+        self.assertIn("config.worktree", violation["reason"])
+
+    def test_the_audit_runs_no_git_at_all_once_a_redirect_file_differs(self):
+        worktree = self.root / "wt"
+        sp.git(self.repo, "worktree", "add", "-q", "--detach", str(worktree))
+        layout = lw.worktree_git_layout(worktree)
+        before = lw.git_admin_fingerprint(layout, worktree)
+        Path(layout["GIT_DIR"], "config.worktree").write_text("[core]\n")
+        base = sp.git(worktree, "rev-parse", "HEAD").stdout.decode().strip()
+        with mock.patch.object(lw, "git", side_effect=AssertionError("git ran")):
+            audit = lw.audit_worktree(worktree, base, ["add.py"], [], scratch_dir=self.root,
+                                      git_layout=layout, git_admin_before=before)
+        self.assertEqual(audit.patch, b"")
+        self.assertEqual(audit.changed_paths, [])
+        (violation,) = audit.violations
+        self.assertEqual(violation["path"], ".git")
+        self.assertIn("git redirect file", violation["reason"])
+        self.assertIn("config.worktree", violation["reason"])
+        self.assertIn("git was not run", violation["reason"])
+
+    def test_an_unchanged_fingerprint_lets_the_audit_run_normally(self):
+        worktree = self.root / "wt"
+        sp.git(self.repo, "worktree", "add", "-q", "--detach", str(worktree))
+        layout = lw.worktree_git_layout(worktree)
+        before = lw.git_admin_fingerprint(layout, worktree)
+        (worktree / "add.py").write_text("def add(a, b):\n    return a + b\n")
+        base = sp.git(worktree, "rev-parse", "HEAD").stdout.decode().strip()
+        audit = lw.audit_worktree(worktree, base, ["add.py"], [], scratch_dir=self.root,
+                                  git_layout=layout, git_admin_before=before)
+        self.assertEqual(audit.changed_paths, ["add.py"])
+        self.assertEqual(audit.violations, [])
+
+    def test_the_redirect_file_names_are_defined_once_in_the_permissions_module(self):
+        layout = {"GIT_DIR": str(self.root / "admin")}
+        (self.root / "admin").mkdir()
+        self.assertEqual(list(lw.git_admin_fingerprint(layout, self.root)),
+                         ["gitfile", *permissions.GIT_ADMIN_REDIRECTS])
+        source = Path(lw.__file__).read_text(encoding="utf-8")
+        self.assertNotIn('GIT_ADMIN_REDIRECTS = ("commondir"', source)
+        self.assertIn("permissions.GIT_ADMIN_REDIRECTS", source)
+
+
+class AuditSubmodules(WrapperCase):
+    """R24: a gitlink in the base tree is not descended into by the launcher's audit: a nested
+    repository the worker planted at it must not get its own config (a clean filter) run by the
+    launcher's git."""
+
+    def setUp(self):
+        super().setUp()
+        head = sp.git(self.repo, "rev-parse", "HEAD").stdout.decode().strip()
+        sp.git(self.repo, "update-index", "--add", "--cacheinfo", f"160000,{head},sub")
+        sp.git(self.repo, "commit", "-q", "-m", "add a gitlink")
+        self.worktree = self.root / "wt"
+        sp.git(self.repo, "worktree", "add", "-q", "--detach", str(self.worktree))
+        self.layout = lw.worktree_git_layout(self.worktree)
+        self.base = sp.git(self.worktree, "rev-parse", "HEAD").stdout.decode().strip()
+        self.sentinel = self.root / "sentinel"
+
+    def plant_nested_repo(self):
+        nested = self.worktree / "sub"
+        nested.mkdir(exist_ok=True)
+        sp.git(nested, "init", "-q")
+        (nested / "x.txt").write_text("one\n")
+        sp.git(nested, "add", "x.txt")
+        sp.git(nested, "commit", "-q", "-m", "nested")
+        sp.git(nested, "config", "filter.pwn.clean", f"sh -c 'echo tampered > {self.sentinel}; cat'")
+        (nested / ".git" / "info").mkdir(exist_ok=True)
+        (nested / ".git" / "info" / "attributes").write_text("* filter=pwn\n")
+        (nested / "x.txt").write_text("two\n")  # modified, so any status of it hashes through the filter
+        if self.sentinel.exists():
+            self.sentinel.unlink()
+
+    def test_a_nested_repo_at_a_base_gitlink_does_not_run_its_filter_in_the_audit(self):
+        self.plant_nested_repo()
+        (self.worktree / "add.py").write_text("def add(a, b):\n    return a + b\n")
+        audit = lw.audit_worktree(self.worktree, self.base, ["add.py"], [], scratch_dir=self.root,
+                                  git_layout=self.layout)
+        self.assertFalse(self.sentinel.exists(), "the nested repository's filter ran in the audit")
+        # The rest of the audit is unaffected: the worker's real change is still reported.
+        self.assertEqual(audit.changed_paths, ["add.py"])
+        self.assertEqual(audit.violations, [])
+        self.assertIn(b"add.py", audit.patch)
+        self.assertNotIn(b"sub", audit.patch.replace(b"subtract", b""))
+
+    def test_base_gitlinks_are_found_from_the_base_tree_including_nested_ones(self):
+        head = self.base
+        deep = self.repo / "vendor" / "lib"
+        deep.mkdir(parents=True)
+        (self.repo / "vendor" / "keep.txt").write_text("k\n")
+        sp.git(self.repo, "add", "vendor/keep.txt")
+        sp.git(self.repo, "update-index", "--add", "--cacheinfo", f"160000,{head},vendor/lib")
+        sp.git(self.repo, "commit", "-q", "-m", "nested gitlink")
+        base = sp.git(self.repo, "rev-parse", "HEAD").stdout.decode().strip()
+        self.assertEqual(lw.base_gitlinks(self.worktree, base, env=self.layout), ["sub", "vendor/lib"])
+
+    def test_a_repo_without_gitlinks_has_none(self):
+        plain = sp.make_repo(self.root / "plain-parent")
+        base = sp.git(plain, "rev-parse", "HEAD").stdout.decode().strip()
+        self.assertEqual(lw.base_gitlinks(plain, base), [])
+
 
 
 @unittest.skipUnless(sys.platform == "darwin" and permissions.wrapper_available(), "Seatbelt only")

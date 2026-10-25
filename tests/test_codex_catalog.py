@@ -75,7 +75,7 @@ class WriteCatalog(unittest.TestCase):
         digest = codex_catalog.write_catalog(path, self.entry)
         self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"models": [self.entry]})
         self.assertEqual(digest, hashlib.sha256(path.read_bytes()).hexdigest())
-        self.assertEqual(digest, codex_catalog.file_sha256(path))
+        self.assertEqual(digest, sp.lw.job_file_sha256(path))
 
     def test_the_same_entry_writes_the_same_bytes(self):
         first = codex_catalog.write_catalog(self.root / "a.json", self.entry)
@@ -84,7 +84,10 @@ class WriteCatalog(unittest.TestCase):
         self.assertEqual(first, second)
 
     def test_a_missing_file_has_no_hash(self):
-        self.assertIsNone(codex_catalog.file_sha256(self.root / "absent.json"))
+        self.assertIsNone(sp.lw.job_file_sha256(self.root / "absent.json"))
+
+    def test_the_launcher_reads_the_catalog_through_the_one_safe_helper_only(self):
+        self.assertFalse(hasattr(codex_catalog, "file_sha256"))  # no second, link-following reader
 
 
 class Template(unittest.TestCase):

@@ -12,9 +12,9 @@ Standard library only. Design rules:
   model's shell environment via shell_environment_policy and redacted from all logs.
 * Every job runs Codex in its own empty ``CODEX_HOME`` inside the report directory, in an
   ephemeral session, on a model catalog generated for the discovered model
-  (``codex_catalog``): the worker never sees the user's Codex home, and the self-check pins
-  the catalog file's hash. An installed Codex that is too old or lacks a required flag is a
-  preflight refusal.
+  (``codex_catalog``) and kept in the report directory, which the worker cannot write: the
+  worker never sees the user's Codex home, and the self-check pins the catalog file's hash. An
+  installed Codex that is too old or lacks a required flag is a preflight refusal.
 * Every job runs in its own detached ``git worktree``. The primary checkout is never
   mutated. Failed worktrees are preserved, never auto-merged, never committed.
 * One job runs at a time by default. ``--max-workers`` 2-4 widens that to a bounded pool of
@@ -25,8 +25,9 @@ Standard library only. Design rules:
   full-host minus a short deny list: the worker, every verification command and every native
   step run as ``sandbox-exec -f <report_dir>/permissions.sb``, a permissive Seatbelt profile
   (``allow default`` plus denials) generated from the user's ``<state>/permissions.json``
-  (``permissions``). The listed secrets cannot be read; the primary checkout's files, HEAD,
-  index, branches and hooks and the launcher's own state cannot be written. Everything else the
+  (``permissions``). The listed secrets cannot be read; the primary checkout's files and its
+  git directory (wherever it lives; only ``objects/`` stays writable) and the launcher's own
+  state cannot be written. Everything else the
   launcher can read or write stays reachable. Where ``sandbox-exec`` is missing or cannot apply
   the profile, jobs run without it and the report says ``deny_list_applied: false``.
 * Independent verification runs the contract commands on the host inside that wrapper. Every
@@ -49,6 +50,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import sys
@@ -57,7 +59,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, BinaryIO, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import apple_verification as apple
 import codex_catalog
@@ -224,8 +226,9 @@ MIN_CODEX_VERSION = (0, 164, 0)
 CODEX_REQUIRED_FLAGS = ("--ephemeral", "--output-schema", "--ignore-user-config",
                         "--ignore-rules", "--json")
 CODEX_COMPAT_TIMEOUT_SECONDS = 30.0
-# Each job's Codex home is this directory inside its report directory; the generated model
-# catalog lives in it and ``-c model_catalog_json`` points at it.
+# Each job's Codex home is this directory inside its report directory. It is the worker's own
+# writable home, so the generated model catalog (``-c model_catalog_json``) is kept beside it in
+# the report directory instead, where only the launcher can write.
 CODEX_HOME_NAME = "codex-home"
 CATALOG_PIN_KEY = "model_catalog_json"
 # Single-valued flags: a second, different value is drift, not a later value quietly winning.
@@ -750,6 +753,28 @@ def job_codex_home(report_dir: Path) -> Path:
     return home
 
 
+def create_native_roots(report_dir: Path) -> List[Path]:
+    """Create ``<report_dir>/apple-scratch`` and ``<report_dir>/screenshots``, private, if absent.
+
+    The deny profile re-opens both for the job and guards each against being renamed, which also
+    means a missing one could never be created by a wrapped process. A path that exists but is a
+    link or not a directory is refused: the job would be handed something the launcher did not make.
+    """
+    roots = []
+    for name in (NATIVE_SCRATCH_NAME, SCREENSHOTS_DIR_NAME):
+        root = Path(report_dir) / name
+        try:
+            root.mkdir(mode=0o700)
+        except FileExistsError:
+            if root.is_symlink() or not root.is_dir():
+                raise BlockedError(f"the job directory {root} already exists and is not a "
+                                   "directory") from None
+        except OSError as error:
+            raise BlockedError(f"cannot create the job directory {root}: {error}") from error
+        roots.append(root)
+    return roots
+
+
 def model_label(name: str) -> str:
     """A model name the server reported, made safe to quote in a report line."""
     if omlx_discovery.SAFE_MODEL_NAME.fullmatch(name):
@@ -858,10 +883,17 @@ def _parse_porcelain_z(raw: bytes, include_ignored: bool = False) -> List[Tuple[
     return entries
 
 
-def status_entries(repo: Path, *, ignored: bool = False,
+def status_entries(repo: Path, *, ignored: bool = False, ignore_submodules: bool = False,
                    env: Optional[Dict[str, str]] = None) -> List[Tuple[str, str]]:
-    """``git status`` entries without touching the index (--no-optional-locks)."""
+    """``git status`` entries without touching the index (--no-optional-locks).
+
+    ``ignore_submodules`` adds ``--ignore-submodules=all``: git then never runs ``git status``
+    inside a submodule or nested repository at a gitlink, which would read (and run) that
+    repository's own config.
+    """
     argv = ["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all"]
+    if ignore_submodules:
+        argv.append("--ignore-submodules=all")
     if ignored:
         argv.append("--ignored=matching")
     process = git(repo, *argv, check=not ignored, env=env)
@@ -910,6 +942,60 @@ def dirty_primary_files(repo: Path) -> List[str]:
     return changed_paths(repo)
 
 
+class NotRegularFile(OSError):
+    """A path the launcher needs to read is not a regular file (a FIFO, socket, device, directory)."""
+
+
+@contextlib.contextmanager
+def open_regular_file(path: Path) -> Iterator[BinaryIO]:
+    """``path`` opened for binary reading, only if it is a regular file the launcher can read now.
+
+    Every file the launcher reads after a worker ran goes through here, because the worker can
+    swap a file it may write for something that would otherwise be followed or waited on. The
+    open uses ``O_NOFOLLOW`` (a symlink in the last component is ``ELOOP``, never followed, so
+    a link to a file the worker may not read reads nothing) and ``O_NONBLOCK`` (opening a FIFO
+    with no writer returns at once instead of waiting forever), then ``fstat`` on the opened
+    descriptor must say regular file, else ``NotRegularFile``. The check is on the descriptor
+    that is read, so there is no gap between the check and the read.
+    """
+    descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise NotRegularFile(errno.EINVAL, "not a regular file", str(path))
+        handle = os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    with handle:
+        yield handle
+
+
+def read_regular_file(path: Path) -> bytes:
+    """The bytes of a regular file (see ``open_regular_file``); ``OSError`` for anything else."""
+    with open_regular_file(path) as handle:
+        return handle.read()
+
+
+def _sha256_of_regular_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open_regular_file(path) as handle:
+        for chunk in iter(lambda: handle.read(READ_CHUNK_BYTES), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def job_file_sha256(path: Path) -> Optional[str]:
+    """The sha256 of a job file as it is now, or ``None`` when it is not a readable regular file.
+
+    A link or FIFO swapped in for it is ``None``, never hashed through, so what the launcher
+    compares against a generated file's digest is only ever that file's own content.
+    """
+    try:
+        return _sha256_of_regular_file(path)
+    except OSError:
+        return None
+
+
 def _digest_path(path: Path) -> str:
     """Content fingerprint for one path; comparable before/after without holding data."""
     try:
@@ -917,11 +1003,7 @@ def _digest_path(path: Path) -> str:
             return "symlink:" + os.readlink(str(path))
         if path.is_dir():
             return "directory"
-        digest = hashlib.sha256()
-        with open(str(path), "rb") as handle:
-            for chunk in iter(lambda: handle.read(READ_CHUNK_BYTES), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
+        return _sha256_of_regular_file(path)
     except OSError as error:
         return f"unreadable:{error.__class__.__name__}"
 
@@ -1155,6 +1237,30 @@ def symlink_escape(worktree: Path, relative: str) -> Optional[str]:
 DIFF_ARGS = ("--no-ext-diff", "--no-textconv", "--find-renames")
 
 
+def base_gitlinks(worktree: Path, base_commit: str, env: Optional[Dict[str, str]] = None) -> List[str]:
+    """The paths that are gitlinks (mode 160000: submodules) in the base commit's tree, sorted.
+
+    Nothing under one is the job's to change, and git must not look inside one while the
+    launcher audits the worktree: a repository the worker made there would have its own config
+    (a clean filter, ...) run by the launcher's git. The audit leaves these paths out.
+    """
+    process = git(worktree, "ls-tree", "-r", "-z", "--full-tree", base_commit, env=env)
+    links = []
+    for record in (process.stdout or b"").split(b"\0"):
+        meta, _, path = record.partition(b"\t")
+        if meta.startswith(b"160000 ") and path:
+            links.append(path.decode("utf-8", "surrogateescape"))
+    return sorted(links)
+
+
+class _GitRedirected(Exception):
+    """A git redirect file differs from its pre-worker state; the audit must not run git."""
+
+    def __init__(self, changed: Sequence[str]) -> None:
+        super().__init__(", ".join(changed))
+        self.changed = list(changed)
+
+
 def audit_scratch_dir(worktree: Path, scratch_dir: Optional[Path]) -> Path:
     """Where the throwaway audit index lives; it must not sit inside the worktree."""
     candidate = Path(scratch_dir) if scratch_dir is not None else worktree.parent
@@ -1169,7 +1275,8 @@ def audit_scratch_dir(worktree: Path, scratch_dir: Optional[Path]) -> Path:
 def audit_worktree(worktree: Path, base_commit: str, allowed_paths: Sequence[str],
                    secrets: Sequence[str],
                    scratch_dir: Optional[Path] = None,
-                   git_layout: Optional[Dict[str, str]] = None) -> Audit:
+                   git_layout: Optional[Dict[str, str]] = None,
+                   git_admin_before: Optional[Dict[str, str]] = None) -> Audit:
     """Audit everything that differs from the *original* base commit.
 
     The comparison target is the commit the job started from, never the moving HEAD, so
@@ -1180,21 +1287,18 @@ def audit_worktree(worktree: Path, base_commit: str, allowed_paths: Sequence[str
     ``git_layout`` pins ``GIT_DIR``/``GIT_COMMON_DIR``/``GIT_WORK_TREE`` (captured before the
     worker ran) on every git call here, so a worker that repointed the worktree's ``.git``
     gitfile or its ``commondir`` cannot steer the launcher's own (unwrapped) git at a repository
-    it controls, whose config or attributes would otherwise run arbitrary filters.
+    it controls, whose config or attributes would otherwise run arbitrary filters. Pinning does
+    not cover every redirect (``<admin>/config.worktree`` is still read with
+    ``extensions.worktreeConfig``), so ``git_admin_before`` -- the redirect fingerprint from before
+    the worker ran -- is compared with the live files before *each* git call: on a difference the
+    audit runs no more git, and records the violation instead.
+
+    Gitlinks present in the base tree are left out of staging (a pathspec exclusion) and of
+    ``status`` (``--ignore-submodules=all``), so git never descends into a nested repository the
+    worker may have planted at one; a change to such a path is therefore not reported.
     """
     layout = dict(git_layout or {})
     audit = Audit(base_commit=base_commit)
-    audit.head_commit = git(worktree, "rev-parse", "--verify", "--quiet", "HEAD",
-                            env=layout or None).stdout.decode("utf-8", "replace").strip()
-    if audit.head_commit != base_commit:
-        audit.head_changed = True
-        audit.violations.append({
-            "path": ".",
-            "reason": "worker moved HEAD (git commit is forbidden); commits are preserved "
-                      f"for review, not hidden (base {base_commit[:12]} -> "
-                      f"head {audit.head_commit[:12]})",
-        })
-
     scratch = audit_scratch_dir(worktree, scratch_dir)
     index_path = scratch / f"audit-index-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     audit_env = dict(layout, GIT_INDEX_FILE=str(index_path))
@@ -1214,15 +1318,44 @@ def audit_worktree(worktree: Path, base_commit: str, allowed_paths: Sequence[str
             entry["role"] = role
         entries.append(entry)
 
-    try:
-        git(worktree, "read-tree", base_commit, env=audit_env)
-        git(worktree, "add", "-A", env=audit_env)
+    def untampered() -> None:
+        """Called before every git command: the redirect files must be as they were."""
+        if git_admin_before and layout:
+            changed = git_redirect_changes(git_admin_before, layout, worktree)
+            if changed:
+                raise _GitRedirected(changed)
+
+    def run_git(*args: str, env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
+        untampered()
+        return git(worktree, *args, env=env)
+
+    def status(**options: Any) -> List[Tuple[str, str]]:
+        untampered()
         # status compares the working tree with its *own* index, so it must not see the throwaway
         # staging index; it still gets the pinned git layout, never a tampered gitfile/commondir.
-        for status, path in status_entries(worktree, env=(layout or None)):
-            record(status, path)
-        name_status = git(worktree, "--no-optional-locks", "diff", "--cached", "--name-status",
-                          "-z", *DIFF_ARGS, base_commit, env=audit_env)
+        return status_entries(worktree, ignore_submodules=True, env=(layout or None), **options)
+
+    try:
+        audit.head_commit = run_git("rev-parse", "--verify", "--quiet", "HEAD",
+                                    env=layout or None).stdout.decode("utf-8", "replace").strip()
+        if audit.head_commit != base_commit:
+            audit.head_changed = True
+            audit.violations.append({
+                "path": ".",
+                "reason": "worker moved HEAD (git commit is forbidden); commits are preserved "
+                          f"for review, not hidden (base {base_commit[:12]} -> "
+                          f"head {audit.head_commit[:12]})",
+            })
+
+        run_git("read-tree", base_commit, env=audit_env)
+        untampered()
+        excluded = [f":(exclude,literal){path}"
+                    for path in base_gitlinks(worktree, base_commit, env=layout or None)]
+        run_git("add", "-A", *(["--", ".", *excluded] if excluded else []), env=audit_env)
+        for entry_status, path in status():
+            record(entry_status, path)
+        name_status = run_git("--no-optional-locks", "diff", "--cached", "--name-status",
+                              "-z", *DIFF_ARGS, base_commit, env=audit_env)
         for code, source, destination in _parse_name_status_z(name_status.stdout or b""):
             if destination is None:
                 record(code, source)
@@ -1239,19 +1372,22 @@ def audit_worktree(worktree: Path, base_commit: str, allowed_paths: Sequence[str
             if escape:
                 audit.violations.append({"path": path, "reason": f"symlink escape at {escape}"})
 
-        diff = git(worktree, "--no-optional-locks", "diff", "--cached", "--binary",
-                   *DIFF_ARGS, base_commit, env=audit_env)
+        diff = run_git("--no-optional-locks", "diff", "--cached", "--binary",
+                       *DIFF_ARGS, base_commit, env=audit_env)
         audit.patch = redact(diff.stdout.decode("utf-8", "replace"), secrets).encode("utf-8")
-        stat = git(worktree, "--no-optional-locks", "diff", "--cached", "--stat",
-                   *DIFF_ARGS, base_commit, env=audit_env)
-        audit.diffstat = redact(stat.stdout.decode("utf-8", "replace"), secrets).strip()
+        summary = run_git("--no-optional-locks", "diff", "--cached", "--stat",
+                          *DIFF_ARGS, base_commit, env=audit_env)
+        audit.diffstat = redact(summary.stdout.decode("utf-8", "replace"), secrets).strip()
 
         changed = set(audit.changed_paths)
         ignored = sorted(
-            {path.rstrip("/") for status, path in status_entries(worktree, ignored=True, env=(layout or None))
-             if status == "!!"}
+            {path.rstrip("/") for entry_status, path in status(ignored=True)
+             if entry_status == "!!"}
         )
         audit.ignored_paths = [path for path in ignored if path not in changed]
+    except _GitRedirected as redirected:
+        audit.changed_paths = sorted({entry["path"] for entry in entries})
+        audit.violations.append(git_redirect_violation(redirected.changed, git_skipped=True))
     finally:
         with contextlib.suppress(OSError):
             index_path.unlink()
@@ -1498,8 +1634,9 @@ def missing_config_pins(argv: Sequence[str], profile: omlx_discovery.ServerProfi
     ``profile`` and ``context_window``, so the argv must name exactly the model, endpoint and
     window discovery found. ``catalog`` is the job's generated model catalog and the sha256
     ``codex_catalog.write_catalog`` returned for it: the argv must point ``model_catalog_json``
-    at exactly that file, and the file is hashed again here, so a catalog changed after it was
-    written is drift too. Without ``catalog`` no ``model_catalog_json`` may appear at all.
+    at exactly that file, and the file is hashed again here (``job_file_sha256``, which never
+    follows a link or waits on a FIFO), so a catalog changed after it was written is drift too.
+    Without ``catalog`` no ``model_catalog_json`` may appear at all.
     """
     alias = profile.model.api_model
     endpoint = profile_endpoint(profile)
@@ -1515,7 +1652,7 @@ def missing_config_pins(argv: Sequence[str], profile: omlx_discovery.ServerProfi
     if catalog is not None:
         catalog_path, catalog_sha = catalog
         pinned[CATALOG_PIN_KEY] = catalog_pin(catalog_path)
-        actual_sha = codex_catalog.file_sha256(catalog_path)
+        actual_sha = job_file_sha256(catalog_path)
         if actual_sha is None:
             problems.append(f"{CATALOG_PIN_KEY} names {catalog_path}, which can no longer be "
                             "read")
@@ -2067,6 +2204,9 @@ class DenyWrapper:
     record: Dict[str, Any]
     worktree: Optional[Path] = None
     profile: Optional[Path] = None
+    # The primary's git directories (common dir, own admin dir): a denial naming one is a write to
+    # the primary checkout even when the checkout keeps its git dir elsewhere (R22).
+    git_dirs: Tuple[Path, ...] = ()
 
     @property
     def applied(self) -> bool:
@@ -2088,7 +2228,8 @@ class DenyWrapper:
             return
         seen = {(item["path"], item["kind"]) for item in self.record["denials"]}
         for found in permissions.find_denials(text, self.perms, self.primary_repo,
-                                              state_dir=self.state_dir, worktree=self.worktree):
+                                              state_dir=self.state_dir, worktree=self.worktree,
+                                              git_dirs=self.git_dirs):
             if (found["path"], found["kind"]) not in seen:
                 seen.add((found["path"], found["kind"]))
                 self.record["denials"].append(dict(found, source=source))
@@ -2099,12 +2240,14 @@ def deny_list_applied(report: Dict[str, Any]) -> bool:
     return bool((report.get("permissions") or {}).get("deny_list_applied"))
 
 
-def load_job_permissions(options: "JobOptions") -> permissions.Permissions:
+def load_job_permissions(options: "JobOptions", report_dir: Path) -> permissions.Permissions:
     """The user's permissions list for this job, or a ``preflight_failed`` refusal.
 
     A list that cannot be read or parsed is never replaced by the defaults (the job would run
     without the denials the user wrote), and a list that would hide the repository, the worktree
-    root, the state directory or the Codex executable refuses the job naming the conflict.
+    root, the state directory or the Codex executable, or whose ``deny_write`` entry would stop
+    the job writing its state, report directory, worktree root or Codex home, refuses the job
+    naming the conflict.
     """
     try:
         perms = permissions.load_permissions(options.state_dir)
@@ -2113,7 +2256,8 @@ def load_job_permissions(options: "JobOptions") -> permissions.Permissions:
     codex = shutil.which(options.codex_bin) or options.codex_bin
     problems = permissions.check_conflicts(
         perms, repo=options.task.repo_path, worktree_root=options.state_dir / "worktrees",
-        state_dir=options.state_dir, codex_bin=Path(codex))
+        state_dir=options.state_dir, codex_bin=Path(codex), report_dir=report_dir,
+        codex_home=report_dir / CODEX_HOME_NAME)
     if problems:
         raise PreflightError("the permissions list conflicts with this job: " + "; ".join(problems))
     return perms
@@ -2172,20 +2316,38 @@ def worktree_git_layout(worktree: Path) -> Dict[str, str]:
     return {"GIT_DIR": git_dir, "GIT_COMMON_DIR": common_dir, "GIT_WORK_TREE": str(worktree)}
 
 
-# The admin files whose contents redirect where git reads its dir, common dir or config from; a
-# change to any is treated as tampering (the worker tried to repoint the launcher's own git).
-GIT_ADMIN_REDIRECTS = ("commondir", "gitdir", "config.worktree")
-
-
 def git_admin_fingerprint(layout: Dict[str, str], worktree: Path) -> Dict[str, str]:
     """A fingerprint of everything that redirects git for this worktree: the worktree's ``.git``
     gitfile and the admin dir's ``commondir``/``gitdir``/``config.worktree``. Compared before and
     after the worker; any difference is an audit violation, never informational."""
     admin = Path(layout["GIT_DIR"])
     targets = {"gitfile": Path(worktree) / ".git"}
-    for name in GIT_ADMIN_REDIRECTS:
+    # The redirect files are named once, in permissions: the same list the profile keeps denied.
+    for name in permissions.GIT_ADMIN_REDIRECTS:
         targets[name] = admin / name
     return {name: path_state(path) for name, path in targets.items()}
+
+
+def git_redirect_changes(before: Dict[str, str], layout: Dict[str, str], worktree: Path) -> List[str]:
+    """The redirect files whose state differs from ``before`` (the fingerprint taken before the
+    worker ran); empty while every one is as the launcher left it."""
+    try:
+        after = git_admin_fingerprint(layout, Path(worktree))
+    except OSError:
+        after = {}
+    return sorted(name for name in before if before.get(name) != after.get(name))
+
+
+def git_redirect_violation(changed: Sequence[str], git_skipped: bool = False) -> Dict[str, str]:
+    """The audit violation for a changed git redirect file (``git_skipped``: the audit then did
+    not run git at all, so nothing the redirect could steer ever ran)."""
+    reason = ("worker changed git redirect file(s) " + ", ".join(changed)
+              + " (gitfile/commondir/gitdir/config.worktree)")
+    if git_skipped:
+        reason += "; git was not run on this worktree again, so nothing it could steer ran"
+    else:
+        reason += "; the launcher pinned its own git layout so the audit was not steered"
+    return {"path": ".git", "reason": reason + ", but this is refused, not informational"}
 
 
 def note_git_admin_tamper(report: Dict[str, Any], worktree: Path) -> List[str]:
@@ -2193,68 +2355,55 @@ def note_git_admin_tamper(report: Dict[str, Any], worktree: Path) -> List[str]:
 
     Compares the live fingerprint with the one captured before the worker ran. A change means the
     worker tried to repoint the launcher's own (unwrapped) git at a repository it controls. The
-    launcher already pinned ``GIT_DIR``/``GIT_COMMON_DIR``/``GIT_WORK_TREE`` so the attempt did
-    not steer the audit, but a repointed admin file is still a refusal, never informational, so
-    the change itself is recorded as a violation. Returns the names that changed.
+    launcher already pinned ``GIT_DIR``/``GIT_COMMON_DIR``/``GIT_WORK_TREE`` and the audit skips
+    git once a redirect file differs, so the attempt did not steer anything, but a repointed admin
+    file is still a refusal, never informational, so the change itself is recorded as a violation.
+    Returns the names that changed.
     """
     before = report.get("_git_admin_before")
     layout = report.get("_git_layout")
     if not before or not layout:
         return []
-    try:
-        after = git_admin_fingerprint(layout, Path(worktree))
-    except OSError:
-        after = {}
-    changed = sorted(name for name in before if before.get(name) != after.get(name))
+    changed = git_redirect_changes(before, layout, Path(worktree))
     if not changed:
         return []
     report.setdefault("git_admin_tampered", changed)
     # Ensure the violation is present even after a later audit reset report["violations"]; it is
-    # keyed on path ".git" and reason prefix so it is not appended twice.
+    # keyed on path ".git" and reason prefix so it is not appended twice (the audit records the
+    # same violation itself when it skipped git).
     violations = report.setdefault("violations", [])
     if not any(v.get("path") == ".git" and "git redirect file" in v.get("reason", "")
                for v in violations):
-        violations.append({
-            "path": ".git",
-            "reason": "worker changed git redirect file(s) " + ", ".join(changed)
-                      + " (gitfile/commondir/gitdir/config.worktree); the launcher pinned its own "
-                        "git layout so the audit was not steered, but this is refused, not "
-                        "informational",
-        })
+        violations.append(git_redirect_violation(changed))
     return changed
 
 
-def safe_read_job_text(path: Path, report_dir: Path, secrets: Sequence[str]) -> Tuple[str, Optional[str]]:
-    """Read a launcher-read job file without following a symlink out of the report directory.
+def safe_read_job_text(path: Path, report_dir: Path, secrets: Sequence[str]
+                       ) -> Tuple[str, Optional[str], Optional[str]]:
+    """Read a launcher-read job file without following a link or waiting on a FIFO.
 
-    The file is opened ``O_NOFOLLOW`` (so its final component may not be a symlink) and must be a
-    regular file whose real path stays inside ``report_dir``. Returns ``(text, None)`` when it is
-    safe, or ``("", reason)`` when it is missing or looks tampered (a symlink, a non-regular file,
-    or a real path outside the report directory), so evidence is never read *through* a swap.
+    ``open_regular_file`` refuses a symlink, a FIFO or any non-regular file, and the real path
+    must stay inside ``report_dir``. Returns ``(text, missing, tampered)``: ``text`` with both
+    ``None`` when it was read; ``("", reason, None)`` when the file is simply not there (a worker
+    that crashed or timed out before writing it is not tampering); ``("", None, reason)`` when it
+    is there but something was swapped in or in the way (a symlink, a non-regular file, a path
+    outside the report directory, or an error reading it), so evidence is never read *through* a
+    swap.
     """
     try:
-        descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+        with open_regular_file(path) as handle:
+            if not _covers_path(report_dir, path):
+                return "", None, "resolves outside the report directory, so it was not read"
+            data = handle.read()
+    except NotRegularFile:
+        return "", None, "not a regular file, so it was not read"
     except OSError as error:
         if error.errno in (errno.ELOOP, errno.EMLINK):
-            return "", "a symlink is in place of the file, so it was not read"
-        return "", f"could not be opened ({error.strerror})"
-    try:
-        info = os.fstat(descriptor)
-        if (info.st_mode & 0o170000) != 0o100000:
-            return "", "not a regular file, so it was not read"
-        if not _covers_path(report_dir, path):
-            return "", "resolves outside the report directory, so it was not read"
-        chunks: List[bytes] = []
-        while True:
-            chunk = os.read(descriptor, READ_CHUNK_BYTES)
-            if not chunk:
-                break
-            chunks.append(chunk)
-    except OSError as error:
-        return "", f"could not be read ({error.strerror})"
-    finally:
-        os.close(descriptor)
-    return redact(b"".join(chunks).decode("utf-8", "replace"), secrets), None
+            return "", None, "a symlink is in place of the file, so it was not read"
+        if error.errno in (errno.ENOENT, errno.ENOTDIR):
+            return "", f"could not be opened ({error.strerror})", None
+        return "", None, f"could not be read ({error.strerror})"
+    return redact(data.decode("utf-8", "replace"), secrets), None, None
 
 
 def setup_deny_wrapper(options: "JobOptions", report: Dict[str, Any],
@@ -2272,19 +2421,26 @@ def setup_deny_wrapper(options: "JobOptions", report: Dict[str, Any],
     """
     record = report["permissions"]
     try:
+        # The job worktree's own GIT_COMMON_DIR (read before any worker ran) is the primary's
+        # real common dir whatever shape the primary is; the profile also resolves the primary's
+        # own git dir (a linked-worktree primary has its admin dir apart from it).
         text = permissions.seatbelt_profile(
             perms, primary_repo=options.task.repo_path, state_dir=options.state_dir,
             allowed_writes=job_writable_paths(report_dir, worktree, codex_home,
                                               options.task.max_attempts, env),
             protect_write_roots=job_write_roots(report_dir, worktree, codex_home),
-            job_git_admin=git_layout["GIT_DIR"], job_worktree=worktree)
+            job_git_admin=git_layout["GIT_DIR"], job_worktree=worktree,
+            git_common_dir=git_layout["GIT_COMMON_DIR"])
+        primary_git_dirs = permissions.resolve_git_dirs(options.task.repo_path)
     except permissions.PermissionsError as error:
         raise PreflightError(f"the permissions deny profile cannot be built: {error}") from None
     profile = report_dir / PERMISSIONS_PROFILE_NAME
     profile.write_text(text, encoding="utf-8")
     record.update(mode=perms.mode, profile=str(profile), deny_list_applied=False,
                   profile_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest())
-    wrapper = DenyWrapper(perms, options.task.repo_path, options.state_dir, record, worktree=worktree)
+    wrapper = DenyWrapper(perms, options.task.repo_path, options.state_dir, record, worktree=worktree,
+                          git_dirs=(Path(git_layout["GIT_COMMON_DIR"]),
+                                    *(Path(path) for path in primary_git_dirs)))
     if not permissions.wrapper_available():
         record["reason"] = (f"{permissions.SANDBOX_EXEC} is not available on this host, so the "
                             "deny list was not applied: the job ran with full host access")
@@ -2563,13 +2719,6 @@ def _tail(text: str, limit: int = 800) -> str:
     return text[-limit:] if len(text) > limit else text
 
 
-def _read_text(path: Path, secrets: Sequence[str]) -> str:
-    try:
-        return redact(path.read_text(encoding="utf-8", errors="replace"), secrets)
-    except OSError:
-        return ""
-
-
 def _inside(child: Path, parent: Path) -> bool:
     try:
         Path(os.path.realpath(str(child))).relative_to(os.path.realpath(str(parent)))
@@ -2729,7 +2878,7 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     deadline.require("preflight")
     # The user's permissions list is local configuration read before anything else is spent on
     # the job: a list that cannot be used, or that would hide what the job needs, refuses it.
-    perms = load_job_permissions(options)
+    perms = load_job_permissions(options, report_dir)
     # The installed Codex must run the qualified invocation before anything else is spent on
     # the job, a model load included.
     report["codex_compat"] = codex_compat(options.codex_bin, run=options.codex_run)
@@ -2784,11 +2933,16 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     report["_git_layout"] = git_layout
     report["_git_admin_before"] = git_admin_fingerprint(git_layout, worktree)
 
-    # The job's own Codex home and the model catalog generated for the pinned model. The hash
-    # write_catalog returns is what every launch self-check compares the file against.
+    # The job's own Codex home and the model catalog generated for the pinned model. The catalog
+    # sits in the report directory, which the worker cannot write, not in its writable Codex home;
+    # the hash write_catalog returns is what every launch self-check compares the file against.
     codex_home = job_codex_home(report_dir)
     report["codex_home"] = str(codex_home)
-    catalog_path = codex_home / codex_catalog.CATALOG_NAME
+    # The roots the wrapper re-opens and rename-protects must exist before the profile is built:
+    # a protected path that is missing cannot be created inside the job (xcodebuild's
+    # -derivedDataPath, a screenshot capture).
+    create_native_roots(report_dir)
+    catalog_path = report_dir / codex_catalog.CATALOG_NAME
     try:
         catalog_sha = codex_catalog.write_catalog(
             catalog_path, codex_catalog.build_local_entry(profile.model, context_window))
@@ -2950,7 +3104,8 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         argv = worker_argv(options.codex_bin, worktree, profile, context_window, last_path,
                            loaded["overrides"], list(loaded["environment"]), catalog_path)
         _policy_check(argv, profile, context_window, catalog)
-        before_worker = audit_worktree(worktree, base_commit, task.allowed_paths, secrets, scratch_dir=report_dir, git_layout=git_layout)
+        before_worker = audit_worktree(worktree, base_commit, task.allowed_paths, secrets, scratch_dir=report_dir, git_layout=git_layout,
+                                       git_admin_before=report["_git_admin_before"])
         patch_before = before_worker.patch
         # Snapshot every changed-from-base path *before* the worker runs, so whatever state a
         # path is in afterwards can be attributed to this attempt only if it actually changed.
@@ -2997,7 +3152,8 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
             if evidence["usage"]["availability"] == "complete":
                 evidence["usage"]["availability"] = "partial"
         # Check actual scoped changes BEFORE verification can create its own files.
-        after_worker = audit_worktree(worktree, base_commit, task.allowed_paths, secrets, scratch_dir=report_dir, git_layout=git_layout)
+        after_worker = audit_worktree(worktree, base_commit, task.allowed_paths, secrets, scratch_dir=report_dir, git_layout=git_layout,
+                                      git_admin_before=report["_git_admin_before"])
         after_states = {path: path_state(worktree / path) for path in after_worker.changed_paths}
         # A changed path was authored by this attempt's worker only when its state differs from
         # the before-worker snapshot; a path that was not changed before counts as authored.
@@ -3017,7 +3173,8 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         if stream is not None:
             report["workstream_progress"] = stream.record_attempt(report["job_id"], has_patch=has_patch)
         report.pop("_active_attempt", None)
-        last_message, last_message_tampered = safe_read_job_text(last_path, report_dir, secrets)
+        last_message, last_message_missing, last_message_tampered = safe_read_job_text(
+            last_path, report_dir, secrets)
         attempt = {
             "attempt": attempt_number,
             "returncode": result["returncode"],
@@ -3042,6 +3199,8 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
             "last_message_excerpt": _tail(last_message),
             "logs": [str(prompt_path), str(jsonl_path), str(stderr_path), str(last_path)],
         }
+        if last_message_missing:
+            attempt["last_message_missing"] = last_message_missing
         if last_message_tampered:
             attempt["last_message_tampered"] = last_message_tampered
         report["logs"].extend(attempt["logs"])
@@ -3091,7 +3250,8 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         # write files, and the comparison target is the original base commit, so committed,
         # staged, unstaged and untracked work is all visible to it.
         audit = audit_worktree(worktree, base_commit, task.allowed_paths, secrets,
-                               scratch_dir=report_dir, git_layout=git_layout)
+                               scratch_dir=report_dir, git_layout=git_layout,
+                               git_admin_before=report["_git_admin_before"])
         report["head_commit"] = audit.head_commit
         report["changed_paths"] = audit.changed_paths
         report["violations"] = audit.violations
@@ -3109,7 +3269,8 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         # No attempt reached verification (unsupported tool, exhausted budget, ...). Audit
         # what the worker left behind anyway, still against the original base commit.
         audit = audit_worktree(worktree, base_commit, task.allowed_paths, secrets,
-                               scratch_dir=report_dir, git_layout=git_layout)
+                               scratch_dir=report_dir, git_layout=git_layout,
+                               git_admin_before=report["_git_admin_before"])
         report["head_commit"] = audit.head_commit
     patch_path = report_dir / "changes.patch"
     patch_path.write_bytes(audit.patch)
@@ -3336,7 +3497,7 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
         unfinished = report.pop("_active_attempt", None)
         if report.get("worktree") and report.get("primary_fingerprint_before"):
             try:
-                final_audit = audit_worktree(Path(report["worktree"]), report["base_commit"], options.task.allowed_paths, secrets, scratch_dir=Path(report["report_dir"]), git_layout=report.get("_git_layout"))
+                final_audit = audit_worktree(Path(report["worktree"]), report["base_commit"], options.task.allowed_paths, secrets, scratch_dir=Path(report["report_dir"]), git_layout=report.get("_git_layout"), git_admin_before=report.get("_git_admin_before"))
                 report["changed_paths"] = final_audit.changed_paths
                 report["violations"] = final_audit.violations
                 note_git_admin_tamper(report, Path(report["worktree"]))

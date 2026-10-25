@@ -432,3 +432,33 @@ Model `Qwen3.5-9B-OptiQ-4bit`, launcher catalog `870e20c8…`; `primary_changed_
 | `echo x > <repo>/.git/refs/tags/evil` | `Operation not permitted` |
 | `echo evil >> ~/.zshrc`, `echo evil >> ~/.gitconfig` | `Operation not permitted` |
 | `git add` + `git commit` in the job worktree | rc 0, new commit created |
+
+### Wrapper smoke, fix round 2
+
+Re-run after the common-dir allowlist, the catalog move and the safe job-file reads, same commands,
+fresh pilot and state (`python3 scripts/prepare_pilot.py --root <root>`, then
+`bin/local-worker run --task-file <root>/task.json --state-dir <root>/state --json`), on the real
+oMLX model:
+
+| Status | Tests | Worker s | Job wall s | Tokens (input / cached / output) | `permissions` |
+| --- | --- | ---: | ---: | --- | --- |
+| ok, exit 0 | 1 passed, `deny_list_applied: true` | 26.9 | 28.6 | 13,510 / 11,743 / 750 | `deny_list_applied: true`, `reason: null`, `denials: []`, profile sha256 `f85871de…` (14 statements) |
+
+Model `Qwen3.5-9B-OptiQ-4bit`, launcher catalog `870e20c8…`; `changed_paths: [add.py]`, no
+violations, `primary_changed_during_job: false` (`sentinel.txt` still dirty), `git_admin_tampered`
+absent, the oMLX key in neither the report nor stderr. The catalog is now
+`<report_dir>/local-model-catalog.json` (the worker's `<report_dir>/codex-home` holds none), and
+`<report_dir>/apple-scratch` and `<report_dir>/screenshots` were created before the profile. The
+attempt's `-o` file was written by Codex, so neither `last_message_missing` nor
+`last_message_tampered` is set. The same job's profile was then exercised directly:
+
+| Command under the job's profile | Result |
+| --- | --- |
+| `echo x >> <repo>/.git/config`, `echo x > <repo>/.git/info/attributes` | `Operation not permitted` |
+| `echo x > <repo>/.git/MERGE_HEAD`, `.git/index.lock`, `.git/shallow` | `Operation not permitted` |
+| `mv <repo>/.git/objects/info <repo>/.git/objects/info.old`, `echo x > <repo>/.git/objects/info/alternates` | `Operation not permitted` |
+| `echo x >> <report_dir>/local-model-catalog.json`, `rm <report_dir>/local-model-catalog.json` | `Operation not permitted` |
+| `mkdir -p <report_dir>/apple-scratch/derived/Build`, `echo x > <report_dir>/screenshots/shot.png` | allowed |
+| `touch <worktree>/…`, `touch <report_dir>/codex-home/…` | allowed (probes removed) |
+| `echo x >> <state>/permissions.json`, `echo evil >> ~/.zshrc` | `Operation not permitted` |
+| `git add` + `git commit` in the job worktree | rc 0, new commit created; git prints `error: Unable to create '<repo>/.git/packed-refs.lock': Operation not permitted` and carries on (the allowlist leaves only `objects/` and the job's admin dir writable, so the lock a commit tries to take is refused) |

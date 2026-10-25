@@ -14,17 +14,16 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping
 
 from omlx_discovery import ModelProfile
 
-__all__ = ["CATALOG_NAME", "TEMPLATE_PATH", "build_local_entry", "file_sha256",
-           "fill_template", "write_catalog"]
+__all__ = ["CATALOG_NAME", "TEMPLATE_PATH", "build_local_entry", "fill_template", "write_catalog"]
 
 TEMPLATE_PATH = Path(__file__).resolve().with_name("codex_local_model_template.json")
-# The file name inside the job's Codex home; ``-c model_catalog_json`` points at it.
+# The file name inside the job's report directory (the launcher's, not the worker's, to write);
+# ``-c model_catalog_json`` points at it.
 CATALOG_NAME = "local-model-catalog.json"
-READ_CHUNK_BYTES = 1 << 16
 
 
 def fill_template(template: Any, values: Mapping[str, Any]) -> Any:
@@ -72,15 +71,3 @@ def write_catalog(path: Path, entry: Dict[str, Any]) -> str:
     data = (json.dumps({"models": [entry]}, indent=2, sort_keys=True) + "\n").encode("utf-8")
     Path(path).write_bytes(data)
     return hashlib.sha256(data).hexdigest()
-
-
-def file_sha256(path: Path) -> Optional[str]:
-    """The sha256 of the file at ``path`` as it is now; ``None`` when it cannot be read."""
-    digest = hashlib.sha256()
-    try:
-        with open(str(path), "rb") as handle:
-            for chunk in iter(lambda: handle.read(READ_CHUNK_BYTES), b""):
-                digest.update(chunk)
-    except OSError:
-        return None
-    return digest.hexdigest()

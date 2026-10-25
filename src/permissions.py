@@ -6,13 +6,16 @@ Workers keep full host access (network, simulators, every cache); a macOS Seatbe
 the user's primary checkout (spec §6.2, §6.14):
 
 * ``deny_read`` paths cannot be read at all (``file-read*``: contents and metadata);
-* with ``protect_primary_checkout`` the primary checkout's files, ``.git/HEAD``, ``.git/index``,
-  ``.git/packed-refs``, ``.git/config`` and the whole ``.git/refs``, ``.git/logs`` and
-  ``.git/worktrees`` subtrees cannot be written, and nothing that would later run when the user
-  uses git there can be planted (``.git/hooks``, ``.git/info``, ``.git/modules``,
-  ``.git/objects/info/alternates``); the job's own linked-worktree admin dir is re-opened for its
-  commit, but its ``commondir``/``gitdir``/``config.worktree`` and the worktree's ``.git`` gitfile
-  stay denied so they cannot repoint the launcher's own git;
+* with ``protect_primary_checkout`` the primary checkout's files and its resolved git common dir
+  (wherever it is: a plain ``.git``, a ``--separate-git-dir``, or the main repository of a linked
+  worktree used as the primary) cannot be written, except ``objects/`` (a commit in the job's
+  worktree writes there; ``objects/info`` stays shut so no alternates file is planted) and the
+  job's own linked-worktree admin dir under ``worktrees/<name>``; the primary's own admin dir, when
+  it is itself a linked worktree, is shut too. That is an allowlist, so nothing that would later run
+  when the user uses git there (config, hooks, ``info/attributes``, refs, ``MERGE_HEAD``,
+  ``index.lock``, ``shallow``, ...) can be planted. The job's admin dir keeps its
+  ``commondir``/``gitdir``/``config.worktree`` and the worktree's ``.git`` gitfile denied so they
+  cannot repoint the launcher's own git;
 * ``deny_write`` paths (persistence vectors: ``~/.gitconfig``, shell rc files,
   ``~/Library/LaunchAgents`` by default) cannot be written, so nothing planted there runs the
   next time the user opens a shell or runs git;
@@ -52,12 +55,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 __all__ = [
-    "DEFAULT_DENY_READ", "DEFAULT_DENY_WRITE", "LOG_FILE", "MODE_FULL_HOST", "PERMISSIONS_FILE",
-    "SANDBOX_EXEC", "SCHEMA_VERSION", "Permissions", "PermissionsError", "add_deny_read",
-    "add_deny_write", "check_conflicts", "default_permissions", "describe", "find_denials",
-    "load_permissions", "normalize_entry", "permissions_payload", "record_change",
-    "remove_deny_read", "remove_deny_write", "save_permissions", "seatbelt_profile", "wrap_argv",
-    "wrapper_available",
+    "DEFAULT_DENY_READ", "DEFAULT_DENY_WRITE", "GIT_ADMIN_REDIRECTS", "LOG_FILE", "MODE_FULL_HOST",
+    "PERMISSIONS_FILE", "SANDBOX_EXEC", "SCHEMA_VERSION", "Permissions", "PermissionsError",
+    "add_deny_read", "add_deny_write", "check_conflicts", "default_permissions", "describe",
+    "find_denials", "load_permissions", "normalize_entry", "permissions_payload", "record_change",
+    "remove_deny_read", "remove_deny_write", "resolve_git_dirs", "save_permissions",
+    "seatbelt_profile", "wrap_argv", "wrapper_available",
 ]
 
 PERMISSIONS_FILE = "permissions.json"
@@ -84,20 +87,17 @@ DEFAULT_DENY_WRITE = (
     "~/.bashrc", "~/.bash_profile", "~/.profile", "~/Library/LaunchAgents",
 )
 
-# The files of the primary checkout's .git a worker must not write: moving HEAD or a branch,
-# rewriting the index, the packed refs or the repository config would change the user's checkout.
-GIT_PROTECTED_FILES = ("HEAD", "index", "packed-refs", "config")
-# Whole subtrees of the primary ``.git`` kept read-only: every ref (so no branch, tag, remote or
-# stash ref can be moved or created), the shared reflogs, and the linked-worktree admin area
-# (``worktrees/``) — the job's own admin dir is re-opened separately so its commit still works.
-GIT_PROTECTED_SUBTREES = ("refs", "logs", "worktrees")
-# What in that .git would run, or be trusted, the next time the user runs git in the checkout,
-# outside any wrapper: hooks, info/ (attributes, exclude), the submodule repositories under
-# modules/ (each with its own hooks and config) and an alternates file pointing the object store
-# elsewhere. A linked worktree keeps its own modules/ and sparse-checkout under
-# .git/worktrees/<name>, so shutting these does not stop a worker committing in its worktree.
-GIT_PLANTING_DIRS = ("hooks", "info", "modules")
-GIT_PLANTING_FILES = (os.path.join("objects", "info", "alternates"),)
+# Inside the primary's git common dir the profile is an allowlist: every write is denied except
+# these subtrees, which a commit in the job's linked worktree needs (it writes loose objects and
+# packs there). The job's own admin dir (``worktrees/<name>``) is re-opened separately. Everything
+# else -- config, hooks, info/, refs, logs, HEAD, packed-refs, shallow, MERGE_HEAD, index.lock,
+# modules/, reftable/, worktrees/ of other jobs -- stays read-only, so there is no list of planting
+# places to keep complete: what would run, unwrapped, the next time the user runs git there cannot
+# be written.
+GIT_WRITABLE_DIRS = ("objects",)
+# Inside a re-opened subtree: ``objects/info`` (alternates, packs lists, commit-graph) is shut again,
+# so the object store cannot be pointed at a directory the worker controls.
+GIT_SHUT_BELOW = (os.path.join("objects", "info"),)
 # The admin files of a linked worktree that redirect where its git dir, common dir or config
 # come from. Writable they would point the launcher's own (unwrapped) git at a directory the
 # worker controls; the rest of the admin dir (index, HEAD, logs, ORIG_HEAD, …) stays writable so
@@ -366,7 +366,7 @@ def save_permissions(state_dir: Path, perms: Permissions) -> Path:
 # --------------------------------------------------------------------------- conflicts
 
 def check_conflicts(perms: Permissions, *, repo: Path, worktree_root: Path, state_dir: Path,
-                    codex_bin: Path) -> List[str]:
+                    codex_bin: Path, report_dir: Any = None, codex_home: Any = None) -> List[str]:
     """What in this list would break a job, one sentence each (empty when it is safe to run).
 
     A deny entry that is, or sits above, the repository, the worktree root, the state directory
@@ -374,6 +374,11 @@ def check_conflicts(perms: Permissions, *, repo: Path, worktree_root: Path, stat
     (``<repo>/.env``) is fine: hiding one file is what the list is for. With
     ``protect_primary_checkout`` the worktree root and state directory must also live outside
     the repository, or the profile's write denial would cover the job's own worktrees.
+
+    A ``deny_write`` entry is applied after the job's own re-openings, so one that is, or sits
+    above, the state directory, the job's report directory, the worktree root or the Codex home
+    (``report_dir``/``codex_home`` when given) would leave the worker unable to write what it
+    needs; it fails silently at run time as ``Operation not permitted``, so it is refused here.
     """
     protected = (("repository", repo), ("worktree root", worktree_root),
                  ("state directory", state_dir), ("Codex executable", codex_bin))
@@ -384,6 +389,15 @@ def check_conflicts(perms: Permissions, *, repo: Path, worktree_root: Path, stat
             if any(_covers(root, form) for root in roots for form in _path_forms(path)):
                 problems.append(f"deny_read entry {entry!r} would hide the {label} {path}; "
                                 f"remove it with 'permissions allow-read'")
+    job_writes = [("state directory", state_dir), ("report directory", report_dir),
+                  ("worktree root", worktree_root), ("Codex home", codex_home)]
+    for entry in perms.deny_write:
+        roots = _forms(entry)
+        for label, path in job_writes:
+            if path is not None and any(_covers(root, form) for root in roots
+                                        for form in _path_forms(path)):
+                problems.append(f"deny_write entry {entry!r} would stop the job writing the {label} "
+                                f"{path}; remove it with 'permissions allow-write'")
     if perms.protect_primary_checkout:
         repo_forms = _path_forms(repo)
         for label, path in protected[1:3]:
@@ -436,6 +450,46 @@ def _rename_protection(paths: Iterable[str]) -> List[str]:
                                             for item in sorted(guarded.values())) + ")"]
 
 
+def resolve_git_dirs(repo: Any) -> Tuple[str, str]:
+    """``(git_dir, common_dir)`` of the checkout at ``repo``, as real paths.
+
+    Read from the files git itself reads, no subprocess: a ``.git`` directory is both; a ``.git``
+    *file* (``gitdir: <path>``, relative to the checkout) names the git dir, which is also the
+    common dir unless it holds a ``commondir`` file (a linked worktree: ``git_dir`` is its admin dir
+    under ``<main>/.git/worktrees/<name>`` and ``common_dir`` the main repository's ``.git``). So a
+    plain checkout, a ``--separate-git-dir`` one and a linked worktree used as the primary each
+    resolve to where their refs, config and hooks really live. A directory with no ``.git`` at all
+    has nothing to resolve and keeps the nominal ``<repo>/.git`` path. A ``.git`` file that does not
+    say ``gitdir:`` is refused rather than guessed, since the wrong guess would leave the real git
+    dir writable.
+    """
+    root = os.path.realpath(str(repo))
+    dot_git = os.path.join(root, ".git")
+    if os.path.isdir(dot_git):
+        git_dir = os.path.realpath(dot_git)
+    elif os.path.isfile(dot_git):
+        try:
+            with open(dot_git, "rb") as handle:
+                first = handle.readline(8192).decode("utf-8", "surrogateescape").rstrip("\r\n")
+        except OSError as error:
+            raise PermissionsError(f"cannot read the gitfile {dot_git}: {error}") from None
+        if not first.startswith("gitdir:") or not first[len("gitdir:"):].strip():
+            raise PermissionsError(f"{dot_git} is not a gitfile (no 'gitdir: <path>' first line), so "
+                                   "the primary checkout's git directory cannot be protected")
+        git_dir = os.path.realpath(os.path.join(root, first[len("gitdir:"):].strip()))
+    else:
+        return dot_git, dot_git
+    common = git_dir
+    try:
+        with open(os.path.join(git_dir, "commondir"), "rb") as handle:
+            named = handle.readline(8192).decode("utf-8", "surrogateescape").strip()
+    except OSError:
+        named = ""
+    if named:
+        common = os.path.realpath(os.path.join(git_dir, named))
+    return git_dir, common
+
+
 def _inside_state(state: str, allowed_writes: Iterable[Any]) -> List[str]:
     """The real paths of ``allowed_writes`` that lie strictly inside ``state``, each once.
 
@@ -463,7 +517,8 @@ def _reals(entries: Iterable[str]) -> List[str]:
 
 def seatbelt_profile(perms: Permissions, *, primary_repo: Path, state_dir: Any = None,
                      allowed_writes: Iterable[Any] = (), protect_write_roots: Iterable[Any] = (),
-                     job_git_admin: Any = None, job_worktree: Any = None) -> str:
+                     job_git_admin: Any = None, job_worktree: Any = None,
+                     git_common_dir: Any = None) -> str:
     """The Seatbelt profile text for ``perms`` (write it as UTF-8).
 
     ``(allow default)`` first, then denials (and the re-openings named below), in the order that
@@ -475,28 +530,33 @@ def seatbelt_profile(perms: Permissions, *, primary_repo: Path, state_dir: Any =
        job's own ``allowed_writes`` that lie inside it are re-opened (its worktree, Codex home,
        last-message files, scratch). This comes before the rules below, so a job path can never
        re-open the primary checkout or a hidden path;
-    3. the primary checkout is made read-only as a whole, its ``.git`` is re-opened for writing,
-       then closed again around: the four files that move HEAD/index/packed-refs/config; the
-       whole ``refs``, ``logs`` and ``worktrees`` subtrees (no ref created or moved, no linked
-       worktree's admin touched); ``hooks``/``info``/``modules`` and ``objects/info/alternates``
-       (nothing planted that would run, unwrapped, the next time the user runs git). When the
-       job's own linked worktree is known, its admin dir under ``worktrees/<name>`` is re-opened
-       (so its commit still writes index/HEAD/logs) but its ``commondir``, ``gitdir`` and
-       ``config.worktree`` stay denied, and the worktree's ``.git`` gitfile is denied — otherwise
-       a worker could repoint the launcher's own (unwrapped) ``read-tree``/``add``/``diff`` at a
-       git directory it controls, whose config/attributes then run arbitrary filters;
+    3. the primary checkout is made read-only as a whole, then its git directories are shut:
+       the *resolved* common dir (``resolve_git_dirs``, plus ``git_common_dir`` when the caller
+       knows one -- the launcher passes the job worktree's own ``GIT_COMMON_DIR``) and, when the
+       primary is itself a linked worktree, its own admin dir. Never a hardcoded ``<repo>/.git``:
+       a ``--separate-git-dir`` primary keeps its refs, config and hooks elsewhere. Inside the
+       common dir this is an allowlist -- only ``objects/`` (``GIT_WRITABLE_DIRS``) is re-opened,
+       with ``objects/info`` shut again (``GIT_SHUT_BELOW``) -- so config, hooks, ``info/``, refs,
+       ``MERGE_HEAD``, ``index.lock``, ``shallow``, ``reftable/`` and every other job's admin dir
+       are refused without a list of planting places to keep complete. When the job's own linked
+       worktree is known, its admin dir under ``worktrees/<name>`` is re-opened (so its commit
+       still writes index/HEAD/logs) but its ``commondir``, ``gitdir`` and ``config.worktree``
+       stay denied, and the worktree's ``.git`` gitfile is denied -- otherwise a worker could
+       repoint the launcher's own (unwrapped) ``read-tree``/``add``/``diff`` at a git directory it
+       controls, whose config/attributes then run arbitrary filters;
     4. the ``deny_write`` persistence vectors (``~/.gitconfig``, shell rc files,
        ``~/Library/LaunchAgents`` by default) are write-denied;
     5. everything hidden is also write-denied, so a secret cannot be rewritten or replaced, and
        cannot be cloned: ``clonefile(2)`` of a directory checks only that directory, so every
        parent of a hidden path is clone-denied too;
-    6. every hidden path, the checkout, its ``.git`` subtrees and admin redirects, the deny_write
-       paths, the state directory, its ``permissions.json``/``permissions.log``, and the re-opened
-       job roots (``protect_write_roots``: the worktree, Codex home, scratch) -- and every parent
-       of each, up to ``/`` -- are guarded against being renamed, replaced or deleted
-       (``_rename_protection``). Their *contents* stay as writable as they were, except where an
-       earlier rule says otherwise, so the re-opened roots cannot be swapped for a symlink the
-       launcher would then follow.
+    6. every hidden path, the checkout, its git directories, ``objects/``, the admin redirects,
+       the deny_write paths, the state directory, its ``permissions.json``/``permissions.log``,
+       and the re-opened job roots (``protect_write_roots``: the worktree, Codex home, scratch)
+       -- and every parent of each, up to ``/`` -- are guarded against being renamed, replaced or
+       deleted (``_rename_protection``). Their *contents* stay as writable as they were, except
+       where an earlier rule says otherwise, so the re-opened roots cannot be swapped for a
+       symlink the launcher would then follow. A guarded root has to exist when the profile is
+       used: the launcher creates the native scratch and screenshots directories first.
 
     Without ``state_dir`` there is no state rule (``allowed_writes`` is then unused).
 
@@ -506,10 +566,10 @@ def seatbelt_profile(perms: Permissions, *, primary_repo: Path, state_dir: Any =
     ``docker login`` fail under the wrapper; create the directory outside a job, or lift the
     entry with ``allow-read``.
 
-    Not covered: a primary checkout that uses the reftable ref backend (``.git/reftable/``)
-    keeps its branches outside ``.git/refs`` and ``packed-refs``, and one whose ``.git`` is
-    a gitfile (a linked worktree or submodule used as the primary) keeps its HEAD, index and refs
-    elsewhere; branch protection assumes a plain ``.git`` directory with files-backend refs.
+    Not covered: ``objects/`` stays writable (a commit needs it), so a worker can still damage
+    or delete the primary's object store, though it cannot repoint or extend it; and a git
+    feature that writes elsewhere in the common dir during a worktree commit (``gc --auto``,
+    ``packed-refs``) warns or fails inside the job.
     """
     _validate(perms, "the permissions list")
     lines = ["(version 1)", "(allow default)"]
@@ -531,16 +591,18 @@ def seatbelt_profile(perms: Permissions, *, primary_repo: Path, state_dir: Any =
             guarded.append(real)
     if perms.protect_primary_checkout:
         repo = os.path.realpath(str(primary_repo))
-        git_dir = os.path.join(repo, ".git")
-        closed = [f"(literal {_quote(os.path.join(git_dir, name))})" for name in GIT_PROTECTED_FILES]
-        closed += [f"(subpath {_quote(os.path.join(git_dir, name))})" for name in GIT_PROTECTED_SUBTREES]
-        closed += [f"(subpath {_quote(os.path.join(git_dir, name))})" for name in GIT_PLANTING_DIRS]
-        closed += [f"(literal {_quote(os.path.join(git_dir, name))})" for name in GIT_PLANTING_FILES]
+        own_git_dir, resolved_common = resolve_git_dirs(repo)
+        commons = _reals([resolved_common] + ([str(git_common_dir)] if git_common_dir is not None else []))
+        # The primary's own admin dir is a separate directory only when it is a linked worktree.
+        own_admin = [] if any(_same(own_git_dir, common) for common in commons) else [own_git_dir]
+        shut = [*commons, *own_admin]
+        reopened_git = [os.path.join(common, name) for common in commons for name in GIT_WRITABLE_DIRS]
+        reshut_git = [os.path.join(common, name) for common in commons for name in GIT_SHUT_BELOW]
         lines.append(f"(deny file-write* (subpath {_quote(repo)}))")
-        lines.append(f"(allow file-write* (subpath {_quote(git_dir)}))")
-        lines.append("(deny file-write* " + " ".join(closed) + ")")
-        guarded += [repo, git_dir]
-        guarded += [os.path.join(git_dir, name) for name in GIT_PROTECTED_SUBTREES]
+        lines.append("(deny file-write* " + " ".join(f"(subpath {_quote(path)})" for path in shut) + ")")
+        lines.append("(allow file-write* " + " ".join(f"(subpath {_quote(path)})" for path in reopened_git) + ")")
+        lines.append("(deny file-write* " + " ".join(f"(subpath {_quote(path)})" for path in reshut_git) + ")")
+        guarded += [repo, *shut, *reopened_git, *reshut_git]
         if job_git_admin is not None:
             admin = os.path.realpath(str(job_git_admin))
             # The job's own linked-worktree admin dir is re-opened (its commit needs index/HEAD/
@@ -707,7 +769,8 @@ def _mentions(line: str, folded: str, origin: Sequence[int],
 
 
 def find_denials(text: str, perms: Permissions, primary_repo: Path, *,
-                 state_dir: Any = None, worktree: Any = None) -> List[Dict[str, str]]:
+                 state_dir: Any = None, worktree: Any = None,
+                 git_dirs: Iterable[Any] = ()) -> List[Dict[str, str]]:
     """The wrapper denials visible in ``text``: ``{"path", "kind"}`` in order of appearance.
 
     A line saying ``Operation not permitted`` that names a denied-read entry (or a path under
@@ -726,6 +789,10 @@ def find_denials(text: str, perms: Permissions, primary_repo: Path, *,
     entries are the bare ``{"path", "kind"}`` and worktree-only denials are not reported. This is
     a reading of tool output, not proof: ``EPERM`` has other causes, so callers word it as a
     likely cause.
+
+    ``git_dirs`` are the primary's git directories that live outside the checkout (a
+    ``--separate-git-dir`` primary, the main repository of a linked-worktree primary): a denial
+    naming one is a ``primary_checkout`` write like a denial inside the checkout itself.
     """
     # Write groups in precedence order (first match wins the cause): the job's own worktree is
     # the most specific (it sits inside the state dir), then the primary checkout, the deny_write
@@ -734,7 +801,10 @@ def find_denials(text: str, perms: Permissions, primary_repo: Path, *,
     if worktree is not None:
         write_groups.append(("unknown", _path_forms(worktree)))
     if perms.protect_primary_checkout:
-        write_groups.append(("primary_checkout", _path_forms(primary_repo)))
+        primary_forms = _path_forms(primary_repo)
+        for git_dir in git_dirs:
+            primary_forms.extend(form for form in _path_forms(git_dir) if form not in primary_forms)
+        write_groups.append(("primary_checkout", primary_forms))
     denied_writes: List[str] = []
     for entry in perms.deny_write:
         denied_writes.extend(form for form in _forms(entry) if form not in denied_writes)

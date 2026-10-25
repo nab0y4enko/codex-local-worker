@@ -106,7 +106,7 @@ class ToolLauncher(unittest.TestCase):
         self.assertNotIn(TOKEN, joined)
         self.assertEqual(worker["env"][VAR], TOKEN)                 # the MCP server inherits it
         profile = sp.discovered_profile()                              # provider pins preserved
-        catalog = (Path(report["codex_home"]) / "local-model-catalog.json",
+        catalog = (Path(report["report_dir"]) / "local-model-catalog.json",
                    report["catalog_sha256"])
         self.assertEqual(lw.missing_config_pins(worker["argv"], profile,
                                                 profile.model.context_window, catalog), [])

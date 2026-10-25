@@ -40,7 +40,8 @@ class IsolationCase(unittest.TestCase):
         """A worker argv on a catalog generated for ``self.profile`` at a 32768 window."""
         report_dir = self.root / "report"
         report_dir.mkdir()
-        self.catalog = lw.job_codex_home(report_dir) / codex_catalog.CATALOG_NAME
+        lw.job_codex_home(report_dir)
+        self.catalog = report_dir / codex_catalog.CATALOG_NAME  # the launcher's, not the worker's, file
         self.catalog_sha = codex_catalog.write_catalog(
             self.catalog, codex_catalog.build_local_entry(self.profile.model, 32768))
         return lw.worker_argv("codex", Path("/wt"), self.profile, 32768, Path("/r/l.txt"),
@@ -60,8 +61,7 @@ class JobHome(IsolationCase):
         self.assertTrue(worker["env"]["CODEX_HOME"].startswith(report["report_dir"]))
         self.assertIn("--ephemeral", worker["argv"])
         self.assertEqual(lw.config_overrides_map(worker["argv"])["model_catalog_json"],
-                         json.dumps(str(Path(report["report_dir"]) / "codex-home"
-                                        / "local-model-catalog.json")))
+                         json.dumps(str(Path(report["report_dir"]) / "local-model-catalog.json")))
 
     def test_the_job_home_is_created_empty_inside_the_report_directory(self):
         report_dir = self.root / "report"
@@ -87,7 +87,7 @@ class JobHome(IsolationCase):
     def test_the_report_names_the_home_and_the_hash_of_the_catalog_it_launched_with(self):
         report, run = self.run_clean_job()
         home = Path(report["report_dir"]) / "codex-home"
-        catalog = home / "local-model-catalog.json"
+        catalog = Path(report["report_dir"]) / "local-model-catalog.json"  # not in the writable home
         self.assertEqual(report["codex_home"], str(home))
         self.assertEqual(report["environment"]["codex_home"], str(home))
         self.assertEqual(report["catalog_sha256"], hashlib.sha256(catalog.read_bytes()).hexdigest())
@@ -128,7 +128,7 @@ class JobHome(IsolationCase):
         self.assertEqual(seen["codex_home"], Path(report["codex_home"]))
         overrides = lw.config_overrides_map(seen["overrides"])
         self.assertEqual(overrides["model_catalog_json"],
-                         json.dumps(str(Path(report["codex_home"]) / codex_catalog.CATALOG_NAME)))
+                         json.dumps(str(Path(report["report_dir"]) / codex_catalog.CATALOG_NAME)))
         self.assertNotIn("report_dir", seen)
 
     def test_a_catalog_changed_after_it_was_written_blocks_before_any_worker(self):
