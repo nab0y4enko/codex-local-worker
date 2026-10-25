@@ -239,8 +239,7 @@ def _attachment(export_dir: Path, wanted: str) -> Path:
                 name_values = [str(value.get(key, "")) for key in
                                ("name", "attachmentName", "displayName",
                                 "suggestedHumanReadableName")]
-                matched = any(name == wanted or Path(name).stem == wanted or
-                              Path(name).stem.startswith(wanted + "_")
+                matched = any(_xcode_attachment_name(name, wanted)
                               for name in name_values if name)
                 if matched:
                     for key in ("exportedFileName", "fileName", "filename", "path"):
@@ -253,16 +252,35 @@ def _attachment(export_dir: Path, wanted: str) -> Path:
                 for child in value:
                     visit(child)
         visit(data)
+    valid: set[Path] = set()
     for candidate in candidates:
         path = (export_dir / candidate).resolve()
         if export_dir.resolve() in path.parents and path.is_file() and not path.is_symlink():
-            return path
+            valid.add(path)
+    if len(valid) == 1:
+        return next(iter(valid))
+    if len(valid) > 1:
+        raise ValueError(f"multiple exported XCTest attachments match {wanted!r}")
     for path in export_dir.rglob("*"):
-        if path.is_file() and not path.is_symlink() and path.name == wanted:
-            return path
-        if path.is_file() and not path.is_symlink() and path.stem == wanted:
-            return path
+        if path.is_file() and not path.is_symlink() and _xcode_attachment_name(path.name, wanted):
+            valid.add(path.resolve())
+    if len(valid) == 1:
+        return next(iter(valid))
+    if len(valid) > 1:
+        raise ValueError(f"multiple exported XCTest attachments match {wanted!r}")
     raise FileNotFoundError(f"named XCTest attachment {wanted!r} was not exported")
+
+
+def _xcode_attachment_name(value: str, wanted: str) -> bool:
+    """Match exact names or Xcode's ``name_index_UUID.png`` export suffix only."""
+    if value == wanted:
+        return True
+    stem = Path(value).stem
+    if stem == wanted:
+        return True
+    match = re.fullmatch(re.escape(wanted) + r"_([0-9]+)_([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-"
+                         r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})", stem)
+    return match is not None
 
 
 def _safe_screenshot_name(value: Any) -> str:

@@ -191,6 +191,26 @@ class CaptureTests(unittest.TestCase):
             sp.lw._capture_checkout(source, scratch, lambda cwd, argv: None, [])
         self.assertFalse(scratch.exists())
 
+    def test_xcode_attachment_match_requires_exact_name_or_index_uuid_suffix(self):
+        self.assertTrue(screenshots._xcode_attachment_name(
+            "Screen_0_97EB4635-49F7-4D8F-ADDD-233ECB533393.png", "Screen"))
+        self.assertFalse(screenshots._xcode_attachment_name(
+            "Screen_Other_0_97EB4635-49F7-4D8F-ADDD-233ECB533393.png", "Screen"))
+
+    def test_ambiguous_xcode_attachments_are_refused(self):
+        export_dir = self.root / "attachments"
+        export_dir.mkdir()
+        names = ["Screen_0_97EB4635-49F7-4D8F-ADDD-233ECB533393.png",
+                 "Screen_1_97EB4635-49F7-4D8F-ADDD-233ECB533393.png",
+                 "Screen_Other_0_97EB4635-49F7-4D8F-ADDD-233ECB533393.png"]
+        for name in names:
+            (export_dir / name).write_bytes(b"attachment")
+        (export_dir / "manifest.json").write_text(json.dumps([{"attachments": [
+            {"exportedFileName": name, "suggestedHumanReadableName": name}
+            for name in names]}]), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "multiple exported XCTest attachments"):
+            screenshots._attachment(export_dir, "Screen")
+
     def test_capture_source_builds_unique_artifacts_and_writes_screenshot(self):
         calls = []
         summary = {"result": "Passed", "totalTestCount": 1, "passedTests": 1,
