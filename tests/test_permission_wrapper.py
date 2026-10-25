@@ -111,7 +111,7 @@ class WrappedJobs(WrapperCase):
             with self.subTest(path=str(path)):
                 self.assertIn(f'(subpath "{real(path)}")', reopen)
         for evidence in ("report.json", "progress.json", sp.DENY_PROFILE_NAME,
-                         "attempt-1.jsonl", "changes.patch"):
+                         "worker-attempt-1.jsonl", "changes.patch"):
             with self.subTest(evidence=evidence):
                 self.assertNotIn(f"{real(report_dir)}/{evidence}", reopen)
                 self.assertFalse(sp.seatbelt_write_allowed(text, report_dir / evidence))

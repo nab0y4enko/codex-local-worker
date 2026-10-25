@@ -1971,160 +1971,12 @@ def summarize_failure(attempt: Dict[str, Any], tests: Sequence[Dict[str, Any]],
     return "\n".join(lines)
 
 
-def _walk_key(node: Any, key: str) -> List[Any]:
-    found: List[Any] = []
-    if isinstance(node, dict):
-        for name, value in node.items():
-            if name == key:
-                found.append(value)
-            found.extend(_walk_key(value, key))
-    elif isinstance(node, list):
-        for item in node:
-            found.extend(_walk_key(item, key))
-    return found
-
-
-UNSUPPORTED_RE = re.compile(r"unsupported (?:tool|function)|tool .{0,40}not (?:supported|available)", re.I)
-# A raw (non-JSON) stream line is only a diagnostic when it reads like one: plain progress text
-# that happens to quote the phrase must stay silent, while a CLI error line must fail closed.
-DIAGNOSTIC_RE = re.compile(r"\b(?:error|errors|fatal|panic|exception|traceback|failed|failure|"
-                           r"warning|refused|rejected|denied)\b", re.I)
-# Event kinds the CLI itself labels as failures, and the field names that carry a failure status.
-ERROR_EVENT_TYPES = ("error", "tool_error", "tool_call_error", "function_call_error")
-FAILURE_STATUSES = ("failed", "failure", "error")
-FAILURE_STATUS_KEYS = ("status", "exit_status", "state", "outcome")
-# Only these fields of a failure node are diagnostics. Command text, tool output of a merely
-# non-zero exit, reasoning and chat text are data the worker quotes, never tool-failure evidence.
-DIAGNOSTIC_KEYS = ("error", "message", "detail", "details", "reason", "msg")
-PAYLOAD_KEYS = ("output", "content", "result", "text")
-
-
-def _walk_dicts(node: Any) -> List[Dict[str, Any]]:
-    found: List[Dict[str, Any]] = []
-    if isinstance(node, dict):
-        found.append(node)
-        for value in node.values():
-            found.extend(_walk_dicts(value))
-    elif isinstance(node, list):
-        for item in node:
-            found.extend(_walk_dicts(item))
-    return found
-
-
-def _walk_strings(node: Any) -> List[str]:
-    found: List[str] = []
-    if isinstance(node, str):
-        found.append(node)
-    elif isinstance(node, dict):
-        for value in node.values():
-            found.extend(_walk_strings(value))
-    elif isinstance(node, list):
-        for item in node:
-            found.extend(_walk_strings(item))
-    return found
-
-
-def _present(value: Any) -> bool:
-    return value not in (None, False, "", {}, [], 0)
-
-
-def _failure_texts(event: Any) -> List[str]:
-    """Diagnostic strings of real failure events; content streams are never searched."""
-    texts: List[str] = []
-    for node in _walk_dicts(event):
-        kind = node.get("type")
-        kind = kind.lower() if isinstance(kind, str) else ""
-        declared = (kind in ERROR_EVENT_TYPES or _present(node.get("error"))
-                    or node.get("is_error") is True or node.get("ok") is False
-                    or node.get("success") is False)
-        failed = declared or any(isinstance(node.get(name), str)
-                                 and node[name].lower() in FAILURE_STATUSES
-                                 for name in FAILURE_STATUS_KEYS)
-        if not failed:
-            continue
-        keys = list(DIAGNOSTIC_KEYS)
-        if declared:
-            keys.extend(PAYLOAD_KEYS)
-        for key in keys:
-            texts.extend(_walk_strings(node.get(key)))
-    return texts
-
-
 def parse_worker_log(text: str) -> Dict[str, Any]:
-    """Extract model routing, tool-use and token evidence from the worker JSONL stream.
-
-    Unsupported-tool detection is deliberately narrow: an explicit error/failure event or a
-    raw diagnostic line, never successful command output, command text, reasoning or messages.
-    Model, thread, tool and terminal-failure evidence comes only from the documented event
-    locations: a model name, item type or event type that a payload merely quotes is data.
-    """
-    models: List[str] = []
-    started: set = set()
-    completed: set = set()
-    stageless: set = set()
-    anonymous = 0
-    anonymous_started = 0
-    anonymous_completed = 0
-    thread_id: Optional[str] = None
-    terminal: List[str] = []
-    unsupported = False
-    tokens: Dict[str, Optional[int]] = {"input_tokens": None, "output_tokens": None}
+    """Compatibility wrapper over the live event accumulator."""
+    accumulator = observation.EventAccumulator()
     for line in text.splitlines():
-        line = line.strip()
-        event: Any = None
-        if line.startswith("{"):
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                event = None
-        if event is None:
-            if line and UNSUPPORTED_RE.search(line) and DIAGNOSTIC_RE.search(line):
-                unsupported = True
-            continue
-        for value in observation.event_models(event):
-            if value not in models:
-                models.append(value)
-        for value in _walk_key(event, "input_tokens") + _walk_key(event, "prompt_tokens"):
-            if isinstance(value, int):
-                tokens["input_tokens"] = value
-        for value in _walk_key(event, "output_tokens") + _walk_key(event, "completion_tokens"):
-            if isinstance(value, int):
-                tokens["output_tokens"] = value
-        identified = observation.tool_event(event)
-        if identified is not None:
-            stage, key = identified
-            if key is None:
-                # Without an id nothing can be deduplicated, so each observation counts once.
-                anonymous += 1
-                if stage == "started":
-                    anonymous_started += 1
-                elif stage == "completed":
-                    anonymous_completed += 1
-            elif stage == "started":
-                started.add(key)
-            elif stage == "completed":
-                completed.add(key)
-            else:
-                stageless.add(key)
-        thread = observation.event_thread_id(event)
-        if thread and thread_id is None:
-            thread_id = thread
-        failure_type = observation.terminal_failure(event)
-        if failure_type and failure_type not in terminal:
-            terminal.append(failure_type)
-        if any(UNSUPPORTED_RE.search(item) for item in _failure_texts(event)):
-            unsupported = True
-    return {
-        "observed_models": sorted(models),
-        "thread_id": thread_id,
-        "tool_call_events": len(started | completed | stageless) + anonymous,
-        "tool_started_count": len(started) + anonymous_started,
-        "tool_completed_count": len(completed) + anonymous_completed,
-        "unsupported_tools": unsupported,
-        "terminal_failure": bool(terminal),
-        "terminal_failures": sorted(terminal),
-        **observation.parse_usage(text),
-    }
+        accumulator.add_raw_line(line)
+    return accumulator.result()
 
 
 def model_routing(evidence: Dict[str, Any], alias: str) -> str:
@@ -2895,6 +2747,7 @@ def progress(report: Dict[str, Any], phase: str) -> None:
     # The observer rewrites this file per attempt with its own attempt start; the job start
     # stays authoritative, so a live snapshot still reports job-level elapsed time.
     previous["started_at"] = report.get("started_at") or previous.get("started_at")
+    previous.setdefault("last_event_at", None)
     previous.setdefault("job_started_at", previous["started_at"])
     previous.update(launcher_pid=report["launcher_pid"],
                     active=phase != report.get("status"),
@@ -3180,9 +3033,9 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         if loaded["prompt"]:
             prompt += "\n" + loaded["prompt"] + "\n"
 
-        jsonl_path = report_dir / f"attempt-{attempt_number}.jsonl"
+        jsonl_path = report_dir / f"worker-attempt-{attempt_number}.jsonl"
         prompt_path = report_dir / f"attempt-{attempt_number}.prompt.txt"
-        stderr_path = report_dir / f"attempt-{attempt_number}.stderr.txt"
+        stderr_path = report_dir / f"worker-attempt-{attempt_number}.stderr.log"
         last_path = last_message_path(report_dir, attempt_number)
         prompt_path.write_text(redact(prompt, secrets), encoding="utf-8")
         argv = worker_argv(options.codex_bin, worktree, profile, context_window, last_path,
@@ -3229,16 +3082,21 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
             raise
         finally:
             _RUN_OBSERVER.reset(context_token)
+        # The real streaming runner already fed each chunk live. A test/injected runner may
+        # return captured bytes without invoking the observer callback, so complete the same
+        # accumulation and persisted stream once in that compatibility path.
+        if observer.activity_count == 0:
+            if result.get("stdout"):
+                observer("stdout", result["stdout"])
+            if result.get("stderr"):
+                observer("stderr", result["stderr"])
         observer.finish(result=result)
         stdout_text = redact(result["stdout"].decode("utf-8", "replace"), secrets)
         stderr_text = redact(result["stderr"].decode("utf-8", "replace"), secrets)
-        jsonl_path.write_text(stdout_text, encoding="utf-8")
-        stderr_path.write_text(stderr_text, encoding="utf-8")
         for text in [*worker_command_outputs(stdout_text), stderr_text]:
             wrapper.collect(text, f"worker attempt {attempt_number}")
         evidence = parse_worker_log(stdout_text)
         report["tooling"] = tools.mark_observations(report.get("tooling"), stdout_text)
-        observer.record_event_evidence(evidence)
         routing = model_routing(evidence, report["api_model"])
         timeline = observer.snapshot()["usage"]
         for field_name in ("started_at", "finished_at", "elapsed_seconds"):
@@ -3272,6 +3130,8 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         report.pop("_active_attempt", None)
         last_message, last_message_missing, last_message_tampered = safe_read_job_text(
             last_path, report_dir, secrets)
+        if not last_path.exists():
+            last_path.write_text("", encoding="utf-8")
         attempt = {
             "attempt": attempt_number,
             "returncode": result["returncode"],
@@ -3655,6 +3515,19 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
                             "worker_seconds": round(sum(a["elapsed_seconds"] for a in attempts), 3),
                             "verification_seconds": round(sum(t.get("elapsed_seconds", 0) or 0 for a in attempts for t in a.get("tests", [])), 3),
                             "native_preflight_seconds": report.get("native_preflight_seconds", 0.0)}
+        codex_home = report.get("codex_home")
+        if codex_home:
+            home_path = Path(codex_home)
+            expected_home = Path(report["report_dir"]) / CODEX_HOME_NAME
+            try:
+                if home_path.absolute() == expected_home.absolute() and not home_path.is_symlink():
+                    shutil.rmtree(str(home_path))
+                    report["codex_home_removed"] = not home_path.exists()
+                else:
+                    report["codex_home_removed"] = False
+            except OSError as cleanup_error:
+                report["codex_home_removed"] = False
+                report["codex_home_cleanup_error"] = redact(str(cleanup_error), secrets)
         progress(report, report["status"])
         write_report(report, secrets)
     return report
@@ -3837,6 +3710,8 @@ def summary_lines(report: Dict[str, Any]) -> List[str]:
 def status_snapshot(item):
     """Read process liveness without treating missing output as a stalled model."""
     item = dict(item)
+    item.setdefault("phase", item.get("status"))
+    item.setdefault("last_event_at", None)
     if not item.get("active"):
         return item
     pid = item.get("launcher_pid")

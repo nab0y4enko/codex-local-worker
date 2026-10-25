@@ -130,7 +130,7 @@ class ToolLauncher(unittest.TestCase):
         artifacts = self.artifacts(report)
         self.assertIn("changes.patch", artifacts)
         self.assertEqual(report["patch_path"], str(Path(report["report_dir"], "changes.patch")))
-        for name in ("attempt-1.jsonl", "attempt-1.stderr.txt", "attempt-1.prompt.txt",
+        for name in ("worker-attempt-1.jsonl", "worker-attempt-1.stderr.log", "attempt-1.prompt.txt",
                      "report.json", "changes.patch"):
             self.assertIn(name, artifacts)
             self.assertNotIn(TOKEN, artifacts[name], name)

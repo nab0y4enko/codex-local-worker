@@ -71,20 +71,24 @@ class NativeGateIntegrationTests(unittest.TestCase):
         return {'qualified': True, 'status': 'passed', 'simulator_udid': udid,
                 'checks': [], 'launch_pid': 101, 'xctest': {'passed': 1, 'failed': 0}}
 
-    def runner(self, argv, *, cwd, env, timeout, stdin_data=None):
+    def runner(self, argv, *, cwd, env, timeout, stdin_data=None, stall_seconds=None,
+               on_stall=None):
         raw = [str(item) for item in argv]
         argv, wrapped = sp.deny_wrapped(raw)
         if wrapped and argv == sp.WRAPPER_PROBE:
-            return self.fake(raw, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data)
+            return self.fake(raw, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data,
+                             stall_seconds=stall_seconds, on_stall=on_stall)
         if argv[0] == lw.apple.SANDBOX_EXEC:
             self.fail('full-host native runs must not use the legacy Apple profile')
         if argv == list(lw.FULL_HOST_PROBE_ARGV):
-            return self.fake(raw, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data)
+            return self.fake(raw, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data,
+                             stall_seconds=stall_seconds, on_stall=on_stall)
         if argv[1:2] == ['exec']:
             self.assertTrue(self.gate_done, 'worker started before native qualification completed')
             self.assertTrue(wrapped, 'the worker must run inside the deny wrapper')
             self.events.append('worker')
-            return self.fake(raw, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data)
+            return self.fake(raw, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data,
+                             stall_seconds=stall_seconds, on_stall=on_stall)
         call = {'argv': list(argv), 'wrapped': wrapped, 'cwd': cwd, 'env': dict(env),
                 'timeout': timeout}
         self.native_calls.append(call)
@@ -97,7 +101,8 @@ class NativeGateIntegrationTests(unittest.TestCase):
         self.assertEqual(env['IBToolNeverDeque'], '1')
         self.assertNotIn(lw.apple.FOUNDATION_HOME_ENV, env)
         self.assertNotIn(lw.API_KEY_ENV, env)
-        return self.fake(raw, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data)
+        return self.fake(raw, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data,
+                         stall_seconds=stall_seconds, on_stall=on_stall)
 
     @contextlib.contextmanager
     def injected(self):

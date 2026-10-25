@@ -13,6 +13,8 @@ try:
     import worker_observability as obs
 except ImportError:
     obs = None
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import support as sp  # noqa: E402
 
 
 def lines(*events):
@@ -60,6 +62,34 @@ class WorkerObservability(unittest.TestCase):
                 observer.finish(result=result)
             self.assertEqual(result["returncode"], 0)
             self.assertEqual(observer.snapshot()["status"], "completed")
+
+    def test_one_copy_of_each_attempt_stream_is_persisted(self):
+        root = sp.tmpdir()
+        self.addCleanup(sp.cleanup, root)
+        repo = sp.make_repo(root)
+        report, _ = sp.run_clean_job(root, repo)
+        names = sorted(path.name for path in Path(report["report_dir"]).glob("*attempt-1*")
+                       if path.name in {"attempt-1.last-message.txt", "attempt-1.prompt.txt",
+                                        "worker-attempt-1.jsonl", "worker-attempt-1.stderr.log",
+                                        "attempt-1.jsonl", "attempt-1.stderr.txt"})
+        self.assertEqual(names, ["attempt-1.last-message.txt", "attempt-1.prompt.txt",
+                                 "worker-attempt-1.jsonl", "worker-attempt-1.stderr.log"])
+        self.assertTrue(report["codex_home_removed"])
+        self.assertFalse(Path(report["codex_home"]).exists())
+        self.assertTrue((Path(report["report_dir"]) / sp.lw.codex_catalog.CATALOG_NAME).is_file())
+
+    def test_progress_always_has_phase_and_last_event_time(self):
+        with tempfile.TemporaryDirectory() as root:
+            observer = obs.RunObserver(Path(root))
+            initial = json.loads((Path(root) / "progress.json").read_text())
+            self.assertEqual(initial["phase"], initial["status"])
+            self.assertIsNone(initial["last_event_at"])
+            observer("stdout", b'{"type":"item.started","item":{"id":"c1",'
+                     b'"type":"command_execution"}}\n')
+            updated = json.loads((Path(root) / "progress.json").read_text())
+            self.assertEqual(updated["phase"], "tool_started")
+            self.assertIsNotNone(updated["last_event_at"])
+            observer.finish()
 
     def test_real_worker_and_launcher_pids_are_written_to_progress(self):
         with tempfile.TemporaryDirectory() as root:

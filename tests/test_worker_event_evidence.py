@@ -49,7 +49,8 @@ class StreamRun(sp.FakeRun):
         super().__init__(**kwargs)
         self.worker_stream = worker_stream
 
-    def __call__(self, argv, *, cwd, env, timeout, stdin_data=None):
+    def __call__(self, argv, *, cwd, env, timeout, stdin_data=None, stall_seconds=None,
+                 on_stall=None):
         raw = [str(item) for item in argv]
         argv, wrapped = sp.deny_wrapped(raw)
         if argv[1:2] == ["exec"]:
@@ -62,7 +63,8 @@ class StreamRun(sp.FakeRun):
                 self.worker_edit(Path(cwd), self.exec_calls)
             return sp.result(argv, self.worker_rc, self.worker_stream, self.worker_stderr,
                              timed_out=self.worker_timed_out)
-        return super().__call__(raw, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data)
+        return super().__call__(raw, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data,
+                                stall_seconds=stall_seconds, on_stall=on_stall)
 
 
 class TerminalEventEvidence(unittest.TestCase):
@@ -191,9 +193,9 @@ class ThreadIdentityEvidence(unittest.TestCase):
             self.assertIsNone(observer.snapshot()["thread_id"])
             observer_events(observer, {"type": "thread.started", "thread_id": "thr_live_42"})
             self.assertEqual(observer.snapshot()["thread_id"], "thr_live_42")
+            observer.finish(result={"returncode": 0, "timed_out": False})
             self.assertEqual(json.loads((Path(root) / "progress.json").read_text())["thread_id"],
                              "thr_live_42")
-            observer.finish(result={"returncode": 0, "timed_out": False})
             snapshot = observer.snapshot()
             self.assertEqual(snapshot["status"], "completed")
             self.assertEqual(snapshot["thread_id"], "thr_live_42")

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import selectors
 import signal
 import subprocess
@@ -21,7 +22,8 @@ FIELDS = ("input_tokens", "output_tokens", "cached_input_tokens")
 # A worker or a test command can flood its pipes. Memory stays bounded by retaining at
 # most this many bytes per stream; the caller treats the truncation as a failure.
 CAPTURE_LIMIT_BYTES = 16 * 1024 * 1024
-TOOLS = {"command_execution", "function_call", "exec_command", "mcp_tool_call", "web_search"}
+TOOLS = {"command_execution", "function_call", "exec_command", "mcp_tool_call", "web_search",
+        "file_change"}
 # Documented top-level events that end a run unsuccessfully, whatever the exit code claims.
 TERMINAL_EVENT_TYPES = ("turn.failed", "response.failed", "error")
 # The two documented item lifecycle stages: separate counts that are never merged.
@@ -118,6 +120,156 @@ class _UsageAccumulator:
         if self.snapshot is not None:
             return _result([self.snapshot], {"event_msg/token_count"}, snapshots=True)
         return _result([], set())
+
+
+_UNSUPPORTED_RE = re.compile(r"unsupported (?:tool|function)|tool .{0,40}not (?:supported|available)", re.I)
+_DIAGNOSTIC_RE = re.compile(r"\b(?:error|errors|fatal|panic|exception|traceback|failed|failure|"
+                            r"warning|refused|rejected|denied)\b", re.I)
+_ERROR_EVENT_TYPES = ("error", "tool_error", "tool_call_error", "function_call_error")
+_FAILURE_STATUSES = ("failed", "failure", "error")
+_FAILURE_STATUS_KEYS = ("status", "exit_status", "state", "outcome")
+_DIAGNOSTIC_KEYS = ("error", "message", "detail", "details", "reason", "msg")
+_PAYLOAD_KEYS = ("output", "content", "result", "text")
+
+
+def _walk_values(node, key):
+    if isinstance(node, dict):
+        for name, value in node.items():
+            if name == key:
+                yield value
+            for found in _walk_values(value, key):
+                yield found
+    elif isinstance(node, list):
+        for item in node:
+            for found in _walk_values(item, key):
+                yield found
+
+
+def _walk_dicts(node):
+    if isinstance(node, dict):
+        yield node
+        for value in node.values():
+            yield from _walk_dicts(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _walk_dicts(item)
+
+
+def _walk_strings(node):
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for value in node.values():
+            yield from _walk_strings(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _walk_strings(item)
+
+
+def _failure_texts(event):
+    for node in _walk_dicts(event):
+        kind = node.get("type")
+        kind = kind.lower() if isinstance(kind, str) else ""
+        declared = (kind in _ERROR_EVENT_TYPES or node.get("error") not in (None, False, "", {}, [], 0)
+                    or node.get("is_error") is True or node.get("ok") is False
+                    or node.get("success") is False)
+        failed = declared or any(isinstance(node.get(name), str)
+                                 and node[name].lower() in _FAILURE_STATUSES
+                                 for name in _FAILURE_STATUS_KEYS)
+        if failed:
+            keys = list(_DIAGNOSTIC_KEYS)
+            if declared:
+                keys.extend(_PAYLOAD_KEYS)
+            for key in keys:
+                yield from _walk_strings(node.get(key))
+
+
+class EventAccumulator:
+    """One incremental parser shared by live progress and post-run evidence."""
+    def __init__(self):
+        self.models = []
+        self.started = set()
+        self.completed = set()
+        self.stageless = set()
+        self.anonymous = 0
+        self.anonymous_started = 0
+        self.anonymous_completed = 0
+        self.file_change_ids = set()
+        self.file_change_anonymous = 0
+        self.thread_id = None
+        self.terminal = []
+        self.unsupported = False
+        self.tokens = {"input_tokens": None, "output_tokens": None}
+        self.usage = _UsageAccumulator()
+
+    def add_raw_line(self, line):
+        line = line.strip()
+        event = None
+        if line.startswith("{"):
+            try:
+                event = json.loads(line)
+            except (ValueError, TypeError):
+                pass
+        if event is None:
+            if line and _UNSUPPORTED_RE.search(line) and _DIAGNOSTIC_RE.search(line):
+                self.unsupported = True
+            return
+        self.add(event)
+
+    def add(self, event):
+        if not isinstance(event, dict):
+            return
+        self.usage.add(event)
+        for model in event_models(event):
+            if model not in self.models:
+                self.models.append(model)
+        for value in list(_walk_values(event, "input_tokens")) + list(_walk_values(event, "prompt_tokens")):
+            if isinstance(value, int):
+                self.tokens["input_tokens"] = value
+        for value in list(_walk_values(event, "output_tokens")) + list(_walk_values(event, "completion_tokens")):
+            if isinstance(value, int):
+                self.tokens["output_tokens"] = value
+        detected = tool_event(event)
+        if detected is not None:
+            stage, key = detected
+            if key is None:
+                self.anonymous += 1
+                if stage == "started":
+                    self.anonymous_started += 1
+                elif stage == "completed":
+                    self.anonymous_completed += 1
+                if event.get("type") == "file_change" or (isinstance(event.get("item"), dict)
+                        and event["item"].get("type") == "file_change"):
+                    self.file_change_anonymous += 1
+            elif stage == "started":
+                self.started.add(key)
+            elif stage == "completed":
+                self.completed.add(key)
+            else:
+                self.stageless.add(key)
+            if event.get("type") == "file_change" or (isinstance(event.get("item"), dict)
+                    and event["item"].get("type") == "file_change"):
+                self.file_change_ids.add(key) if key is not None else None
+        thread = event_thread_id(event)
+        if thread and self.thread_id is None:
+            self.thread_id = thread
+        failure = terminal_failure(event)
+        if failure and failure not in self.terminal:
+            self.terminal.append(failure)
+        if any(_UNSUPPORTED_RE.search(text) for text in _failure_texts(event)):
+            self.unsupported = True
+
+    def result(self):
+        return {
+            "observed_models": sorted(self.models), "thread_id": self.thread_id,
+            "tool_call_events": len(self.started | self.completed | self.stageless) + self.anonymous,
+            "tool_started_count": len(self.started) + self.anonymous_started,
+            "tool_completed_count": len(self.completed) + self.anonymous_completed,
+            "unsupported_tools": self.unsupported,
+            "terminal_failure": bool(self.terminal),
+            "terminal_failures": sorted(self.terminal), "file_changes": len(self.file_change_ids) + self.file_change_anonymous,
+            **self.usage.result(),
+        }
 
 
 def parse_usage(text):
@@ -433,22 +585,24 @@ class _Redactor:
         if not self.secrets:
             self.pending = ""
             return value
-        out, index = [], 0
-        while index < len(value):
-            if not final and len(value) - index < self.max_length:
-                remaining = value[index:]
-                if any(secret.startswith(remaining) and len(secret) > len(remaining)
-                       for secret in self.secrets):
+        safe_end = len(value) if final else max(0, len(value) - self.max_length + 1)
+        if not final:
+            # A shorter secret can start just before the held suffix. Move the cut back until
+            # no match is split; this also keeps replacement markers wholly in one output.
+            while True:
+                earlier = safe_end
+                for secret in self.secrets:
+                    start = value.find(secret, max(0, safe_end - len(secret) + 1))
+                    if 0 <= start < safe_end and start + len(secret) > safe_end:
+                        earlier = min(earlier, start)
+                if earlier == safe_end:
                     break
-            secret = next((secret for secret in self.secrets if value.startswith(secret, index)), None)
-            if secret:
-                out.append("[REDACTED]")
-                index += len(secret)
-            else:
-                out.append(value[index])
-                index += 1
-        self.pending = value[index:]
-        return "".join(out)
+                safe_end = earlier
+        output = value[:safe_end]
+        self.pending = "" if final else value[safe_end:]
+        for secret in self.secrets:
+            output = output.replace(secret, "[REDACTED]")
+        return output
 
 
 def _atomic_json(path, value):
@@ -496,16 +650,13 @@ class RunObserver:
         self.finished_at = None
         self.finished_elapsed = None
         self.last_activity_at = None
+        self.last_event_at = None
         self.activity_count = 0
-        self.thread_id = None
-        self.terminal_failures = []
-        # Separate identity sets per stage: a duplicate ``item.started`` is one tool, and a
-        # payload that merely contains a ``type`` value is never counted at all.
-        self.tool_ids = {"tool_started": set(), "tool_completed": set()}
-        self.tool_anonymous = {"tool_started": 0, "tool_completed": 0}
+        self.events = EventAccumulator()
         self.line = ""
-        self.usage = _UsageAccumulator()
         self.closed = False
+        self._last_progress_write = 0.0
+        self._last_progress_status = None
         self._write_progress()
 
     def process_started(self, pid):
@@ -518,7 +669,7 @@ class RunObserver:
                 "worker_pgid": pid, "worker_command": self.worker_command,
                 "started_at": self.started_at,
             })
-        self._write_progress()
+        self._write_progress(force=True)
 
     def _inherited(self):
         """Job metadata the launcher already wrote into this attempt's progress file."""
@@ -539,52 +690,16 @@ class RunObserver:
                     job_started_at=self.job.get("started_at") or self.started_at)
 
     def _event(self, event):
-        self.usage.add(event)
-        if not isinstance(event, dict):
-            return
-        thread = event_thread_id(event)
-        if thread and self.thread_id is None:
-            self.thread_id = thread
-        failure = terminal_failure(event)
-        if failure and failure not in self.terminal_failures:
-            self.terminal_failures.append(failure)
+        self.events.add(event)
         detected = tool_event(event)
         if detected is None:
             return
-        stage, key = detected
+        stage, _key = detected
         if stage is None:
             # A bare top-level tool event names a tool but has no lifecycle stage of its own.
             return
         name = "tool_started" if stage == "started" else "tool_completed"
-        if key is None:
-            # Without an id there is nothing to deduplicate against, so it stays an observation.
-            self.tool_anonymous[name] += 1
-        else:
-            self.tool_ids[name].add(key)
         self.status = name
-
-    def _tool_counts(self):
-        return dict((name + "_count", len(self.tool_ids[name]) + self.tool_anonymous[name])
-                    for name in self.tool_ids)
-
-    def record_event_evidence(self, evidence):
-        """Reconcile the snapshot with what the persisted JSONL actually contains.
-
-        The live callback only sees chunks the reader delivered while the worker ran, so thread
-        identity and terminal events are adopted from the parsed stream before the final snapshot
-        is written. Tool counts stay what the live stream showed: they are a progress signal.
-        """
-        if not isinstance(evidence, dict):
-            return
-        thread = evidence.get("thread_id")
-        if thread and self.thread_id is None:
-            self.thread_id = thread
-        for failure in evidence.get("terminal_failures") or []:
-            if failure not in self.terminal_failures:
-                self.terminal_failures.append(failure)
-        if self.terminal_failures and self.status not in ("failed", "timed_out"):
-            self.status = "failed"
-        self._write_progress()
 
     def _persist(self, name, text):
         if not text:
@@ -595,10 +710,16 @@ class RunObserver:
             self.line += text
             while "\n" in self.line:
                 line, self.line = self.line.split("\n", 1)
+                self.last_event_at = _now()
                 try:
-                    self._event(json.loads(line))
+                    event = json.loads(line)
                 except (ValueError, TypeError):
-                    continue
+                    event = None
+                if isinstance(event, dict):
+                    self.status = "worker_processing"
+                    self._event(event)
+                else:
+                    self.events.add_raw_line(line)
 
     def __call__(self, stream, chunk):
         if self.closed:
@@ -609,8 +730,12 @@ class RunObserver:
         self._persist(stream, self.redactors[stream].feed(chunk))
         self._write_progress()
 
+    def evidence(self):
+        return self.events.result()
+
     def snapshot(self):
-        usage = self.usage.result()["usage"]
+        evidence = self.evidence()
+        usage = evidence["usage"]
         if self.status in {"failed", "timed_out"}:
             usage["complete"] = False
             usage["availability"] = ("partial" if any(usage[name] is not None for name in FIELDS)
@@ -619,38 +744,56 @@ class RunObserver:
                      elapsed_seconds=(self.finished_elapsed if self.finished_elapsed is not None else
                                       round(time.monotonic() - self.started, 3)))
         return dict(job_id=self.job_id, attempt=self.attempt, status=self.status,
-                    thread_id=self.thread_id, terminal_failures=list(self.terminal_failures),
+                    phase=self.status, last_event_at=self.last_event_at,
+                    thread_id=evidence["thread_id"], terminal_failures=list(evidence["terminal_failures"]),
                     launcher_pid=self.launcher_pid, worker_pid=self.worker_pid,
                     started_at=self.started_at, finished_at=self.finished_at,
                     last_activity_at=self.last_activity_at, activity_count=self.activity_count,
                     elapsed_seconds=usage["elapsed_seconds"], usage=usage,
-                    **self._tool_counts(), **self._job_metadata())
+                    tool_started_count=evidence["tool_started_count"],
+                    tool_completed_count=evidence["tool_completed_count"], **self._job_metadata())
 
-    def _write_progress(self):
+    def _write_progress(self, force=False):
+        now = time.monotonic()
+        if (not force and self.status == self._last_progress_status and
+                now - self._last_progress_write < .5):
+            return
         _atomic_json(self.report_dir / "progress.json", self.snapshot())
+        self._last_progress_write = now
+        self._last_progress_status = self.status
+
+    def _close_files(self):
+        for handle in getattr(self, "files", {}).values():
+            with contextlib.suppress(Exception):
+                if not handle.closed:
+                    handle.close()
 
     def finish(self, status="completed", result=None):
         if self.closed:
             return
-        for name, redactor in self.redactors.items():
-            self._persist(name, redactor.feed(b"", final=True))
-        if self.line:
-            with contextlib.suppress(ValueError, TypeError):
-                self._event(json.loads(self.line))
-        for handle in self.files.values():
-            handle.close()
-        if self.active_path is not None:
-            with contextlib.suppress(OSError):
-                self.active_path.unlink()
+        try:
+            for name, redactor in self.redactors.items():
+                self._persist(name, redactor.feed(b"", final=True))
+            if self.line:
+                self.last_event_at = _now()
+                self.events.add_raw_line(self.line)
+        finally:
+            self._close_files()
+            if self.active_path is not None:
+                with contextlib.suppress(OSError):
+                    self.active_path.unlink()
         if result and result.get("timed_out"):
             status = "timed_out"
         elif result and result.get("returncode") not in (None, 0) and status == "completed":
             status = "failed"
-        if self.terminal_failures and status not in ("failed", "timed_out"):
+        if self.events.result()["terminal_failures"] and status not in ("failed", "timed_out"):
             # A documented terminal event outranks a zero exit code: the run never ended well.
             status = "failed"
         self.status = status
         self.finished_at = _now()
         self.finished_elapsed = round(time.monotonic() - self.started, 3)
         self.closed = True
-        self._write_progress()
+        self._write_progress(force=True)
+
+    def __del__(self):
+        self._close_files()

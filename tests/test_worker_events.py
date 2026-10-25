@@ -1,11 +1,14 @@
 """Worker JSONL evidence: model routing, tool counts, tokens and unsupported-tool detection."""
 import json
+import tempfile
 import sys
+import time
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import support as sp  # noqa: E402
+import worker_observability as obs  # noqa: E402
 
 lw = sp.lw
 
@@ -41,6 +44,37 @@ def reading_stream(*extra_events):
 
 
 class UnsupportedToolEvidence(unittest.TestCase):
+    def test_file_change_events_are_counted(self):
+        parsed = evidence({"type": "item.completed", "item": {
+            "type": "file_change", "id": "change-1", "path": "src/a.py"}})
+        self.assertEqual(parsed["file_changes"], 1)
+
+    def test_live_and_post_run_evidence_are_identical(self):
+        text = sp.load_fixture_text("codex/exec_pilot.jsonl")
+        with tempfile.TemporaryDirectory() as root:
+            observer = obs.RunObserver(root, secrets=[sp.SECRET])
+            for start in range(0, len(text), 97):
+                observer("stdout", text[start:start + 97].encode())
+            observer.finish()
+            self.assertEqual(observer.evidence(), lw.parse_worker_log(text))
+
+    def test_redaction_is_linear_for_large_chunked_payload(self):
+        redactor = obs._Redactor([sp.SECRET, "another-secret-value"])
+        payload = (b"x" * 1024 + sp.SECRET.encode()) * 8192
+        started = time.monotonic()
+        out = "".join(redactor.feed(payload[i:i + 65536])
+                      for i in range(0, len(payload), 65536)) + redactor.feed(b"", final=True)
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertNotIn(sp.SECRET, out)
+        self.assertEqual(out.count("[REDACTED]"), 8192)
+
+    def test_redaction_holds_a_secret_that_crosses_a_chunk_boundary(self):
+        redactor = obs._Redactor(["cross-boundary-secret"])
+        first = redactor.feed(b"prefix cross-boundary-")
+        second = redactor.feed(b"secret suffix")
+        final = redactor.feed(b"", final=True)
+        self.assertEqual(first + second + final, "prefix [REDACTED] suffix")
+
     def test_source_text_that_quotes_the_phrase_is_not_a_failure(self):
         parsed = reading_stream()
         self.assertFalse(parsed["unsupported_tools"])
