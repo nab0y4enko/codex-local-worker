@@ -11,9 +11,7 @@ import json
 import os
 import platform
 import random
-import re
 import shutil
-import socket
 import subprocess
 import tempfile
 import time
@@ -74,13 +72,12 @@ class LiveQualification(unittest.TestCase):
         if requested:
             return Path(requested).expanduser().resolve()
         date = _datetime.date.today().isoformat()
-        host = re.sub(r"[^A-Za-z0-9._-]+", "-", socket.gethostname()).strip("-") or "host"
-        return ROOT / "docs" / "qualification" / (date + "-" + host + ".md")
+        return ROOT / "docs" / "qualification" / (date + "-host-record.md")
 
     @classmethod
     def _write_record(cls, path):
         profile = next((item.get("profile") for item in cls.observations if item.get("profile")), None)
-        lines = ["# Task 26 live qualification — %s" % socket.gethostname(), "",
+        lines = ["# Task 26 live qualification", "",
                  "Date: %s" % _datetime.datetime.now().astimezone().isoformat(),
                  "Platform: %s %s" % (platform.platform(), platform.machine()),
                  "Launcher: `%s`" % LAUNCHER,
