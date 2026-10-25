@@ -32,6 +32,7 @@ import os
 import re
 import shutil
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -52,9 +53,12 @@ ZERO_OID = "0" * 40
 # Any git object id we accept as evidence must be a full lowercase sha1, never prose or empty.
 OID = re.compile(r"[0-9a-f]{40}")
 INDEX_NAME = "staged.index"
+TRANSACTION_NAME = "transaction.json"
+DEFAULT_IGNORED_CAP = 536870912
 # A dirty tree may only be force-removed while all of this evidence is present and verified.
 REQUIRED_EVIDENCE = ("recovery_ref", "recovery_commit", "index_commit", "bundle",
-                     "bundle_sha256", "archive", "archive_sha256", "archived_files")
+                     "bundle_sha256", "bundle_basis", "archive", "archive_sha256",
+                     "archived_files", "ignored_files")
 # A snapshot commit needs an identity, and it must not depend on whoever ran the cleanup.
 SNAPSHOT_IDENTITY = {
     "GIT_AUTHOR_NAME": "local-worker-archive",
@@ -199,7 +203,7 @@ def resolve_worktree(repo: Path, state_dir: Path, report: Dict[str, Any], *,
 # --------------------------------------------------------------------------------------
 def snapshot_commit(worktree: Path, scratch: Path, message: str, *,
                     index_commit: Optional[str] = None) -> Tuple[str, str]:
-    """Commit the whole worktree - tracked edits, untracked and ignored files - on top of HEAD.
+    """Commit tracked edits and non-ignored untracked files on top of HEAD.
 
     The real index is never touched: the snapshot lives in a private temporary index, and the
     resulting object goes to the shared object directory, so it outlives the worktree.
@@ -216,16 +220,9 @@ def snapshot_commit(worktree: Path, scratch: Path, message: str, *,
     env = dict(SNAPSHOT_IDENTITY)
     env["GIT_INDEX_FILE"] = str(index)
     lw.git(worktree, "read-tree", "HEAD", env=env)
-    lw.git(worktree, "add", "--force", "--all", "--", ".", env=env)
-    # Names come from git itself and are matched literally, so spaces and glob characters in
-    # untracked or ignored paths cannot widen the scope of the snapshot.
-    paths = [path for status, path in lw.status_entries(worktree, ignored=True)
-             if status in ("??", "!!")]
-    if paths:
-        payload = b"".join((":(literal)" + path).encode("utf-8", "surrogateescape") + b"\0"
-                           for path in paths)
-        lw.git(worktree, "add", "--force", "--pathspec-from-file=-", "--pathspec-file-nul",
-               env=env, stdin=payload)
+    # The absence of --force is deliberate: ignored build outputs stay in the verified file
+    # copy and never enter the repository's object database.
+    lw.git(worktree, "add", "--all", "--", ".", env=env)
     tree = text(lw.git(worktree, "write-tree", env=env))
     if not tree:
         raise LifecycleError("could not write the recovery tree for " + str(worktree))
@@ -285,12 +282,13 @@ def index_snapshot(worktree: Path, message: str) -> Optional[str]:
     return text(committed)
 
 
-def create_bundle(repo: Path, ref: str, destination: Path) -> Path:
+def create_bundle(repo: Path, ref: str, destination: Path, base_commit: str) -> Path:
     """Write and verify a bundle before it is published under its final name."""
     partial = destination.with_name(destination.name + ".partial")
     with contextlib.suppress(OSError):
         partial.unlink()
-    process = lw.git(repo, "bundle", "create", str(partial), ref, check=False)
+    process = lw.git(repo, "bundle", "create", str(partial), ref, "^" + base_commit,
+                     check=False)
     if process.returncode != 0:
         raise LifecycleError(f"git bundle create failed: {text(process) or process.stderr}")
     verified = lw.git(repo, "bundle", "verify", str(partial), check=False)
@@ -300,6 +298,10 @@ def create_bundle(repo: Path, ref: str, destination: Path) -> Path:
         raise LifecycleError(f"git bundle verify failed: {message.strip() or 'no detail'}")
     if not partial.is_file() or partial.stat().st_size == 0:
         raise LifecycleError("git bundle verify produced an empty bundle")
+    heads = lw.git(repo, "bundle", "list-heads", str(partial), check=False)
+    expected = f"{text(lw.git(repo, 'rev-parse', '--verify', ref + '^{commit}'))} {ref}"
+    if heads.returncode != 0 or text(heads) != expected:
+        raise LifecycleError("git bundle heads do not match the requested recovery ref")
     os.replace(str(partial), str(destination))
     return destination
 
@@ -334,22 +336,145 @@ def walk_files(root: Path) -> Dict[str, str]:
     return found
 
 
-def copy_worktree(worktree: Path, destination: Path) -> None:
-    """Full-fidelity copy including ignored and untracked data; only ``.git`` stays behind."""
+def copy_worktree(worktree: Path, destination: Path,
+                  skip_paths: Optional[Set[str]] = None) -> None:
+    """Copy worktree payload, optionally omitting known ignored paths; root ``.git`` stays out."""
+    omitted = set(skip_paths or ())
     destination.mkdir(parents=True, exist_ok=True)
+
+    def copy_directory(source: Path, target: Path, relative: str) -> None:
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.copystat(str(source), str(target), follow_symlinks=False)
+        for entry in sorted(source.iterdir(), key=lambda item: item.name):
+            rel = (relative + "/" + entry.name).lstrip("/")
+            if rel == ".git" or rel in omitted:
+                continue
+            out = target / entry.name
+            if entry.is_symlink() or entry.is_file():
+                shutil.copy2(str(entry), str(out), follow_symlinks=False)
+            elif entry.is_dir():
+                copy_directory(entry, out, rel)
+
     for entry in sorted(worktree.iterdir(), key=lambda item: item.name):
-        if entry.name == ".git":
+        if entry.name == ".git" or entry.name in omitted:
             continue
         target = destination / entry.name
         if entry.is_symlink() or entry.is_file():
             shutil.copy2(str(entry), str(target), follow_symlinks=False)
+        elif entry.is_dir():
+            copy_directory(entry, target, entry.name)
+
+
+def ignored_inventory(worktree: Path) -> Tuple[List[str], int]:
+    """List ignored untracked files and their stored byte size without following symlinks."""
+    process = lw.git(worktree, "ls-files", "--others", "--ignored", "--exclude-standard",
+                     "-z", check=False)
+    if process.returncode != 0:
+        raise LifecycleError("could not inventory ignored files: " +
+                             (text(process) or process.stderr.decode("utf-8", "replace").strip()))
+    relative_paths: Set[str] = set()
+    for raw in process.stdout.split(b"\0"):
+        if not raw:
+            continue
+        relative = os.fsdecode(raw).replace(os.sep, "/").rstrip("/")
+        if not relative or relative.startswith("/") or ".." in relative.split("/"):
+            raise Refusal("git returned an unsafe ignored path")
+        source = worktree / relative
+        if source.is_symlink() or source.is_file():
+            relative_paths.add(relative)
+        elif source.is_dir():
+            for base, directories, files in os.walk(str(source), followlinks=False):
+                kept = []
+                for name in directories:
+                    item = Path(base) / name
+                    if item.is_symlink():
+                        relative_paths.add(os.path.relpath(str(item), str(worktree)).replace(os.sep, "/"))
+                    else:
+                        kept.append(name)
+                directories[:] = kept
+                for name in files:
+                    item = Path(base) / name
+                    relative_paths.add(os.path.relpath(str(item), str(worktree)).replace(os.sep, "/"))
         else:
-            shutil.copytree(str(entry), str(target), symlinks=True)
+            raise LifecycleError("ignored path disappeared during inventory: " + relative)
+    total = 0
+    for relative in relative_paths:
+        try:
+            total += (worktree / relative).lstat().st_size
+        except OSError as error:
+            raise LifecycleError("could not size ignored file " + relative) from error
+    return sorted(relative_paths), total
 
 
-def verify_archive(worktree: Path, destination: Path) -> Tuple[str, int]:
+def ref_exists(repo: Path, ref: str) -> bool:
+    """Use show-ref's return code: its quiet success intentionally has no stdout."""
+    process = lw.git(repo, "show-ref", "--verify", "--quiet", ref, check=False)
+    if process.returncode == 0:
+        return True
+    if process.returncode == 1:
+        return False
+    raise LifecycleError("could not check recovery ref " + ref + ": " +
+                         (text(process) or process.stderr.decode("utf-8", "replace").strip()))
+
+
+def read_transaction_marker(path: Path) -> Dict[str, Any]:
+    if path.is_symlink() or not path.is_file():
+        raise Refusal("partial archive has no verifiable transaction ownership marker")
+    try:
+        marker = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise Refusal("partial archive transaction marker is unreadable") from error
+    if not isinstance(marker, dict):
+        raise Refusal("partial archive transaction marker is not an object")
+    return marker
+
+
+def _write_transaction_marker(path: Path, marker: Dict[str, Any]) -> None:
+    write_receipt(path, marker)
+
+
+def _valid_owned_partial(archive_dir: Path, repo: Path, state_dir: Path, job_id: str,
+                         declared: str, worktree: Path, ref: str) -> Dict[str, Any]:
+    marker = read_transaction_marker(archive_dir / TRANSACTION_NAME)
+    base = str(marker.get("base_commit") or "")
+    if (marker.get("schema") != "local-worker-archive-transaction/1" or
+            not marker.get("transaction_id") or marker.get("repo") != canonical(repo) or
+            marker.get("state_dir") != canonical(state_dir) or marker.get("job_id") != job_id or
+            marker.get("source_worktree") != declared or marker.get("recovery_ref") != ref or
+            not OID.fullmatch(base) or marker.get("recovery_commit") is not None and
+            not OID.fullmatch(str(marker.get("recovery_commit")))):
+        raise Refusal("partial archive marker does not match this repo, job, worktree, base, and ref")
+    if lw.rev_parse(worktree, "HEAD") != base:
+        raise Refusal("partial archive worktree base changed; refusing to discard its evidence")
+    recorded_commit = marker.get("recovery_commit")
+    if ref_exists(repo, ref):
+        current = text(lw.git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}",
+                              check=False))
+        if not recorded_commit or current != recorded_commit:
+            raise Refusal("recovery ref exists but does not match the partial archive ownership marker")
+    elif recorded_commit:
+        # The marker binds the expected object and ref. If the ref is already absent, resume
+        # has no ref to delete; a same-name ref that appears later is still caught above.
+        resolved = text(lw.git(repo, "rev-parse", "--verify", "--quiet",
+                               f"{recorded_commit}^{{commit}}", check=False))
+        if resolved and resolved != recorded_commit:
+            raise Refusal("partial archive recovery commit does not match its ownership marker")
+    allowed = {TRANSACTION_NAME, TRANSACTION_NAME + ".partial", "tmp", "recovery.bundle",
+               "recovery.bundle.partial", FILES_NAME, REPORT_NAME}
+    for child in archive_dir.iterdir():
+        if child.name not in allowed:
+            raise Refusal("partial archive contains an unexpected entry: " + child.name)
+        if child.is_symlink():
+            raise Refusal("partial archive contains a symlink: " + child.name)
+    return marker
+
+
+def verify_archive(worktree: Path, destination: Path,
+                   skip_paths: Optional[Set[str]] = None) -> Tuple[str, int]:
     """Every archived byte must match the worktree it came from; returns (digest, count)."""
-    source = walk_files(worktree)
+    omitted = set(skip_paths or ())
+    source = {relative: kind for relative, kind in walk_files(worktree).items()
+              if relative not in omitted}
     archived = walk_files(destination)
     if not source:
         raise LifecycleError("refusing to archive an empty worktree")
@@ -392,11 +517,31 @@ def verify_evidence(repo: Path, state_dir: Path, job_id: str,
     """Re-check the recovery evidence a prior run claimed. ``None`` means it still holds."""
     ref = str(receipt.get("recovery_ref") or "")
     commit = str(receipt.get("recovery_commit") or "")
-    if not ref.startswith(REF_PREFIX + "/") or not re.fullmatch(r"[0-9a-f]{40}", commit):
+    legacy_receipt = "bundle_basis" not in receipt and "ignored_files" not in receipt
+    recorded_repo = receipt.get("repo")
+    if (not JOB_ID_PATTERN.fullmatch(job_id) or ref != f"{REF_PREFIX}/{job_id}" or
+            receipt.get("job_id") != job_id or not isinstance(recorded_repo, str) or
+            canonical(recorded_repo) != canonical(repo) or
+            not re.fullmatch(r"[0-9a-f]{40}", commit)):
         return "receipt names no valid recovery ref/commit"
+    try:
+        original_report = read_report(state_dir, job_id)
+        _source_path, declared = resolve_worktree(repo, state_dir, original_report,
+                                                  must_exist=False)
+    except LifecycleError as error:
+        return "original job report is not verifiable: " + str(error)
+    if receipt.get("source_worktree") != declared:
+        return "receipt source worktree does not match the original job report"
     if text(lw.git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}",
                    check=False)) != commit:
         return f"recovery ref {ref} no longer resolves to {commit}"
+    basis = str(receipt.get("bundle_basis") or "")
+    if not legacy_receipt:
+        if not OID.fullmatch(basis) or receipt.get("recovery_parent") != basis:
+            return "receipt has no verified bundle basis matching the snapshot's first parent"
+        if text(lw.git(repo, "rev-parse", "--verify", "--quiet", f"{basis}^{{commit}}",
+                       check=False)) != basis:
+            return f"bundle basis {basis} is no longer available"
     index_commit = str(receipt.get("index_commit") or "")
     if index_commit:
         if not re.fullmatch(r"[0-9a-f]{40}", index_commit):
@@ -407,14 +552,22 @@ def verify_evidence(repo: Path, state_dir: Path, job_id: str,
     bundle = Path(str(receipt.get("bundle") or ""))
     if canonical(bundle) != canonical(state_dir / "archives" / job_id / BUNDLE_NAME):
         return "receipt names a bundle outside this job's archive directory"
-    if not bundle.is_file():
+    if bundle.is_symlink() or not bundle.is_file():
         return f"recovery bundle {bundle} is missing"
     if hash_file(bundle) != str(receipt.get("bundle_sha256") or ""):
         return f"recovery bundle {bundle} hash no longer matches the receipt"
+    verified = lw.git(repo, "bundle", "verify", str(bundle), check=False)
+    if verified.returncode != 0:
+        return "recovery bundle no longer verifies: " + (text(verified) or
+            verified.stderr.decode("utf-8", "replace").strip())
+    heads = lw.git(repo, "bundle", "list-heads", str(bundle), check=False)
+    expected_head = f"{commit} {ref}"
+    if heads.returncode != 0 or text(heads) != expected_head:
+        return "recovery bundle head does not match its receipt ref and commit"
     archived = Path(str(receipt.get("archive") or ""))
     if canonical(archived) != canonical(state_dir / "archives" / job_id / FILES_NAME):
         return "receipt names an archive directory outside this job's archive directory"
-    if not archived.is_dir():
+    if archived.is_symlink() or not archived.is_dir():
         return f"archive directory {archived} is missing"
     try:
         digest, count = recompute_archive(archived)
@@ -424,6 +577,42 @@ def verify_evidence(repo: Path, state_dir: Path, job_id: str,
         return f"archive {archived} contents no longer match the receipt"
     if count != int(receipt.get("archived_files") or -1):
         return f"archive {archived} file count no longer matches the receipt"
+    if not legacy_receipt:
+        ignored = receipt.get("ignored_files")
+        if not isinstance(ignored, dict):
+            return "receipt has no ignored-files inventory"
+        paths = ignored.get("paths")
+        count_expected = ignored.get("count")
+        bytes_expected = ignored.get("bytes")
+        stored = ignored.get("stored")
+        if (not isinstance(paths, list) or type(count_expected) is not int or count_expected < 0 or
+                type(bytes_expected) is not int or bytes_expected < 0 or count_expected != len(paths) or
+                stored not in ("copy", "skipped") or
+                not all(isinstance(path, str) and path and not path.startswith("/") and
+                        ".." not in path.split("/") for path in paths) or len(paths) != len(set(paths))):
+            return "receipt ignored-files inventory is malformed"
+        ignored_bytes = 0
+        for relative in paths:
+            copied = archived / relative
+            if stored == "skipped":
+                if copied.exists() or copied.is_symlink():
+                    return f"skipped ignored file {relative} is unexpectedly present in the archive"
+            else:
+                if not copied.exists() and not copied.is_symlink():
+                    return f"copied ignored file {relative} is missing from the archive"
+                try:
+                    ignored_bytes += copied.lstat().st_size
+                except OSError:
+                    return f"copied ignored file {relative} cannot be inspected"
+        if stored == "copy" and ignored_bytes != bytes_expected:
+            return "copied ignored-files byte count no longer matches the receipt"
+    original_report_path = state_dir / "reports" / job_id / REPORT_NAME
+    archived_report = Path(str(receipt.get("archived_report") or ""))
+    if (canonical(original_report_path) != canonical(Path(str(receipt.get("original_report") or ""))) or
+            canonical(archived_report) != canonical(state_dir / "archives" / job_id / REPORT_NAME) or
+            archived_report.is_symlink() or not archived_report.is_file() or
+            hash_file(original_report_path) != hash_file(archived_report)):
+        return "archived copy of the original report is missing or changed"
     return None
 
 
@@ -478,12 +667,17 @@ def archive_lock(state_dir: Path):
 # --------------------------------------------------------------------------------------
 # The operation
 # --------------------------------------------------------------------------------------
-def archive(repo_arg: Any, state_dir_arg: Any, job_id: str) -> Dict[str, Any]:
-    """Archive every byte of one finished worktree, then remove that worktree."""
+def archive(repo_arg: Any, state_dir_arg: Any, job_id: str, *, resume: bool = False,
+            skip_ignored: bool = False, ignored_cap: int = DEFAULT_IGNORED_CAP) -> Dict[str, Any]:
+    """Archive one finished worktree, then remove it only after evidence verifies."""
     repo = Path(os.path.abspath(str(repo_arg)))
     state_dir = Path(os.path.abspath(str(state_dir_arg)))
     if not repo.is_dir():
         raise Refusal(f"repository {repo} does not exist")
+    if not isinstance(ignored_cap, int) or isinstance(ignored_cap, bool) or ignored_cap < 0:
+        raise Refusal("ignored file size cap must be a non-negative integer")
+    if not JOB_ID_PATTERN.fullmatch(job_id) or job_id in (".", ".."):
+        raise Refusal(f"job id {job_id!r} is not a single safe path component")
     if canonical(repo) == canonical(state_dir) or canonical(repo).startswith(
             canonical(state_dir) + os.sep):
         raise Refusal("the repository must live outside the state directory")
@@ -493,7 +687,12 @@ def archive(repo_arg: Any, state_dir_arg: Any, job_id: str) -> Dict[str, Any]:
         archive_dir = state_dir / "archives" / job_id
         receipt_path = archive_dir / RECEIPT_NAME
         original_report = state_dir / "reports" / job_id / REPORT_NAME
+        ref = f"{REF_PREFIX}/{job_id}"
 
+        if archive_dir.is_symlink():
+            raise Refusal(f"{archive_dir} is a symlink; archive directories are never followed")
+        if receipt_path.is_symlink():
+            raise Refusal(f"{receipt_path} is a symlink; receipts are never followed")
         if receipt_path.is_file():
             try:
                 receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -506,13 +705,17 @@ def archive(repo_arg: Any, state_dir_arg: Any, job_id: str) -> Dict[str, Any]:
                 raise Refusal(f"existing receipt for {job_id} is unverifiable: {problem}; "
                               "archives are never overwritten")
             if str(receipt.get("status") or "") != ARCHIVED_STATUS or not receipt.get("removed"):
+                if (str(receipt.get("status") or "") == PREPARED_STATUS and resume and
+                        not worktree.exists()):
+                    receipt["status"] = ARCHIVED_STATUS
+                    receipt["removed"] = True
+                    receipt["archived_at"] = utc_now()
+                    write_receipt(receipt_path, receipt)
+                    return receipt
                 raise Refusal(
                     f"existing receipt for {job_id} is {str(receipt.get('status') or 'unknown')!r} "
-                    "with removal unrecorded; its evidence verifies at "
-                    f"{archive_dir} and nothing here is repeated or deleted. Confirm "
-                    f"{worktree} is absent (otherwise run 'git -C {repo} worktree remove "
-                    f"{worktree}' once that evidence is reviewed), then finish the receipt by "
-                    "setting its status to \"archived\" and \"removed\" to true")
+                    "with removal unrecorded; use --resume only after its worktree is gone and "
+                    "its evidence verifies")
             if worktree.exists():
                 raise Refusal(f"{worktree} still exists although {receipt_path} records it "
                               "as removed; refusing to repeat a completed archive")
@@ -521,24 +724,62 @@ def archive(repo_arg: Any, state_dir_arg: Any, job_id: str) -> Dict[str, Any]:
             replayed["idempotent"] = True
             return replayed
 
-        if archive_dir.exists() and any(archive_dir.iterdir()):
-            raise Refusal(f"{archive_dir} already holds entries without a receipt; nothing is "
-                          "overwritten or removed")
+        if archive_dir.is_symlink():
+            raise Refusal(f"{archive_dir} is a symlink; archive directories are never followed")
+        if archive_dir.exists():
+            if not resume:
+                raise Refusal(f"{archive_dir} already exists without a receipt; use --resume "
+                              "only for a verified partial transaction")
+            worktree, _ = resolve_worktree(repo, state_dir, report)
+            marker = _valid_owned_partial(archive_dir, repo, state_dir, job_id, declared,
+                                          worktree, ref)
+            recovery_commit = marker.get("recovery_commit")
+            if recovery_commit and ref_exists(repo, ref):
+                deleted = lw.git(repo, "update-ref", "-d", ref, recovery_commit, check=False)
+                if deleted.returncode != 0:
+                    raise Refusal("owned partial recovery ref changed during resume; preserving "
+                                  "all evidence")
+            shutil.rmtree(str(archive_dir))
+        elif resume and ref_exists(repo, ref):
+            raise Refusal(f"recovery ref {ref} exists without a transaction marker; it is not "
+                          "owned by this archive and will not be removed")
+
+        # A dead-ref collision is checked before the archive directory is created. Quiet
+        # show-ref emits no output on success, so its exit code is the only reliable test.
+        if ref_exists(repo, ref):
+            raise Refusal(f"recovery ref {ref} already exists; archives are never overwritten")
         worktree, _ = resolve_worktree(repo, state_dir, report)
+        ignored_paths, ignored_bytes = ignored_inventory(worktree)
+        if ignored_bytes > ignored_cap and not skip_ignored:
+            raise Refusal("ignored files total %d bytes, above the %d byte cap; use "
+                          "--skip-ignored to archive without them" % (ignored_bytes, ignored_cap))
+        base_commit = lw.rev_parse(worktree, "HEAD")
+        if not base_commit or not OID.fullmatch(base_commit):
+            raise Refusal(f"{worktree} has no resolvable HEAD base commit")
 
         try:
             archive_dir.mkdir(parents=True, exist_ok=False)
         except FileExistsError as error:
             raise Refusal(f"{archive_dir} already exists") from error
+        marker = {
+            "schema": "local-worker-archive-transaction/1",
+            "transaction_id": uuid.uuid4().hex,
+            "repo": canonical(repo), "state_dir": canonical(state_dir), "job_id": job_id,
+            "source_worktree": declared, "base_commit": base_commit,
+            "recovery_ref": ref, "recovery_commit": None,
+            "created_at": utc_now(),
+        }
+        _write_transaction_marker(archive_dir / TRANSACTION_NAME, marker)
         try:
-            ref = f"{REF_PREFIX}/{job_id}"
-            if text(lw.git(repo, "show-ref", "--verify", "--quiet", ref, check=False)):
-                raise Refusal(f"recovery ref {ref} already exists; archives are never "
-                              "overwritten")
             staged = index_snapshot(worktree, f"local-worker staged index {job_id}")
             commit, parent = snapshot_commit(worktree, archive_dir / "tmp",
                                              f"local-worker archive {job_id}",
                                              index_commit=staged)
+            if parent != base_commit:
+                raise LifecycleError("worktree base changed while preparing its recovery snapshot")
+            marker["recovery_commit"] = commit
+            marker["index_commit"] = staged or ""
+            _write_transaction_marker(archive_dir / TRANSACTION_NAME, marker)
             # ``<old-value> = ZERO_OID`` makes this create-only: a ref that appeared in the
             # meantime makes git refuse instead of moving someone else's evidence.
             published = lw.git(repo, "update-ref", ref, commit, ZERO_OID, check=False)
@@ -547,11 +788,12 @@ def archive(repo_arg: Any, state_dir_arg: Any, job_id: str) -> Dict[str, Any]:
                           or published.stderr.decode("utf-8", "replace").strip())
                 raise Refusal(f"recovery ref {ref} already exists ({detail}); an existing ref "
                               "is never moved and archives are never overwritten")
-            bundle = create_bundle(repo, ref, archive_dir / BUNDLE_NAME)
+            bundle = create_bundle(repo, ref, archive_dir / BUNDLE_NAME, base_commit)
             bundle_hash = hash_file(bundle)
             files_dir = archive_dir / FILES_NAME
-            copy_worktree(worktree, files_dir)
-            archive_hash, count = verify_archive(worktree, files_dir)
+            excluded = set(ignored_paths) if skip_ignored else set()
+            copy_worktree(worktree, files_dir, excluded)
+            archive_hash, count = verify_archive(worktree, files_dir, excluded)
             report_copy = archive_dir / REPORT_NAME
             shutil.copy2(str(original_report), str(report_copy))
 
@@ -562,7 +804,7 @@ def archive(repo_arg: Any, state_dir_arg: Any, job_id: str) -> Dict[str, Any]:
                 "schema": "local-worker-archive/1",
                 "status": PREPARED_STATUS,
                 "job_id": job_id,
-                "repo": str(repo),
+                "repo": canonical(repo),
                 "git_common_dir": common_dir(repo),
                 "source_worktree": declared,
                 "report_status": report.get("status"),
@@ -570,6 +812,10 @@ def archive(repo_arg: Any, state_dir_arg: Any, job_id: str) -> Dict[str, Any]:
                 "recovery_commit": commit,
                 "recovery_parent": parent,
                 "index_commit": staged or "",
+                "bundle_basis": base_commit,
+                "ignored_files": {"count": len(ignored_paths), "bytes": ignored_bytes,
+                                  "stored": "skipped" if skip_ignored else "copy",
+                                  "paths": ignored_paths},
                 "bundle": str(bundle),
                 "bundle_sha256": bundle_hash,
                 "archive": str(files_dir),
@@ -584,6 +830,11 @@ def archive(repo_arg: Any, state_dir_arg: Any, job_id: str) -> Dict[str, Any]:
                 "idempotent": False,
             }
             write_receipt(receipt_path, receipt)
+
+            problem = verify_evidence(repo, state_dir, job_id, receipt)
+            if problem:
+                raise LifecycleError("recovery evidence failed verification before removal: " +
+                                     problem)
 
             # Everything above verified, so removal is now reversible from the ref, the
             # bundle and the copy. ``git worktree remove`` refuses a dirty tree by design:
@@ -609,6 +860,9 @@ def archive(repo_arg: Any, state_dir_arg: Any, job_id: str) -> Dict[str, Any]:
             receipt["forced_removal"] = forced
             receipt["archived_at"] = utc_now()
             write_receipt(receipt_path, receipt)
+            problem = verify_evidence(repo, state_dir, job_id, receipt)
+            if problem:
+                raise LifecycleError("recovery evidence changed after worktree removal: " + problem)
             with contextlib.suppress(OSError):
                 shutil.rmtree(str(archive_dir / "tmp"))
             return receipt
@@ -618,36 +872,130 @@ def archive(repo_arg: Any, state_dir_arg: Any, job_id: str) -> Dict[str, Any]:
                     archive_dir.rmdir()
 
 
+def prune(repo_arg: Any, state_dir_arg: Any, older_than_days: int,
+          dry_run: bool = False) -> List[Dict[str, Any]]:
+    """Remove only old, fully verified archived evidence after validating every candidate."""
+    repo = Path(os.path.abspath(str(repo_arg)))
+    state_dir = Path(os.path.abspath(str(state_dir_arg)))
+    if not repo.is_dir():
+        raise Refusal(f"repository {repo} does not exist")
+    if not isinstance(older_than_days, int) or isinstance(older_than_days, bool) or older_than_days < 0:
+        raise Refusal("older-than days must be a non-negative integer")
+    if canonical(repo) == canonical(state_dir) or canonical(repo).startswith(
+            canonical(state_dir) + os.sep):
+        raise Refusal("the repository must live outside the state directory")
+    archive_root = state_dir / "archives"
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=older_than_days)
+    with archive_lock(state_dir):
+        if archive_root.is_symlink():
+            raise Refusal(f"{archive_root} is a symlink; archive directories are never followed")
+        if not archive_root.is_dir():
+            return []
+        candidates: List[Tuple[Path, str, Dict[str, Any], str]] = []
+        for archive_dir in sorted(archive_root.iterdir(), key=lambda item: item.name):
+            if archive_dir.is_symlink() or not archive_dir.is_dir():
+                continue
+            job_id = archive_dir.name
+            if not JOB_ID_PATTERN.fullmatch(job_id):
+                continue
+            receipt_path = archive_dir / RECEIPT_NAME
+            if receipt_path.is_symlink() or not receipt_path.is_file():
+                continue
+            try:
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                raise Refusal(f"cannot read prune candidate receipt {receipt_path}") from error
+            if not isinstance(receipt, dict) or receipt.get("status") != ARCHIVED_STATUS or not receipt.get("removed"):
+                continue
+            raw_time = receipt.get("archived_at")
+            try:
+                archived_at = datetime.datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
+                if archived_at.tzinfo is None:
+                    raise ValueError("timestamp has no timezone")
+            except (ValueError, TypeError):
+                raise Refusal(f"archived receipt {receipt_path} has no valid archived_at timestamp")
+            if archived_at > cutoff:
+                continue
+            problem = verify_evidence(repo, state_dir, job_id, receipt)
+            if problem:
+                raise Refusal(f"cannot prune unverifiable archive {job_id}: {problem}")
+            source = receipt.get("source_worktree")
+            if not isinstance(source, str):
+                raise Refusal(f"archived receipt {job_id} has no source worktree")
+            source_path = Path(source)
+            if source_path.exists() or source_path.is_symlink() or canonical(source_path) in registered_worktrees(repo):
+                raise Refusal(f"cannot prune {job_id}: source worktree is still present or registered")
+            candidates.append((archive_dir, job_id, receipt, str(receipt["recovery_ref"])))
+
+        # Validate all refs one more time before deleting the first item. The caller has
+        # explicitly requested pruning; this preflight prevents a partially pruned batch when
+        # an old receipt/ref has drifted.
+        for _archive_dir, job_id, receipt, ref in candidates:
+            current = text(lw.git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}",
+                                  check=False))
+            if current != receipt.get("recovery_commit"):
+                raise Refusal(f"recovery ref for prune candidate {job_id} changed during preflight")
+
+        result = []
+        for archive_dir, job_id, receipt, ref in candidates:
+            item = {"job_id": job_id, "archived_at": receipt.get("archived_at"),
+                    "action": "would_prune" if dry_run else "pruned"}
+            result.append(item)
+            if dry_run:
+                continue
+            removed_ref = lw.git(repo, "update-ref", "-d", ref, str(receipt["recovery_commit"]),
+                                 check=False)
+            if removed_ref.returncode != 0:
+                raise Refusal(f"could not safely delete recovery ref {ref}; preserving archive "
+                              "directory")
+            shutil.rmtree(str(archive_dir))
+        return result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="worktree_lifecycle",
-        description="Archive one finished local-worker worktree (committed, dirty, untracked "
-                    "and ignored work included), verify the evidence, then remove it.")
+        description="Archive finished local-worker worktrees and prune old verified evidence.")
     sub = parser.add_subparsers(dest="command")
     command = sub.add_parser("archive", help="archive and remove one finished worktree")
     command.add_argument("--repo", required=True, help="repository that owns the worktree")
     command.add_argument("--state-dir", required=True,
                          help="launcher state dir (reports/worktrees/archives/worker.lock)")
     command.add_argument("--job-id", required=True, help="finished job id under <state-dir>/reports")
+    command.add_argument("--resume", action="store_true",
+                         help="resume only a transaction whose ownership marker verifies")
+    command.add_argument("--skip-ignored", action="store_true",
+                         help="omit ignored files from the file copy")
+    command.add_argument("--ignored-cap", type=int, default=DEFAULT_IGNORED_CAP,
+                         metavar="BYTES", help="maximum ignored-file bytes copied (default 512 MiB)")
+    pruning = sub.add_parser("prune", help="remove old verified archive evidence explicitly")
+    pruning.add_argument("--repo", required=True, help="repository that owns recovery refs")
+    pruning.add_argument("--state-dir", required=True, help="launcher state directory")
+    pruning.add_argument("--older-than", type=int, required=True, metavar="DAYS")
+    pruning.add_argument("--dry-run", action="store_true", help="list eligible archives without deleting")
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.command != "archive":
+    if args.command not in ("archive", "prune"):
         parser.print_help(sys.stderr)
         return EXIT_REFUSED
     try:
-        receipt = archive(args.repo, args.state_dir, args.job_id)
+        if args.command == "archive":
+            receipt = archive(args.repo, args.state_dir, args.job_id, resume=args.resume,
+                              skip_ignored=args.skip_ignored, ignored_cap=args.ignored_cap)
+        else:
+            receipt = prune(args.repo, args.state_dir, args.older_than, dry_run=args.dry_run)
     except LifecycleError as error:
         kind = "blocked" if isinstance(error, Blocked) else ("refused" if isinstance(
             error, Refusal) else "failed")
-        print(json.dumps({"status": kind, "job_id": args.job_id,
+        print(json.dumps({"status": kind, "job_id": getattr(args, "job_id", None),
                           "reason": str(error)}, sort_keys=False), file=sys.stderr)
         return error.exit_code
     except (lw.LauncherError, OSError) as error:
-        print(json.dumps({"status": "failed", "job_id": args.job_id, "reason": str(error)},
+        print(json.dumps({"status": "failed", "job_id": getattr(args, "job_id", None), "reason": str(error)},
                          sort_keys=False), file=sys.stderr)
         return EXIT_FAILED
     print(json.dumps(receipt, indent=2, sort_keys=False))

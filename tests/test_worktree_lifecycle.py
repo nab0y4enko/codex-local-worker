@@ -68,8 +68,11 @@ class Lifecycle(unittest.TestCase):
         self.assertIn("return a + b", sp.git(self.repo, "show", f"{ref}:add.py").stdout
                       .decode("utf-8", "replace"))
         listed = sp.git(self.repo, "ls-tree", "-r", "--name-only", ref).stdout.decode()
-        for preserved in ("untracked-notes.md", "build.pyc", "__pycache__/cached.pyc"):
-            self.assertIn(preserved, listed)
+        self.assertIn("untracked-notes.md", listed)
+        for ignored in ("build.pyc", "__pycache__/cached.pyc"):
+            self.assertNotIn(ignored, listed)
+        for preserved in ("build.pyc", "__pycache__/cached.pyc"):
+            self.assertTrue((Path(receipt["archive"]) / preserved).is_file())
         verify = lw.git(self.repo, "bundle", "verify", receipt["bundle"], check=False,
                           env=sp.GIT_ID)
         self.assertEqual(verify.returncode, 0, verify.stderr)
@@ -100,6 +103,97 @@ class Lifecycle(unittest.TestCase):
         self.assertTrue(worktree.exists())
         self.assertTrue((worktree / "build.pyc").exists())
         self.assertFalse((self.state / "archives" / JOB / "receipt.json").exists())
+
+    def test_existing_ref_is_detected_before_any_work(self):
+        self.finish()
+        sp.git(self.repo, "update-ref", f"refs/local-worker/archive/{JOB}", "HEAD")
+        with self.assertRaises(wl.Refusal):
+            wl.archive(self.repo, self.state, JOB)
+        self.assertFalse((self.state / "archives" / JOB).exists())
+
+    def test_resume_recovers_owned_partial_archive_after_bundle_failure(self):
+        worktree = self.finish()
+        self.dirty(worktree)
+        with mock.patch.object(wl, "create_bundle", side_effect=wl.LifecycleError("disk full")):
+            with self.assertRaises(wl.LifecycleError):
+                wl.archive(self.repo, self.state, JOB)
+        receipt = wl.archive(self.repo, self.state, JOB, resume=True)
+        self.assertEqual(receipt["status"], "archived")
+        self.assertFalse(worktree.exists())
+
+    def test_resume_never_deletes_an_unowned_preexisting_ref(self):
+        worktree = self.finish()
+        ref = f"refs/local-worker/archive/{JOB}"
+        archive_dir = self.state / "archives" / JOB
+        archive_dir.mkdir(parents=True)
+        sentinel = archive_dir / "unrelated-evidence.txt"
+        sentinel.write_text("preserve this", encoding="utf-8")
+        sp.git(self.repo, "update-ref", ref, "HEAD")
+        with self.assertRaises(wl.Refusal):
+            wl.archive(self.repo, self.state, JOB, resume=True)
+        self.assertEqual(lw.rev_parse(self.repo, ref), lw.rev_parse(self.repo, "HEAD"))
+        self.assertTrue(worktree.exists())
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve this")
+
+    def test_resume_can_rebuild_when_its_marked_partial_ref_is_already_absent(self):
+        job = "20261024-120001-resume-absent-ref-abc123"
+        worktree = self.finish(job=job)
+        self.dirty(worktree)
+        with mock.patch.object(wl, "create_bundle", side_effect=wl.LifecycleError("disk full")):
+            with self.assertRaises(wl.LifecycleError):
+                wl.archive(self.repo, self.state, job)
+        marker = json.loads((self.state / "archives" / job / wl.TRANSACTION_NAME)
+                            .read_text(encoding="utf-8"))
+        self.assertTrue(marker["recovery_commit"])
+        deleted = lw.git(self.repo, "update-ref", "-d", marker["recovery_ref"],
+                         marker["recovery_commit"], check=False)
+        self.assertEqual(deleted.returncode, 0)
+        receipt = wl.archive(self.repo, self.state, job, resume=True)
+        self.assertEqual(receipt["status"], wl.ARCHIVED_STATUS)
+        self.assertFalse(worktree.exists())
+
+    def test_ignored_files_stay_out_of_git_objects_and_bundle_has_a_basis(self):
+        worktree = self.finish()
+        base = lw.rev_parse(worktree, "HEAD")
+        (worktree / ".gitignore").write_text("build/\n", encoding="utf-8")
+        (worktree / "build").mkdir()
+        (worktree / "build" / "big.bin").write_bytes(b"\0" * 4096)
+        receipt = wl.archive(self.repo, self.state, JOB)
+        tree = sp.git(self.repo, "ls-tree", "-r", "--name-only",
+                      receipt["recovery_commit"]).stdout.decode()
+        self.assertNotIn("build/big.bin", tree)
+        self.assertTrue((Path(receipt["archive"]) / "build" / "big.bin").is_file())
+        self.assertEqual(receipt["bundle_basis"], base)
+        self.assertEqual(receipt["ignored_files"]["stored"], "copy")
+
+    def test_ignored_over_cap_refuses_without_mutation_unless_skipped(self):
+        worktree = self.finish()
+        (worktree / ".gitignore").write_text("build/\n", encoding="utf-8")
+        (worktree / "build").mkdir()
+        (worktree / "build" / "big.bin").write_bytes(b"\0" * 4096)
+        with self.assertRaises(wl.Refusal):
+            wl.archive(self.repo, self.state, JOB, ignored_cap=1024)
+        self.assertTrue(worktree.exists())
+        self.assertFalse((self.state / "archives" / JOB).exists())
+        receipt = wl.archive(self.repo, self.state, JOB, ignored_cap=1024, skip_ignored=True)
+        self.assertEqual(receipt["ignored_files"]["stored"], "skipped")
+        self.assertFalse((Path(receipt["archive"]) / "build" / "big.bin").exists())
+
+    def test_prune_removes_only_old_archived_receipts_and_supports_dry_run(self):
+        worktree = self.finish()
+        archived = wl.archive(self.repo, self.state, JOB)
+        receipt_path = Path(self.state / "archives" / JOB / "receipt.json")
+        receipt = json.loads(receipt_path.read_text("utf-8"))
+        receipt["archived_at"] = "2000-01-01T00:00:00Z"
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        dry = wl.prune(self.repo, self.state, 1, dry_run=True)
+        self.assertEqual(dry[0]["job_id"], JOB)
+        self.assertTrue((self.state / "archives" / JOB).exists())
+        pruned = wl.prune(self.repo, self.state, 1, dry_run=False)
+        self.assertEqual(pruned[0]["action"], "pruned")
+        self.assertFalse((self.state / "archives" / JOB).exists())
+        self.assertEqual(lw.git(self.repo, "show-ref", "--verify", "--quiet",
+                                archived["recovery_ref"], check=False).returncode, 1)
 
     def test_staged_only_content_is_recoverable(self):
         """HEAD has A, the index has B, the worktree was reset back to A: B must survive too."""
@@ -152,6 +246,11 @@ class Lifecycle(unittest.TestCase):
         self.assertIn("removal unrecorded", replay.stderr)
         self.assertEqual(json.loads(receipt_path.read_text(encoding="utf-8"))["status"],
                          wl.PREPARED_STATUS)
+        resumed = wl.archive(self.repo, self.state, JOB, resume=True)
+        self.assertEqual(resumed["status"], wl.ARCHIVED_STATUS)
+        self.assertTrue(resumed["removed"])
+        self.assertEqual(json.loads(receipt_path.read_text(encoding="utf-8"))["status"],
+                         wl.ARCHIVED_STATUS)
 
     def test_completed_receipt_replays_and_damaged_evidence_is_refused(self):
         worktree = self.finish()
@@ -174,6 +273,17 @@ class Lifecycle(unittest.TestCase):
         self.assertIn("hash no longer matches", third.stderr)
         self.assertEqual(bundle.read_bytes(), before + b"\0damaged\0")
         self.assertFalse(worktree.exists())
+
+    def test_legacy_receipt_without_new_fields_remains_readable(self):
+        self.finish()
+        receipt = json.loads(self.run_archive().stdout)
+        receipt.pop("bundle_basis")
+        receipt.pop("ignored_files")
+        receipt_path = self.state / "archives" / JOB / wl.RECEIPT_NAME
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        self.assertIsNone(wl.verify_evidence(self.repo, self.state, JOB, receipt))
+        replay = self.run_archive()
+        self.assertEqual(replay.returncode, 0, replay.stderr)
 
     def test_primary_checkout_and_active_lock_are_refused(self):
         primary = self.finish(worktree=self.repo)
@@ -282,7 +392,7 @@ class Lifecycle(unittest.TestCase):
         entries = lw.git(worktree, "ls-files", "--stage", "--abbrev=40", env=sp.GIT_ID).stdout
         return self.index_path(worktree).read_bytes(), entries
 
-    def assert_preserved(self, worktree, job, index_state):
+    def assert_preserved(self, worktree, job, index_state, *, marker=True):
         """Nothing was removed, no evidence was published, and the index bytes are untouched."""
         self.assertTrue(worktree.exists())
         self.assertTrue((worktree / "build.pyc").is_file())
@@ -291,9 +401,17 @@ class Lifecycle(unittest.TestCase):
         self.assertIn(wl.canonical(worktree), wl.registered_worktrees(self.repo))
         archive_dir = self.state / "archives" / job
         self.assertFalse((archive_dir / "receipt.json").exists())
-        self.assertFalse(archive_dir.exists() and any(archive_dir.iterdir()))
-        self.assertEqual(wl.text(lw.git(self.repo, "show-ref", "--verify", "--quiet",
-                                        wl.REF_PREFIX + "/" + job, check=False)), "")
+        marker_path = archive_dir / wl.TRANSACTION_NAME
+        if marker:
+            self.assertTrue(marker_path.is_file())
+            marker_data = json.loads(marker_path.read_text(encoding="utf-8"))
+            self.assertEqual(marker_data["job_id"], job)
+            self.assertEqual(marker_data["source_worktree"], str(worktree))
+            self.assertEqual(marker_data["base_commit"], lw.rev_parse(worktree, "HEAD"))
+            self.assertIsNone(marker_data["recovery_commit"])
+        else:
+            self.assertFalse(archive_dir.exists())
+        self.assertFalse(wl.ref_exists(self.repo, wl.REF_PREFIX + "/" + job))
 
     def unmerge(self, worktree):
         """Leave unmerged stage entries in the worker's real index, as a conflicted merge does."""
@@ -375,7 +493,7 @@ class Lifecycle(unittest.TestCase):
                         wl.archive(self.repo, self.state, job)
                 self.assertIsInstance(caught.exception, expected)
                 self.assertIn(needle, str(caught.exception))
-                self.assert_preserved(worktree, job, before)
+                self.assert_preserved(worktree, job, before, marker=name != "head")
 
 
 class DirectoryLinkInventory(unittest.TestCase):
