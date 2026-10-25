@@ -38,7 +38,7 @@ reload the installed app if needed.
 | Python syntax | `python3 -m py_compile spikes/dashboard/server.py tests/test_dashboard_spike.py` — passed. |
 | App package | `/Applications/ChatGPT.app` version `26.1021.31345`; prior local readiness inspection identifies it as the Codex variant. No app UI was opened, installed, reloaded, or restarted for this spike. |
 | CLI package | `codex-cli 0.164.0-alpha.11.1`. Isolated `codex plugin marketplace add`, `codex plugin add`, `codex plugin list`, and `codex mcp list` succeeded with `HOME=CODEX_HOME=/tmp/dashboard-spike-cli-home-r1-20261025`. The CLI listed `dashboard_spike` as an enabled stdio MCP server with no environment overrides. |
-| Actual Codex MCP handshake | In the same isolated home, `/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex app-server --listen stdio://` accepted a no-inference JSON-RPC `initialize` handshake, then `mcpServerStatus/list` started the plugin server and reported `toolsError: null` with `open_dashboard`. The request was repeated with and without the `io.modelcontextprotocol/ui` capability in the outer app-server initialize; the status response exposed the tool name but not `_meta` fields. This verifies MCP server startup and tool listing in the CLI app-server, not desktop rendering or UI capability support. No prompt, model inference, login, or real user config access was performed. |
+| Actual Codex MCP handshake | In the same isolated home, `/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex app-server --listen stdio://` accepted a no-inference JSON-RPC `initialize` handshake advertising `io.modelcontextprotocol/ui`; `mcpServerStatus/list` started the plugin server and returned `toolsError: null` with `open_dashboard`. The status response did not expose `_meta` fields. This verifies MCP server startup and tool listing in the CLI app-server, not desktop rendering or UI capability support. No prompt, model inference, login, or real user config access was performed. |
 | Desktop rendering / advertised host modes / PiP | Not observed; requires the approved desktop install/reload step. |
 | A→B mounted refresh / unsolicited updates | Not observed in the host. The fixture and refresh round trip are prepared; the server has no push mechanism. |
 
@@ -64,7 +64,7 @@ Prepared outside the installed package cache and outside the repository:
 The plugin identity is `dashboard-mcpapps-spike-20261025`, distinct from `codex-local-worker`.
 The CLI qualification changed only the disposable test home at
 `/tmp/dashboard-spike-cli-home-r1-20261025`; the real `~/.codex` and desktop settings were not
-read or changed. The marketplace package version is `0.1.1` and the MCP manifest contains no
+read or changed. The marketplace package version is `0.1.2` and the MCP manifest contains no
 external fixture path or environment override.
 
 After the parent reviews this prepared result and obtains approval for the desktop action, the
