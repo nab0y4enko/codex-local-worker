@@ -71,6 +71,7 @@ import codex_catalog
 import ledger
 import omlx_discovery
 import permissions
+import notify
 import read_answers
 import worker_pool as pool
 import native_readiness as native
@@ -4248,7 +4249,46 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
             # report, but never copy untrusted report or model prose into the ledger.
             report["ledger_error"] = "ledger append failed (%s)" % ledger_error.__class__.__name__
             write_report(report, secrets)
+        _notify_job(report, secrets)
     return report
+
+
+def _notify_job(report: Dict[str, Any], secrets: Sequence[str]) -> bool:
+    """Send a concise redacted outcome notice; never include worker output or file contents."""
+    classification = report.get("classification")
+    classification = classification if isinstance(classification, dict) else {}
+    permissions_record = report.get("permissions")
+    permissions_record = permissions_record if isinstance(permissions_record, dict) else {}
+    code = classification.get("code")
+    next_action = classification.get("next_action")
+    suggestion = classification.get("plugin_suggestion")
+    deny_unapplied = permissions_record.get("deny_list_applied") is False
+    if deny_unapplied or code == "deny_list_unavailable":
+        kind = "deny_list_unavailable"
+    elif next_action == "escalate_cloud":
+        kind = "escalation"
+    elif next_action == "needs_user":
+        kind = "needs_user"
+    elif suggestion:
+        kind = "plugin_suggestion"
+    else:
+        kind = "job"
+    job_id = str(report.get("job_id") or "unknown")
+    status = str(report.get("status") or "not reported")
+    parts = ["Outcome: " + status + "."]
+    remediation = classification.get("remediation")
+    if isinstance(remediation, str) and remediation.strip():
+        parts.append("Reason: " + remediation.strip())
+    if isinstance(suggestion, str) and suggestion.strip():
+        parts.append("Plugin suggestion: " + suggestion.strip())
+    if deny_unapplied:
+        parts.append("Deny list was not applied.")
+    title = redact("Job " + job_id, secrets)
+    message = redact(" ".join(parts), secrets)
+    try:
+        return notify.notify(kind, title, message)
+    except Exception:  # Keep the job outcome independent of any notifier implementation.
+        return False
 
 
 # --------------------------------------------------------------------------------------
@@ -4550,6 +4590,11 @@ def main(argv: Optional[Sequence[str]] = None, *,
             state_dir = resolve_state_dir(args.state_dir)
             markdown_path, json_path = ledger.write_summary(state_dir, session, codex_home)
             summary = ledger.build_summary(state_dir, session, codex_home)
+            try:
+                notify.notify("summary", "Session summary written",
+                              "Summary for session %s was written." % session)
+            except Exception:
+                pass
             print(ledger.render_markdown(summary))
             print("Wrote %s and %s" % (markdown_path, json_path))
             return 0
