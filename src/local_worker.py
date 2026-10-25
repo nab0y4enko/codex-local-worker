@@ -62,6 +62,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import apple_verification as apple
+import classify as failure_classify
 import contract
 import codex_catalog
 import omlx_discovery
@@ -1872,6 +1873,32 @@ def parse_worker_log(text: str) -> Dict[str, Any]:
     return accumulator.result()
 
 
+def typed_worker_error_text(text: str) -> List[str]:
+    """Extract failure detail only from documented terminal/error event shapes.
+
+    Ordinary assistant messages are intentionally ignored: they are worker prose, not
+    independent evidence for the planner's failure classification.
+    """
+    found = []
+    for line in text.splitlines():
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(event, dict) or event.get("type") not in observation.TERMINAL_EVENT_TYPES:
+            continue
+        error = event.get("error")
+        if isinstance(error, dict):
+            value = error.get("message") or error.get("code")
+        elif isinstance(error, str):
+            value = error
+        else:
+            value = None
+        if isinstance(value, str) and value.strip():
+            found.append(value.strip())
+    return found
+
+
 def model_routing(evidence: Dict[str, Any], alias: str) -> str:
     observed = evidence.get("observed_models") or []
     if not observed:
@@ -2479,6 +2506,7 @@ def new_report(options: JobOptions) -> Dict[str, Any]:
         "job_id": f"{_now_stamp()}-{task.task_id}-{uuid.uuid4().hex[:6]}",
         "task_id": task.task_id,
         "status": "worker_failed",
+        "tier": "local",
         "failure_reason": None,
         # Filled from live discovery once preflight has succeeded.
         "endpoint": None,
@@ -2527,6 +2555,8 @@ def new_report(options: JobOptions) -> Dict[str, Any]:
         "preflight": {},
         "sandbox": {},
         "attempts": [],
+        "auto_retries": [],
+        "screenshots": [],
         "tests": [],
         "changed_paths": [],
         "violations": [],
@@ -3074,7 +3104,8 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     # Internal evidence only: it is removed before the report is written.
     worker_authored: Dict[str, str] = {}
     report["_worker_authored"] = worker_authored
-    for attempt_number in range(1, maximum_attempts + 1):
+    attempt_number = 1
+    while attempt_number <= maximum_attempts:
         try:
             if stream is not None:
                 stream.before_attempt(report["job_id"])
@@ -3234,6 +3265,7 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
             "thread_id": evidence["thread_id"],
             "unsupported_tools": evidence["unsupported_tools"],
             "terminal_failures": evidence["terminal_failures"],
+            "error_text": typed_worker_error_text(stdout_text),
             "token_counts": evidence["token_counts"],
             "stderr_excerpt": _tail(stderr_text),
             "last_message_excerpt": _tail(last_message),
@@ -3303,8 +3335,41 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         tests_ok = (all(test.get("status") == "passed" for test in tests) if options.verify else True)
         if routing == "mismatch" or (worker_ok and tests_ok and not audit.violations):
             break
+        candidate_status = ("audit_violation" if audit.violations else
+                            "tests_failed" if worker_ok and not tests_ok else "worker_failed")
+        previous_codes = [item.get("code") for item in report.get("auto_retries", [])
+                          if isinstance(item, dict) and isinstance(item.get("code"), str)]
+        classification = failure_classify.classify(dict(
+            report, status=candidate_status, context_window=context_window,
+            previous_codes=previous_codes))
+        fix = classification.auto_fix
+        if (classification.next_action == "retry_local"
+                and isinstance(fix, dict) and deadline.remaining() > reserve + MIN_ATTEMPT_BUDGET_SECONDS):
+            applied_retry = False
+            if isinstance(fix.get("context_cap"), int) and fix["context_cap"] < context_window:
+                context_window = fix["context_cap"]
+                report["context_window"] = context_window
+                report["auto_retries"].append({"code": classification.code,
+                                               "context_window": context_window})
+                applied_retry = True
+            elif isinstance(fix.get("wait_for_server"), (int, float)):
+                wait_seconds = min(float(fix["wait_for_server"]),
+                                   max(0.0, deadline.remaining() - reserve - MIN_ATTEMPT_BUDGET_SECONDS))
+                if wait_seconds > 0:
+                    time.sleep(wait_seconds)
+                    report["auto_retries"].append({"code": classification.code,
+                                                   "wait_for_server": wait_seconds})
+                    applied_retry = True
+            else:
+                wait_seconds = 0
+            if applied_retry:
+                maximum_attempts += 1
+                feedback = summarize_failure(attempt, tests, audit.violations)
+                attempt_number += 1
+                continue
         if attempt_number < maximum_attempts:
             feedback = summarize_failure(attempt, tests, audit.violations)
+        attempt_number += 1
 
     if audit is None:
         # No attempt reached verification (unsupported tool, exhausted budget, ...). Audit
@@ -3591,6 +3656,7 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
         report["exit_code"] = EXIT_CODES.get(report["status"], 4)
         if report["status"] not in ("ok", "ready") and not report.get("failure_reason"):
             report["failure_reason"] = redact(describe_failure(report), secrets)
+        report["classification"] = failure_classify.classify(report).as_dict()
         report.pop("_worker_authored", None)
         report.pop("_git_layout", None)
         report.pop("_git_admin_before", None)
@@ -3793,6 +3859,26 @@ def summary_lines(report: Dict[str, Any]) -> List[str]:
     return lines
 
 
+def planner_json(report: Dict[str, Any]) -> Dict[str, Any]:
+    """Stable, compact ``run --json`` contract for the planner (spec §11)."""
+    report_dir = report.get("report_dir")
+    return {
+        "job_id": report.get("job_id"),
+        "kind": report.get("job_kind", "implementation"),
+        "tier": report.get("tier", "local"),
+        "model": report.get("api_model"),
+        "status": report.get("status"),
+        "classification": report.get("classification"),
+        "answer": report.get("answer"),
+        "patch_path": report.get("patch_path"),
+        "screenshots": report.get("screenshots", []),
+        "tests": report.get("tests", []),
+        "tokens": report.get("usage"),
+        "durations": report.get("timing", {}),
+        "report_path": str(Path(report_dir) / "report.json") if report_dir else None,
+    }
+
+
 def status_snapshot(item):
     """Read process liveness without treating missing output as a stalled model."""
     item = dict(item)
@@ -3942,7 +4028,7 @@ def main(argv: Optional[Sequence[str]] = None, *,
         return EXIT_CODES["contract_invalid"]
 
     if args.json:
-        print(json.dumps(report, indent=2))
+        print(json.dumps(planner_json(report), indent=2))
     else:
         print("\n".join(summary_lines(report)))
     return int(report.get("exit_code", 4))

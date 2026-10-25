@@ -381,13 +381,15 @@ class FakeRun:
 
     def __init__(self, worker_rc=0, test_rc=0, probe_ok=True, worker_edit=None,
                  worker_timed_out=False, worker_stderr="", apple=None, routed_model=None,
-                 wrapper_rc=0, wrapper_stderr=""):
+                 wrapper_rc=0, wrapper_stderr="", first_stream=None, attempt_streams=None):
         self.worker_rc, self.test_rc, self.probe_ok = worker_rc, test_rc, probe_ok
         # The model the worker's events name: the job's own ``-m`` model unless a test routes
         # the worker somewhere else on purpose.
         self.routed_model = routed_model
         self.worker_edit, self.worker_timed_out, self.worker_stderr = (worker_edit,
             worker_timed_out, worker_stderr)
+        self.first_stream = first_stream
+        self.attempt_streams = list(attempt_streams or [])
         self.wrapper_rc, self.wrapper_stderr = wrapper_rc, wrapper_stderr
         # Knobs for the mocked /usr/bin/sandbox-exec backend: devices, verdicts, failures.
         self.apple = dict(apple or {})
@@ -466,6 +468,10 @@ class FakeRun:
 
     def worker_jsonl(self, argv, cwd, attempt):
         """The worker's JSONL stdout for one attempt (a subclass can add events)."""
+        if attempt <= len(self.attempt_streams):
+            return self.attempt_streams[attempt - 1]
+        if attempt == 1 and self.first_stream is not None:
+            return self.first_stream
         return json.dumps({"type": "turn.completed",
                            "model": self.routed_model or worker_model(argv),
                            "usage": {"input_tokens": 11, "output_tokens": 7}}) + "\n"
