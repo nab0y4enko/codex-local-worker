@@ -21,8 +21,10 @@ absolute directory. Discovery and the cloud catalog check are read-only; the clo
 and checks argv but never starts cloud inference unless that capability is explicitly added after
 user authorization.
 
-Read jobs retain Codex's native `--output-schema` contract and independently validate every
-citation. The live read pilot also checks the retained Codex event stream for a successful
+Cloud read jobs retain Codex's native `--output-schema` contract; local read jobs do not pass it
+(a strict response format makes the local model answer without calling any tool), so the answer
+schema lives in the prompt and the launcher extracts the JSON from the final message (a code fence
+is tolerated). Both tiers independently validate the schema and every citation. The live read pilot also checks the retained Codex event stream for a successful
 `cat widget.py` tool call whose output contains the cited source line; a schema-valid answer alone
 does not qualify as evidence of file inspection. On macOS the model tools use the strict named Codex profile `local_worker_readonly`
 with `--strict-config` and a filesystem deny map; read argv omits `sandbox_mode` so the CLI does

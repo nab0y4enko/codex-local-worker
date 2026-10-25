@@ -2255,6 +2255,8 @@ def missing_config_pins(argv: Sequence[str], profile: omlx_discovery.ServerProfi
         elif argv[argv.index("--output-schema") + 1:
                   argv.index("--output-schema") + 2] != [str(output_schema)]:
             problems.append("--output-schema must name the generated answer schema")
+    elif "--output-schema" in argv:
+        problems.append("--output-schema is not allowed for this worker mode")
     inherit = overrides.get("shell_environment_policy.inherit")
     if inherit not in ('"none"', '"core"'):
         problems.append('shell_environment_policy.inherit must be "none" or "core", '
@@ -3434,6 +3436,17 @@ def _apple_opt_in(options: JobOptions, report: Dict[str, Any], report_dir: Path,
     return updated
 
 
+def read_output_schema(tier_kind: str, schema_path: Path) -> Optional[Path]:
+    """The ``--output-schema`` file a read job passes to Codex, if any.
+
+    Codex turns it into a strict ``text.format`` json_schema on every model request. A local
+    model under that constraint answers on its first turn without calling a tool (measured:
+    zero tool calls, invented citations), so local reads carry the schema in the prompt only
+    and the launcher validates the final message. Cloud models keep the native contract.
+    """
+    return schema_path if tier_kind == "cloud" else None
+
+
 def _read_prompt(task: Task, worktree: Path) -> str:
     return "\n".join([
         f"Read task {task.task_id} (base commit {task.base_ref}).",
@@ -3441,7 +3454,8 @@ def _read_prompt(task: Task, worktree: Path) -> str:
         "Start with cat on the listed paths and read each scoped source file as text before answering. "
         "Cite only lines read from the current worktree.",
         "Return JSON matching this schema. Include at least one citation and quote the cited "
-        "source lines exactly apart from whitespace normalization.",
+        "source lines exactly apart from whitespace normalization. Your final message must be "
+        "only the JSON object, with no other text.",
         json.dumps(read_answers.envelope_schema(task.answer_schema or {}), sort_keys=True),
         "Question:", task.question or "",
         "Scope paths:", *["- " + path for path in task.scope_paths],
@@ -3475,9 +3489,10 @@ def _execute_read_job(options: JobOptions, report: Dict[str, Any], deadline: Dea
     jsonl_path = report_dir / "worker-attempt-1.jsonl"
     prompt = _read_prompt(task, worktree)
     prompt_path.write_text(redact(prompt, secrets), encoding="utf-8")
-    # Keep Codex's native response-format contract for local and cloud reads. The launcher
-    # independently validates the envelope and every citation before releasing an answer.
-    output_schema = schema_path
+    # Cloud reads keep Codex's native response-format contract; local reads carry the schema in
+    # the prompt (see read_output_schema). Either way the launcher independently validates the
+    # envelope and every citation before releasing an answer.
+    output_schema = read_output_schema(task.tier.kind, schema_path)
     argv = worker_argv_for_tier(options, worktree, profile, context_window, last_path,
                                 loaded["overrides"], list(loaded["environment"]), catalog_path,
                                 sandbox_mode=None, output_schema=output_schema,
@@ -3604,7 +3619,7 @@ def _execute_read_job(options: JobOptions, report: Dict[str, Any], deadline: Dea
         errors.append("the worker did not produce a readable answer envelope")
     else:
         try:
-            envelope = json.loads(message)
+            envelope = json.loads(read_answers.extract_json_text(message))
         except (ValueError, TypeError):
             envelope = None
             errors.append("the worker output is not valid JSON")
@@ -4183,19 +4198,20 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
             options, worktree, profile, context_window,
             report_dir / "policy-check.last-message.txt", loaded["overrides"],
             list(loaded["environment"]), catalog_path, sandbox_mode=None,
-            output_schema=read_schema_path, permission_config=read_permission_config,
-            strict_config=True)
+            output_schema=read_output_schema(task.tier.kind, read_schema_path),
+            permission_config=read_permission_config, strict_config=True)
+        read_output = read_output_schema(task.tier.kind, read_schema_path)
         if is_cloud:
             problems = cloud_policy_check(read_argv, task.tier.model or "",
                                           task.tier.reasoning_effort, sandbox_mode=None,
-                                          output_schema=read_schema_path,
+                                          output_schema=read_output,
                                           permission_config=read_permission_config,
                                           strict_config=True)
             if problems:
                 raise BlockedError("cloud worker policy self-check refused the launch: " + "; ".join(problems))
         else:
             _policy_check(read_argv, profile, context_window, catalog,
-                          sandbox_mode=None, output_schema=read_schema_path,
+                          sandbox_mode=None, output_schema=read_output,
                           permission_config=read_permission_config, strict_config=True)
     elif task.kind == "capture":
         pass

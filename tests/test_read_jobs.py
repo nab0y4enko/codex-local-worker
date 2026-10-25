@@ -42,14 +42,14 @@ class ReadJobTests(unittest.TestCase):
                 "max_answer_bytes": 4096}
 
     def run_read_job(self, bad_citation=False, max_bytes=4096, worker_rc=0,
-                     secret_output=None):
+                     secret_output=None, raw_message=None):
         citation = {"path": "add.py", "line_start": 1 if not bad_citation else 9,
                     "line_end": 1 if not bad_citation else 9,
                     "quote": "def add" if not bad_citation else "missing"}
         summary = secret_output or "add currently subtracts"
         message = json.dumps({"answer": {"summary": summary},
                               "citations": [citation]})
-        fake = AnswerRun(message, worker_rc=worker_rc)
+        fake = AnswerRun(message if raw_message is None else raw_message, worker_rc=worker_rc)
         payload = self.payload()
         if secret_output:
             payload["environment"] = {"pass": ["JAVA_HOME"]}
@@ -78,9 +78,9 @@ class ReadJobTests(unittest.TestCase):
         overrides = lw.config_overrides_map(worker)
         self.assertEqual(overrides["default_permissions"], json.dumps(lw.READ_PERMISSION_PROFILE))
         self.assertNotIn("sandbox_mode", overrides)
-        self.assertIn("--output-schema", worker)
-        schema_path = Path(worker[worker.index("--output-schema") + 1])
-        self.assertTrue(schema_path.is_file())
+        # Local reads must not send a response_format constraint: with it the model answers on
+        # its first turn instead of reading files (see the read-job investigation record).
+        self.assertNotIn("--output-schema", worker)
         self.assertEqual(run.verification_calls(), [])
 
     def test_read_prompt_requests_textual_file_access_before_answering(self):
@@ -91,6 +91,39 @@ class ReadJobTests(unittest.TestCase):
         self.assertIn('"citations"', prompt)
         self.assertIn('"answer"', prompt)
 
+    def test_read_prompt_asks_for_only_the_json_object_as_the_final_message(self):
+        task = contract.Contract.from_payload(self.payload())
+        prompt = lw._read_prompt(task, self.repo)
+        self.assertIn("final message must be only the JSON object", prompt)
+
+    def test_only_cloud_reads_use_the_native_output_schema(self):
+        schema = Path("/tmp/answer.schema.json")
+        self.assertIsNone(lw.read_output_schema("local", schema))
+        self.assertEqual(lw.read_output_schema("cloud", schema), schema)
+
+    def test_fenced_json_final_message_is_accepted_and_still_verified(self):
+        message = ("Based on the file:\n```json\n" + json.dumps({
+            "answer": {"summary": "add currently subtracts"},
+            "citations": [{"path": "add.py", "line_start": 1, "line_end": 1,
+                           "quote": "def add"}]}) + "\n```\n")
+        report, _ = self.run_read_job(raw_message=message)
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["answer"], {"summary": "add currently subtracts"})
+
+    def test_fenced_json_with_a_bad_citation_is_still_withheld(self):
+        message = ("```json\n" + json.dumps({
+            "answer": {"summary": "x"},
+            "citations": [{"path": "add.py", "line_start": 1, "line_end": 1,
+                           "quote": "invented"}]}) + "\n```")
+        report, _ = self.run_read_job(raw_message=message)
+        self.assertEqual(report["status"], "answer_invalid")
+        self.assertNotIn("answer", report)
+
+    def test_prose_without_json_is_withheld(self):
+        report, _ = self.run_read_job(raw_message="It subtracts, see add.py line 1.")
+        self.assertEqual(report["status"], "answer_invalid")
+        self.assertIn("not valid JSON", report["failure_reason"])
+
     def test_valid_read_job_returns_answer_without_a_patch(self):
         report, run = self.run_read_job()
         self.assertEqual(report["status"], "ok")
@@ -99,7 +132,7 @@ class ReadJobTests(unittest.TestCase):
         argv = run.calls_of("exec")[0]["argv"]
         self.assertNotIn("-s", argv)
         self.assertIn("--strict-config", argv)
-        self.assertIn("--output-schema", argv)
+        self.assertNotIn("--output-schema", argv)
         self.assertEqual(run.verification_calls(), [])
 
     def test_oversized_answer_is_not_released(self):

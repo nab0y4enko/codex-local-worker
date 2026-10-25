@@ -1,5 +1,6 @@
 """Schema-subset validation and source-citation checks for read jobs."""
 
+import json
 import re
 from pathlib import Path
 from typing import Any, Dict, List
@@ -8,6 +9,33 @@ SUPPORTED_SCHEMA_KEYWORDS = frozenset({
     "type", "properties", "required", "additionalProperties", "items", "enum",
     "minItems", "maxItems", "maxLength", "minimum", "maximum", "description",
 })
+
+
+_FENCE = re.compile(r"```[ \t]*(?:json|JSON)?[ \t]*\r?\n(.*?)\r?\n?```", re.DOTALL)
+
+
+def extract_json_text(message: str) -> str:
+    """The JSON text of a worker's final message, tolerating a code fence around it.
+
+    Local reads send no response-format constraint (it stops the model from calling tools), so
+    a model may wrap the object in a fence or add a sentence before it. The whole message is
+    used when it already parses; otherwise the last fenced block that parses as JSON. Anything
+    else is returned unchanged and fails the caller's JSON check. Extraction only locates the
+    text: the caller still validates the schema and verifies every citation.
+    """
+    def parses(text: str) -> bool:
+        try:
+            json.loads(text)
+        except ValueError:
+            return False
+        return True
+
+    if parses(message):
+        return message
+    for match in reversed(_FENCE.findall(message)):
+        if parses(match):
+            return match
+    return message
 
 
 def envelope_schema(answer_schema: Dict[str, Any]) -> Dict[str, Any]:

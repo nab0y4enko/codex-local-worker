@@ -30,6 +30,16 @@ class ReadAnswerTests(unittest.TestCase):
         self.assertEqual(read_answers.validate({"controls": ["a"]}, schema), [])
         self.assertTrue(read_answers.validate({"controls": ["a", "b", "c"], "x": 1}, schema))
 
+    def test_final_message_json_extraction(self):
+        body = '{"answer": 1, "citations": []}'
+        self.assertEqual(read_answers.extract_json_text(body), body)
+        self.assertEqual(read_answers.extract_json_text("```json\n" + body + "\n```"), body)
+        self.assertEqual(read_answers.extract_json_text("Done.\n```json\n" + body + "\n```"), body)
+        self.assertEqual(read_answers.extract_json_text(
+            "```json\n{\"a\": 1}\n```\ntext\n```json\n" + body + "\n```"), body)
+        for bad in ("no json here", "```python\nprint(1)\n```", "", "```json\n{oops\n```"):
+            self.assertEqual(read_answers.extract_json_text(bad), bad)
+
     def test_envelope_schema_requires_answer_and_citations(self):
         schema = read_answers.envelope_schema({"type": "string"})
         self.assertEqual(schema["required"], ["answer", "citations"])

@@ -197,6 +197,24 @@ class SelfCheck(IsolationCase):
                 (self.catalog, self.catalog_sha), sandbox_mode=None,
                 output_schema=schema, permission_config=permission_config, strict_config=True))
 
+    def test_read_argv_without_a_schema_refuses_a_stray_output_schema_flag(self):
+        self.argv_with_catalog()
+        state = self.root / "state"
+        worktree = state / "worktrees" / "read-job"
+        worktree.mkdir(parents=True)
+        permission_config = lw.native_read_profile_overrides(
+            lw.permissions.default_permissions(), state, worktree)
+        argv = lw.worker_argv("codex", worktree, self.profile, 32768,
+                              self.root / "last-message.txt", catalog_path=self.catalog,
+                              sandbox_mode=None, permission_config=permission_config,
+                              strict_config=True)
+        pins = dict(catalog=(self.catalog, self.catalog_sha), sandbox_mode=None,
+                    permission_config=permission_config, strict_config=True)
+        self.assertEqual(lw.missing_config_pins(argv, self.profile, 32768, **pins), [])
+        drifted = [*argv[:-2], "--output-schema", str(self.root / "s.json"), *argv[-2:]]
+        problems = lw.missing_config_pins(drifted, self.profile, 32768, **pins)
+        self.assertTrue(any("--output-schema" in item for item in problems), problems)
+
     def test_catalog_drift_is_refused(self):
         argv = self.argv_with_catalog()
         Path(self.catalog).write_text("{}")
