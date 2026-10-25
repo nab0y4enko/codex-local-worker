@@ -43,9 +43,10 @@ class VerifierWrites(sp.FakeRun):
 
     def __call__(self, argv, **kwargs):
         argv = [str(item) for item in argv]
-        verification = not (argv[0] == lw.apple.SANDBOX_EXEC
-                            or argv == list(lw.FULL_HOST_PROBE_ARGV)
-                            or argv[1:2] in (["exec"], ["sandbox"]))
+        inner, _ = sp.deny_wrapped(argv)  # classified by what runs inside the deny wrapper
+        verification = not (inner[0] == lw.apple.SANDBOX_EXEC or inner == sp.WRAPPER_PROBE
+                            or inner == list(lw.FULL_HOST_PROBE_ARGV)
+                            or inner[1:2] in (["exec"], ["sandbox"]))
         if verification:
             Path(kwargs["cwd"], "add.py").write_text(FIX, encoding="utf-8")
         return super().__call__(argv, **kwargs)
@@ -65,9 +66,10 @@ class VerifierActs(sp.FakeRun):
 
     def __call__(self, argv, **kwargs):
         argv = [str(item) for item in argv]
-        verification = not (argv[0] == lw.apple.SANDBOX_EXEC
-                            or argv == list(lw.FULL_HOST_PROBE_ARGV)
-                            or argv[1:2] in (["exec"], ["sandbox"]))
+        inner, _ = sp.deny_wrapped(argv)  # classified by what runs inside the deny wrapper
+        verification = not (inner[0] == lw.apple.SANDBOX_EXEC or inner == sp.WRAPPER_PROBE
+                            or inner == list(lw.FULL_HOST_PROBE_ARGV)
+                            or inner[1:2] in (["exec"], ["sandbox"]))
         if not verification:
             return super().__call__(argv, **kwargs)
         self.verifications += 1

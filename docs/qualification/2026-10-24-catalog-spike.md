@@ -372,3 +372,42 @@ re-hashes the file in the self-check before every launch.)
 - **`codex debug prompt-input` must not be the self-check for what the model sees.** It omits
   tools and, without lite, the base instructions. A loopback stub capture, as in `render`, is
   the reliable view.
+
+## Wrapper smoke (Task 9)
+
+Task 9 runs the worker, every verification command and every native step as
+`sandbox-exec -f <report_dir>/permissions.sb <command>`, a profile generated per job from
+`<state>/permissions.json`. The same pilot was run once on this Mac against the real oMLX
+model, with a fresh pilot and a fresh state directory:
+
+```sh
+python3 scripts/prepare_pilot.py --root <root>
+bin/local-worker run --task-file <root>/task.json --state-dir <root>/state --json
+```
+
+| Status | Tests | Worker s | Job wall s | Tokens | `permissions` | Primary checkout |
+| --- | --- | ---: | ---: | --- | --- | --- |
+| ok, exit 0 | 1 passed, `deny_list_applied: true` | 19.2 | 20.7 | 12,918 / 11,459 / 458 | `mode: full_host`, `deny_list_applied: true`, `reason: null`, `denials: []`, profile sha256 `278f293e…` (12 statements) | unchanged; `sentinel.txt` still dirty; `primary_changed_during_job: false` |
+
+Model `Qwen3.5-9B-OptiQ-4bit`, launcher catalog `870e20c8…`. The worker ran `cat`, the
+`apply_patch` heredoc (2 `file_change` items) and `python3 -m unittest -v`; its stderr was
+empty and the stream had no error item. Codex wrote the attempt's `-o` file in place, so
+re-opening that one file inside the shut state directory is enough (the last message reads
+"Done. Fixed `add.py` …").
+
+The same job's profile was then exercised directly
+(`/usr/bin/sandbox-exec -f <report_dir>/permissions.sb …`):
+
+| Command under the job's profile | Result |
+| --- | --- |
+| `touch <state>/permissions.json`, `echo x >> <state>/permissions.json` | `Operation not permitted` |
+| `echo x >> <report_dir>/report.json`, `echo x >> <report_dir>/permissions.sb` | `Operation not permitted` |
+| `mv <state> <state>-moved` | `Operation not permitted` |
+| `touch <root>/repo/add.py` (primary checkout) | `Operation not permitted` |
+| `echo x > <root>/repo/.git/hooks/post-checkout` | `Operation not permitted` |
+| `ls ~/.ssh` | `Operation not permitted` |
+| `touch <worktree>/.smoke-probe`, `touch <report_dir>/codex-home/.smoke-probe` | allowed (probes removed) |
+
+`find_denials` over the output of `mv <root>/repo/add.py <root>/repo/b.py` and
+`mv <state> <root>/x` under that profile returned exactly `<root>/repo/add.py`,
+`<root>/repo/b.py` and `<state>` (all `write`).

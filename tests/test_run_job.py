@@ -185,7 +185,10 @@ class RunJob(unittest.TestCase):
         def edit(cwd, attempt):
             self.fix(cwd)
             (self.repo / "sentinel.txt").write_text("touched during the job\n")
-        report = self.run_job(sp.FakeRun(worker_edit=edit))
+        # Without the deny list nothing stopped the worker writing the primary checkout, so a
+        # change there fails the job (with it applied the change is reported, not attributed).
+        with mock.patch.object(lw.permissions, "wrapper_available", return_value=False):
+            report = self.run_job(sp.FakeRun(worker_edit=edit))
         self.assertEqual(report["status"], "audit_violation")
         self.assertFalse(report["primary_unchanged"])
         self.assertNotEqual(report["primary_fingerprint_before"], report["primary_fingerprint_after"])

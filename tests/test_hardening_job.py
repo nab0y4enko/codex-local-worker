@@ -64,7 +64,7 @@ class HardenedJobTests(unittest.TestCase):
             options=sp.job_options(self.root,self.repo);options.job_kind='repair'
             fake=sp.FakeRun()
             def crash(argv, **kwargs):
-                if list(argv)[1:2]==['exec']:raise OSError('worker runner lost')
+                if sp.deny_wrapped([str(a) for a in argv])[0][1:2]==['exec']:raise OSError('worker runner lost')
                 return fake(argv,**kwargs)
             with mock.patch.object(lw,'run_bounded',crash):report=lw.run_job(options)
             self.assertIn('worker runner lost',report['failure_reason'])
@@ -87,7 +87,7 @@ class HardenedJobTests(unittest.TestCase):
     def test_interrupted_attempt_has_actual_duration_and_unknown_usage(self):
         options=sp.job_options(self.root,self.repo);fake=sp.FakeRun()
         def crash(argv,**kwargs):
-            if list(argv)[1:2]==['exec']:raise OSError('lost child')
+            if sp.deny_wrapped([str(a) for a in argv])[0][1:2]==['exec']:raise OSError('lost child')
             return fake(argv,**kwargs)
         with mock.patch.object(lw,'run_bounded',crash):report=lw.run_job(options)
         self.assertEqual(len(report['attempts']),1)

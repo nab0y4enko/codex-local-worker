@@ -50,9 +50,11 @@ class StreamRun(sp.FakeRun):
         self.worker_stream = worker_stream
 
     def __call__(self, argv, *, cwd, env, timeout, stdin_data=None):
-        argv = [str(item) for item in argv]
+        raw = [str(item) for item in argv]
+        argv, wrapped = sp.deny_wrapped(raw)
         if argv[1:2] == ["exec"]:
-            self.calls.append({"argv": argv, "cwd": Path(cwd) if cwd else None,
+            self.calls.append({"argv": argv, "raw_argv": raw, "wrapped": wrapped, "kind": "exec",
+                               "cwd": Path(cwd) if cwd else None,
                                "env": dict(env), "timeout": timeout,
                                "stdin": (stdin_data or b"").decode("utf-8", "replace")})
             self.exec_calls += 1
@@ -60,7 +62,7 @@ class StreamRun(sp.FakeRun):
                 self.worker_edit(Path(cwd), self.exec_calls)
             return sp.result(argv, self.worker_rc, self.worker_stream, self.worker_stderr,
                              timed_out=self.worker_timed_out)
-        return super().__call__(argv, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data)
+        return super().__call__(raw, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data)
 
 
 class TerminalEventEvidence(unittest.TestCase):

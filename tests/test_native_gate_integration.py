@@ -41,7 +41,8 @@ class NativeGateIntegrationTests(unittest.TestCase):
         self.assertEqual(udid, sp.APPLE_UDID)
         self.assertTrue(Path(worktree).is_dir())
         self.assertTrue(report_dir.is_dir())
-        self.assertEqual(list(report_dir.glob('*.sb')), [])    # no profile is created
+        # The only profile is the job's deny wrapper; no Apple confinement profile is created.
+        self.assertEqual([path.name for path in report_dir.glob('*.sb')], [sp.DENY_PROFILE_NAME])
         self.assertFalse(self.probe_apple.called)              # no readiness probe runs here
         self.assertEqual(self.fake.exec_calls, 0)
         # Call the real full-host closure, rather than treating its existence as proof.
@@ -52,7 +53,8 @@ class NativeGateIntegrationTests(unittest.TestCase):
             before = deadline.remaining()
             result = run(argv)
             call = self.native_calls[-1]
-            self.assertEqual(call['argv'], argv)     # direct argv, never wrapped in sandbox-exec
+            self.assertEqual(call['argv'], argv)     # the plan's argv, run inside the deny wrapper
+            self.assertTrue(call['wrapped'])
             self.assertEqual(call['cwd'], worktree)
             self.assertGreater(call['timeout'], 0)
             self.assertLessEqual(call['timeout'], before)
@@ -70,25 +72,32 @@ class NativeGateIntegrationTests(unittest.TestCase):
                 'checks': [], 'launch_pid': 101, 'xctest': {'passed': 1, 'failed': 0}}
 
     def runner(self, argv, *, cwd, env, timeout, stdin_data=None):
+        raw = [str(item) for item in argv]
+        argv, wrapped = sp.deny_wrapped(raw)
+        if wrapped and argv == sp.WRAPPER_PROBE:
+            return self.fake(raw, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data)
         if argv[0] == lw.apple.SANDBOX_EXEC:
-            self.fail('full-host native runs must not use ' + lw.apple.SANDBOX_EXEC)
+            self.fail('full-host native runs must not use the legacy Apple profile')
         if argv == list(lw.FULL_HOST_PROBE_ARGV):
-            return self.fake(argv, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data)
+            return self.fake(raw, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data)
         if argv[1:2] == ['exec']:
             self.assertTrue(self.gate_done, 'worker started before native qualification completed')
+            self.assertTrue(wrapped, 'the worker must run inside the deny wrapper')
             self.events.append('worker')
-            return self.fake(argv, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data)
-        call = {'argv': list(argv), 'cwd': cwd, 'env': dict(env), 'timeout': timeout}
+            return self.fake(raw, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data)
+        call = {'argv': list(argv), 'wrapped': wrapped, 'cwd': cwd, 'env': dict(env),
+                'timeout': timeout}
         self.native_calls.append(call)
         if not self.gate_done:
             return sp.result(argv, 65 if self.gate_fail else 0,
                              out='native callback output ' + sp.SECRET,
                              timed_out=self.native_timeout)
         self.events.append('verification')
+        self.assertTrue(wrapped, 'verification must run inside the deny wrapper')
         self.assertEqual(env['IBToolNeverDeque'], '1')
         self.assertNotIn(lw.apple.FOUNDATION_HOME_ENV, env)
         self.assertNotIn(lw.API_KEY_ENV, env)
-        return self.fake(argv, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data)
+        return self.fake(raw, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data)
 
     @contextlib.contextmanager
     def injected(self):
@@ -125,7 +134,8 @@ class NativeGateIntegrationTests(unittest.TestCase):
         self.assertEqual(self.fake.exec_calls, 0)
         self.assertEqual(self.events, ['gate_started', 'native_build'])
         self.assertFalse(self.probe_apple.called)
-        self.assertEqual(list(Path(report['report_dir']).glob('*.sb')), [])
+        self.assertEqual([path.name for path in Path(report['report_dir']).glob('*.sb')],
+                         [sp.DENY_PROFILE_NAME])
         self.assertFalse(report['native_preflight']['qualified'])
         self.assertEqual(report['attempts'], [])
         self.assertTrue((Path(report['report_dir']) / 'report.json').is_file())

@@ -22,10 +22,17 @@ Standard library only. Design rules:
   default job and always refused when owned paths of an active same-repository contract
   overlap. There is no fork scheduler: the planner starts every job itself.
 * Post-run audit *detects* out-of-scope edits; it does not prevent them. Execution is
-  full-host: no sandbox confines the worker, so it can read anything the launcher can.
-* Independent verification runs the contract commands directly on the host. Every result is
-  logged truthfully with ``sandboxed: false``; a command that could not be run is reported
-  blocked with the reason it was not run.
+  full-host minus a short deny list: the worker, every verification command and every native
+  step run as ``sandbox-exec -f <report_dir>/permissions.sb``, a permissive Seatbelt profile
+  (``allow default`` plus denials) generated from the user's ``<state>/permissions.json``
+  (``permissions``). The listed secrets cannot be read; the primary checkout's files, HEAD,
+  index, branches and hooks and the launcher's own state cannot be written. Everything else the
+  launcher can read or write stays reachable. Where ``sandbox-exec`` is missing or cannot apply
+  the profile, jobs run without it and the report says ``deny_list_applied: false``.
+* Independent verification runs the contract commands on the host inside that wrapper. Every
+  result is logged truthfully with ``sandboxed: false`` (a deny list is not a sandbox) and
+  ``deny_list_applied``; a command that could not be run is reported blocked with the reason it
+  was not run.
 
 All guarantees apply only to jobs launched through this launcher.
 """
@@ -101,13 +108,26 @@ KILL_GRACE_SECONDS = 10.0
 MIN_ATTEMPT_BUDGET_SECONDS = 5.0
 
 # Default execution backend: the worker and every verification command run with the
-# launcher's own host permissions and network access. Nothing confines them, so the report
-# says so instead of claiming a confinement that is not applied.
+# launcher's own host permissions and network access, minus the job's deny wrapper when it is
+# applied. The report says which, instead of claiming a confinement that is not applied.
 FULL_HOST_BACKEND = "full-host-access"
-# There is no profile and no wrapper: the command is the contract argv, run directly.
+# No confining profile: the command is the contract argv (behind the deny wrapper, if applied).
 FULL_HOST_PROFILE = "none"
 FULL_HOST_PROBE_ARGV = ["/bin/echo", PROBE_MARKER]
 FULL_HOST_CONFINEMENT = "none (full host: launcher permissions, network enabled)"
+FULL_HOST_DENY_CONFINEMENT = ("full host minus the permissions deny list (sandbox-exec deny "
+                              "profile: secrets unreadable, primary checkout and launcher state "
+                              "unwritable), network enabled")
+# The job's deny wrapper (spec §6.2, §6.14): the profile generated per job in its report
+# directory, the trivial command that proves it can be applied before anything runs under it,
+# and the ``sandbox-exec`` exit status (EX_OSERR) that means it could not be applied here.
+PERMISSIONS_PROFILE_NAME = "permissions.sb"
+WRAPPER_PROBE_ARGV = ["/usr/bin/true"]
+WRAPPER_NOT_APPLIED_EXIT = 71
+# Report-directory paths a wrapped process may write besides its worktree and Codex home: the
+# native steps' scratch (derived data, result bundles) and screenshot captures.
+NATIVE_SCRATCH_NAME = "apple-scratch"
+SCREENSHOTS_DIR_NAME = "screenshots"
 # Legacy Codex workspace-write backend: kept usable for a caller that explicitly asks for
 # it. The installed codex sandbox refuses to start without ``-P <profile>``, so the profile
 # and its exact overrides stay pinned here.
@@ -236,10 +256,16 @@ EXIT_CODES = {
 LIMITATIONS = (
     "The allowed-path audit runs after the worker finishes: it detects out-of-scope "
     "edits, it cannot prevent them while the worker runs.",
-    "Execution is full-host: the worker and every verification command run with the "
-    "launcher's own permissions and network access, with no sandbox confinement. The "
-    "post-run audit and the task contract are the only scope controls, so treat any file "
-    "the host can read or write as reachable by a job.",
+    "Execution is full-host minus a deny list: the worker, every verification command and "
+    "every native step run with the launcher's own permissions and network access inside a "
+    "permissive macOS Seatbelt profile (allow default plus denials) generated from "
+    "<state>/permissions.json. The listed secrets cannot be read, and the primary checkout's "
+    "files, HEAD, index, branches and hooks and the launcher's state directory cannot be "
+    "written. It is a deny list, not a sandbox: anything else the host can read or write "
+    "(the home directory, shell and git configuration, caches, the network) stays reachable "
+    "by a job. Where sandbox-exec is missing or cannot apply the profile, jobs still run and "
+    "the report says permissions.deny_list_applied: false, and a primary-checkout change then "
+    "fails the job again.",
     "The launcher and skill do not enforce model choice app-wide. Only jobs started "
     "through this launcher are covered; keep the app planner configuration untouched.",
     "Reports record patch evidence, not semantic review. The selected planner model "
@@ -1901,11 +1927,11 @@ def verification_argv(sandbox: Dict[str, Any], codex_bin: str, worktree: Path,
                       argv: Sequence[str]) -> List[str]:
     """Return the command exactly as this backend runs it.
 
-    The default full-host backend runs the contract argv directly, so the returned argv is the
-    plain command and the log records what really executed rather than a wrapper that is not
-    there. The legacy backends stay reachable through an explicit backend: an Apple job wraps
-    the command in the Seatbelt profile that was probed for it, and the legacy Codex
-    workspace-write backend wraps it in ``codex sandbox``.
+    The default full-host backend runs the contract argv itself, so the returned argv is the
+    plain command; the job's deny wrapper (``DenyWrapper.wrap``) is added around whatever this
+    returns, by the caller, only when it is applied. The legacy backends stay reachable through
+    an explicit backend: an Apple job wraps the command in the Seatbelt profile that was probed
+    for it, and the legacy Codex workspace-write backend wraps it in ``codex sandbox``.
     """
     backend = sandbox.get("backend")
     if backend == FULL_HOST_BACKEND:
@@ -1925,9 +1951,9 @@ def verification_argv(sandbox: Dict[str, Any], codex_bin: str, worktree: Path,
 def full_host_env(env: Dict[str, str]) -> Dict[str, str]:
     """Plain verification environment for the full-host backend: no confinement redirects.
 
-    Nothing is rerouted into a job scratch directory because nothing is confined, so
-    ``HOME``/``CODEX_HOME`` and the Foundation, temp and module-cache locations stay exactly as
-    the job had them. Only ``IBToolNeverDeque=1`` is set -- forcibly, overriding any incoming
+    Nothing is rerouted into a job scratch directory: the deny wrapper (when applied) only takes
+    away secrets, the primary checkout and the launcher state, so ``HOME``/``CODEX_HOME`` and the
+    Foundation, temp and module-cache locations stay exactly as the job had them. Only ``IBToolNeverDeque=1`` is set -- forcibly, overriding any incoming
     value -- so actool/ibtool run in-process and cannot reuse an ``ibtoold`` that an earlier job
     started with different paths.
     """
@@ -2011,9 +2037,178 @@ def probe_sandbox(codex_bin: str, worktree: Path, env: Dict[str, str],
             "argv_template": list(FULL_HOST_PROBE_ARGV)}
 
 
+# --------------------------------------------------------------------------------------
+# The deny wrapper
+# --------------------------------------------------------------------------------------
+@dataclass
+class DenyWrapper:
+    """The job's Seatbelt deny wrapper, and the report's ``permissions`` record it keeps current.
+
+    ``profile`` is set only once the profile is proven to apply; until then ``wrap`` returns
+    the command unchanged and ``record["reason"]`` says why. ``collect`` adds the denials a
+    command's output shows to ``record["denials"]``.
+    """
+
+    perms: permissions.Permissions
+    primary_repo: Path
+    state_dir: Path
+    record: Dict[str, Any]
+    profile: Optional[Path] = None
+
+    @property
+    def applied(self) -> bool:
+        return self.profile is not None
+
+    def wrap(self, argv: Sequence[str]) -> List[str]:
+        if self.profile is None:
+            return [str(item) for item in argv]
+        return permissions.wrap_argv(argv, self.profile)
+
+    def collect(self, text: str, source: str) -> None:
+        """Record the wrapper denials ``text`` shows, each path and kind once (first source)."""
+        if not text:
+            return
+        seen = {(item["path"], item["kind"]) for item in self.record["denials"]}
+        for found in permissions.find_denials(text, self.perms, self.primary_repo,
+                                              state_dir=self.state_dir):
+            if (found["path"], found["kind"]) not in seen:
+                seen.add((found["path"], found["kind"]))
+                self.record["denials"].append(dict(found, source=source))
+
+
+def deny_list_applied(report: Dict[str, Any]) -> bool:
+    """Whether the job's deny wrapper was applied (``False`` for reports that predate it)."""
+    return bool((report.get("permissions") or {}).get("deny_list_applied"))
+
+
+def load_job_permissions(options: "JobOptions") -> permissions.Permissions:
+    """The user's permissions list for this job, or a ``preflight_failed`` refusal.
+
+    A list that cannot be read or parsed is never replaced by the defaults (the job would run
+    without the denials the user wrote), and a list that would hide the repository, the worktree
+    root, the state directory or the Codex executable refuses the job naming the conflict.
+    """
+    try:
+        perms = permissions.load_permissions(options.state_dir)
+    except permissions.PermissionsError as error:
+        raise PreflightError(f"the permissions list cannot be used: {error}") from None
+    codex = shutil.which(options.codex_bin) or options.codex_bin
+    problems = permissions.check_conflicts(
+        perms, repo=options.task.repo_path, worktree_root=options.state_dir / "worktrees",
+        state_dir=options.state_dir, codex_bin=Path(codex))
+    if problems:
+        raise PreflightError("the permissions list conflicts with this job: " + "; ".join(problems))
+    return perms
+
+
+def last_message_path(report_dir: Path, attempt_number: int) -> Path:
+    """The ``-o`` file Codex writes the worker's final message to for one attempt."""
+    return report_dir / f"attempt-{attempt_number}.last-message.txt"
+
+
+def job_writable_paths(report_dir: Path, worktree: Path, codex_home: Path, attempts: int,
+                       env: Dict[str, str]) -> List[Path]:
+    """What a wrapped process of this job may write inside the launcher's state directory.
+
+    Its worktree, its Codex home, the ``-o`` file of each attempt, the native scratch and the
+    screenshots directory, and ``TMPDIR`` should it lie in the state. Nothing else of the report
+    directory: the reports, logs, prompts, patch and this job's own profile are evidence the
+    launcher writes, and a worker able to rewrite ``permissions.sb`` would choose the profile
+    of every later attempt and check.
+    """
+    paths = [worktree, codex_home, report_dir / NATIVE_SCRATCH_NAME, report_dir / SCREENSHOTS_DIR_NAME]
+    paths += [last_message_path(report_dir, number) for number in range(1, attempts + 1)]
+    if env.get("TMPDIR"):
+        paths.append(Path(env["TMPDIR"]))
+    return paths
+
+
+def setup_deny_wrapper(options: "JobOptions", report: Dict[str, Any],
+                       perms: permissions.Permissions, report_dir: Path, worktree: Path,
+                       codex_home: Path, env: Dict[str, str], secrets: Sequence[str],
+                       deadline: Deadline) -> DenyWrapper:
+    """Write ``<report_dir>/permissions.sb`` and decide whether this job runs under it.
+
+    The profile is applied only after ``sandbox-exec`` has run a trivial command under it.
+    Without ``sandbox-exec``, or when it exits 71 because the profile cannot be applied here (the
+    launcher is itself inside a sandbox), the job runs without the wrapper and the report says
+    so with the reason (spec §6.14: never silent). Any other probe failure means the generated
+    profile does not work, and nothing is run under a profile that does not work: the job is
+    blocked.
+    """
+    record = report["permissions"]
+    try:
+        text = permissions.seatbelt_profile(
+            perms, primary_repo=options.task.repo_path, state_dir=options.state_dir,
+            allowed_writes=job_writable_paths(report_dir, worktree, codex_home,
+                                              options.task.max_attempts, env))
+    except permissions.PermissionsError as error:
+        raise PreflightError(f"the permissions deny profile cannot be built: {error}") from None
+    profile = report_dir / PERMISSIONS_PROFILE_NAME
+    profile.write_text(text, encoding="utf-8")
+    record.update(mode=perms.mode, profile=str(profile), deny_list_applied=False,
+                  profile_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest())
+    wrapper = DenyWrapper(perms, options.task.repo_path, options.state_dir, record)
+    if not permissions.wrapper_available():
+        record["reason"] = (f"{permissions.SANDBOX_EXEC} is not available on this host, so the "
+                            "deny list was not applied: the job ran with full host access")
+        return wrapper
+    timeout = deadline.cap(PROBE_TIMEOUT_SECONDS)
+    if timeout < MIN_ATTEMPT_BUDGET_SECONDS:
+        raise DeadlineExpired(f"only {timeout:.1f}s of the job budget is left, so the deny "
+                              "wrapper could not be probed and nothing was run")
+    try:
+        result = run_bounded(permissions.wrap_argv(WRAPPER_PROBE_ARGV, profile), cwd=worktree,
+                             env=env, timeout=timeout)
+    except OSError as error:
+        raise BlockedError(f"the deny wrapper {permissions.SANDBOX_EXEC} could not be started: "
+                           f"{error}") from error
+    detail = redact(_tail((result["stdout"] + b"\n" + result["stderr"]).decode("utf-8", "replace"),
+                          500), secrets)
+    if result["returncode"] == 0 and not result["timed_out"]:
+        wrapper.profile = profile
+        record.update(deny_list_applied=True, reason=None)
+        return wrapper
+    if result["returncode"] == WRAPPER_NOT_APPLIED_EXIT and not result["timed_out"]:
+        record["reason"] = (f"{permissions.SANDBOX_EXEC} exited {WRAPPER_NOT_APPLIED_EXIT}: it "
+                            "could not apply the deny profile here (the launcher is probably "
+                            "itself inside a sandbox), so the deny list was not applied and the "
+                            f"job ran with full host access: {detail or 'no output'}")
+        return wrapper
+    state = "timed out" if result["timed_out"] else f"exited {result['returncode']}"
+    raise BlockedError(f"the deny wrapper probe {state} under {profile}: {detail or 'no output'}; "
+                       "no worker or check is run under a profile that does not work")
+
+
+def worker_command_outputs(text: str) -> List[str]:
+    """The output of every shell command the worker ran, from its JSONL stream.
+
+    Only completed ``command_execution`` items are read: that is where a command the wrapper
+    refused says so. Model messages and reasoning are never read, so a model quoting a denial
+    is not taken for one.
+    """
+    outputs: List[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item = event.get("item") if isinstance(event, dict) else None
+        if (event.get("type") == "item.completed" and isinstance(item, dict)
+                and item.get("type") == "command_execution"):
+            output = item.get("aggregated_output")
+            if isinstance(output, str) and output:
+                outputs.append(output)
+    return outputs
+
+
 def run_verification(task: Task, worktree: Path, env: Dict[str, str], codex_bin: str,
                      sandbox: Dict[str, Any], secrets: Sequence[str],
-                     deadline: Deadline) -> List[Dict[str, Any]]:
+                     deadline: Deadline, wrapper: Optional[DenyWrapper] = None
+                     ) -> List[Dict[str, Any]]:
     """Run each contract command, or report it blocked, exactly as the backend runs it.
 
     There is no per-test timeout reset: every command is capped by whatever is left of the
@@ -2023,12 +2218,15 @@ def run_verification(task: Task, worktree: Path, env: Dict[str, str], codex_bin:
     The backend comes from the probe result. The default full-host backend runs the plain
     command with the launcher's own permissions and network access and records
     ``sandboxed: false``; the legacy Codex workspace-write sandbox and the explicit Apple
-    Seatbelt backend confine the command when a job selected them. Each entry reports which
-    backend ran it and whether anything confined it.
+    Seatbelt backend confine the command when a job selected them. Whatever the backend, the
+    command runs behind the job's deny ``wrapper`` when one is applied (an inner Seatbelt
+    profile still applies inside it: nested profiles intersect). Each entry reports which
+    backend ran it, whether anything confined it and ``deny_list_applied``.
     """
     results: List[Dict[str, Any]] = []
     backend = str(sandbox.get("backend") or FULL_HOST_BACKEND)
     full_host = backend == FULL_HOST_BACKEND
+    denied = wrapper is not None and wrapper.applied
     apple_mode = backend == apple.BACKEND
     apple_scratch = str(sandbox.get("apple_scratch") or "") if apple_mode else ""
     for index, argv in enumerate(task.test_commands, start=1):
@@ -2073,6 +2271,8 @@ def run_verification(task: Task, worktree: Path, env: Dict[str, str], codex_bin:
         timeout = deadline.cap(float(task.timeout_seconds))
         try:
             wrapped = verification_argv(sandbox, codex_bin, worktree, argv)
+            if wrapper is not None:
+                wrapped = wrapper.wrap(wrapped)
             command_env = (apple.verification_env(env, Path(apple_scratch)) if apple_mode
                            else full_host_env(env) if full_host else env)
         except (BlockedError, apple.ApplePolicyError) as error:
@@ -2087,9 +2287,9 @@ def run_verification(task: Task, worktree: Path, env: Dict[str, str], codex_bin:
         passed = result["returncode"] == 0 and not result["timed_out"] and not over_limit
         entry: Dict[str, Any] = {
             "command": argv, "sandboxed": not full_host, "log": str(index),
-            "backend": backend,
-            "confinement": (FULL_HOST_CONFINEMENT if full_host
-                            else str(sandbox.get("apple_argv_prefix") or backend)),
+            "backend": backend, "deny_list_applied": denied,
+            "confinement": ((FULL_HOST_DENY_CONFINEMENT if denied else FULL_HOST_CONFINEMENT)
+                            if full_host else str(sandbox.get("apple_argv_prefix") or backend)),
             "status": "passed" if passed else "failed",
             "returncode": result["returncode"], "timed_out": result["timed_out"],
             "output_limit_exceeded": over_limit,
@@ -2183,8 +2383,18 @@ def new_report(options: JobOptions) -> Dict[str, Any]:
         "report_dir": None,
         "dirty_primary_files": [],
         "primary_unchanged": True,
+        # With the deny wrapper applied the worker cannot write the primary checkout, so a change
+        # seen there was made by the parent or the user: reported, not attributed, not a failure.
+        "primary_changed_during_job": False,
         "primary_fingerprint_before": None,
         "primary_fingerprint_after": None,
+        # The job's Seatbelt deny wrapper (spec §6.2, §6.14), filled once it is set up: the
+        # profile written to ``<report_dir>/permissions.sb`` and its hash, whether it was applied
+        # (and why not), and the denials the worker's commands and the checks ran into.
+        "permissions": {"mode": None, "deny_list_applied": False, "profile": None,
+                        "profile_sha256": None,
+                        "reason": "not set up: the job stopped before anything ran under it",
+                        "denials": []},
         "budget": {"total_seconds": float(task.timeout_seconds), "elapsed_seconds": 0.0,
                    "remaining_seconds": float(task.timeout_seconds), "exceeded": False},
         "workstream": options.workstream,
@@ -2322,7 +2532,7 @@ def progress(report: Dict[str, Any], phase: str) -> None:
     observation._atomic_json(path, previous)
 
 
-def native_gate(options, report, worktree, sandbox, verify_env, secrets, deadline):
+def native_gate(options, report, worktree, sandbox, verify_env, secrets, deadline, wrapper=None):
     directory = Path(report["report_dir"])
     progress(report, "native_preflight")
     gate_started = time.monotonic()
@@ -2331,6 +2541,9 @@ def native_gate(options, report, worktree, sandbox, verify_env, secrets, deadlin
         nonlocal counter
         counter += 1
         wrapped = verification_argv(sandbox, options.codex_bin, worktree, argv)
+        # Native steps build, install and run what the model wrote: same deny wrapper.
+        if wrapper is not None:
+            wrapped = wrapper.wrap(wrapped)
         # Full-host native qualification runs the real toolchain with the plain verification
         # environment; the legacy confined backend keeps its Foundation-home sandbox.
         env = (full_host_env(verify_env)
@@ -2339,6 +2552,8 @@ def native_gate(options, report, worktree, sandbox, verify_env, secrets, deadlin
         result = run_bounded(wrapped, cwd=worktree, env=env,
                              timeout=deadline.require("native preflight command"))
         output = redact((result["stdout"] + b"\n" + result["stderr"]).decode("utf-8", "replace"), secrets)
+        if wrapper is not None:
+            wrapper.collect(output, f"native step {counter}")
         log = directory / f"native-command-{counter}.log"
         log.write_text(output, encoding="utf-8")
         report["logs"].append(str(log))
@@ -2375,6 +2590,9 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     lease_update(lease, report_dir=str(report_dir))
     progress(report, "model_preflight")
     deadline.require("preflight")
+    # The user's permissions list is local configuration read before anything else is spent on
+    # the job: a list that cannot be used, or that would hide what the job needs, refuses it.
+    perms = load_job_permissions(options)
     # The installed Codex must run the qualified invocation before anything else is spent on
     # the job, a model load included.
     report["codex_compat"] = codex_compat(options.codex_bin, run=options.codex_run)
@@ -2492,6 +2710,10 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
                               report_dir / "policy-check.last-message.txt",
                               loaded["overrides"], list(loaded["environment"]), catalog_path),
                   profile, context_window, catalog)
+    # Every process that runs model-influenced code from here on (the worker, each check, each
+    # native step) runs behind the job's deny wrapper; the self-check above saw the inner argv.
+    wrapper = setup_deny_wrapper(options, report, perms, report_dir, worktree, codex_home,
+                                 verify_env, secrets, deadline)
     sandbox = probe_sandbox(options.codex_bin, worktree, verify_env, secrets, deadline)
     if not options.verify:
         sandbox = dict(sandbox)
@@ -2500,15 +2722,20 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     if options.apple_simulator_udid is not None:
         sandbox = _apple_opt_in(options, report, report_dir, worktree, sandbox, verify_env,
                                 secrets, deadline)
+    sandbox = dict(sandbox, deny_list_applied=wrapper.applied)
+    if wrapper.applied and sandbox.get("backend") == FULL_HOST_BACKEND:
+        sandbox["confinement"] = FULL_HOST_DENY_CONFINEMENT
+    report["sandbox"] = sandbox
 
     if options.apple_simulator_udid is not None:
-        native_gate(options, report, worktree, sandbox, verify_env, secrets, deadline)
+        native_gate(options, report, worktree, sandbox, verify_env, secrets, deadline, wrapper)
         if options.preflight_only:
             report["status"] = "ready"
             report["qualification_only"] = True
             report["primary_fingerprint_after"] = primary_fingerprint(task.repo_path)
             report["primary_unchanged"] = report["primary_fingerprint_after"] == report["primary_fingerprint_before"]
-            if not report["primary_unchanged"]:
+            report["primary_changed_during_job"] = not report["primary_unchanged"]
+            if not report["primary_unchanged"] and not wrapper.applied:
                 report["status"] = "audit_violation"
             return
 
@@ -2574,7 +2801,7 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         jsonl_path = report_dir / f"attempt-{attempt_number}.jsonl"
         prompt_path = report_dir / f"attempt-{attempt_number}.prompt.txt"
         stderr_path = report_dir / f"attempt-{attempt_number}.stderr.txt"
-        last_path = report_dir / f"attempt-{attempt_number}.last-message.txt"
+        last_path = last_message_path(report_dir, attempt_number)
         prompt_path.write_text(redact(prompt, secrets), encoding="utf-8")
         argv = worker_argv(options.codex_bin, worktree, profile, context_window, last_path,
                            loaded["overrides"], list(loaded["environment"]), catalog_path)
@@ -2594,8 +2821,8 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
             if stream is not None:
                 stream.start_attempt(report["job_id"])
             report["_active_attempt"] = {"before_patch": patch_before}
-            result = run_bounded(argv, cwd=worktree, env=env, timeout=attempt_timeout,
-                                 stdin_data=prompt.encode("utf-8"))
+            result = run_bounded(wrapper.wrap(argv), cwd=worktree, env=env,
+                                 timeout=attempt_timeout, stdin_data=prompt.encode("utf-8"))
         except BaseException:
             observer.finish(status="failed")
             snapshot = observer.snapshot()
@@ -2611,6 +2838,8 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         stderr_text = redact(result["stderr"].decode("utf-8", "replace"), secrets)
         jsonl_path.write_text(stdout_text, encoding="utf-8")
         stderr_path.write_text(stderr_text, encoding="utf-8")
+        for text in [*worker_command_outputs(stdout_text), stderr_text]:
+            wrapper.collect(text, f"worker attempt {attempt_number}")
         evidence = parse_worker_log(stdout_text)
         report["tooling"] = tools.mark_observations(report.get("tooling"), stdout_text)
         observer.record_event_evidence(evidence)
@@ -2688,13 +2917,14 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         if options.verify:
             progress(report, "verification")
             tests = run_verification(task, worktree, verify_env, options.codex_bin, sandbox,
-                                     secrets, deadline)
+                                     secrets, deadline, wrapper)
             for test in tests:
                 text = test.pop("output_text", "")
                 # Keep the evidence for anything that actually ran, confined or not: an
                 # executed full-host command is the primary evidence of a full-host job.
                 if test.get("status") not in ("passed", "failed"):
                     continue
+                wrapper.collect(text, f"verification attempt {attempt_number} command {test['log']}")
                 log_path = report_dir / f"verify-attempt-{attempt_number}-{test['log']}.log"
                 try:
                     log_path.write_text(text, encoding="utf-8")
@@ -2755,6 +2985,7 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     report["primary_fingerprint_after"] = primary_fingerprint(task.repo_path)
     report["primary_unchanged"] = (report["primary_fingerprint_after"]
                                    == report["primary_fingerprint_before"])
+    report["primary_changed_during_job"] = not report["primary_unchanged"]
     left = deadline.remaining()
     report["budget"] = {
         "total_seconds": deadline.total_seconds,
@@ -2776,9 +3007,11 @@ def decide_status(report: Dict[str, Any], worker_ok: bool) -> str:
     statuses = [test.get("status") for test in report["tests"]]
     all_passed = bool(statuses) and all(status == "passed" for status in statuses)
     budget_exceeded = bool((report.get("budget") or {}).get("exceeded"))
-    # A changed primary checkout is a policy violation no matter what else happened, and it
-    # is checked first so it can never be reported as success.
-    if report.get("primary_unchanged") is False:
+    # Without the deny wrapper a changed primary checkout is a policy violation no matter what
+    # else happened, checked first so it can never be reported as success. With the wrapper
+    # applied the worker could not write it, so the change came from the parent or the user: it
+    # is reported (``primary_changed_during_job``) and not attributed (spec §6.10).
+    if report.get("primary_unchanged") is False and not deny_list_applied(report):
         return "audit_violation"
     if report["violations"]:
         return "audit_violation"
@@ -2833,9 +3066,10 @@ def describe_failure(report: Dict[str, Any]) -> str:
     if report.get("failure_reason"):
         return str(report["failure_reason"])
     parts: List[str] = []
-    if report.get("primary_unchanged") is False:
+    if report.get("primary_unchanged") is False and not deny_list_applied(report):
         parts.append("the primary checkout changed during the job: HEAD, index or the content "
-                     "of a dirty file differs from before the job started")
+                     "of a dirty file differs from before the job started, and the deny list "
+                     "was not applied, so the worker cannot be ruled out")
     for violation in report.get("violations", [])[:5]:
         parts.append(f"audit violation {violation.get('path')} ({violation.get('reason')})")
     for attempt in report.get("attempts", []):
@@ -2974,7 +3208,9 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
                     stream.record_attempt(report["job_id"], has_patch=bool(final_audit.patch) and final_audit.patch != unfinished["before_patch"] and not final_audit.violations)
                 report["primary_fingerprint_after"] = primary_fingerprint(options.task.repo_path)
                 report["primary_unchanged"] = report["primary_fingerprint_after"] == report["primary_fingerprint_before"]
-                if final_audit.violations or not report["primary_unchanged"]:
+                report["primary_changed_during_job"] = not report["primary_unchanged"]
+                if final_audit.violations or (not report["primary_unchanged"]
+                                              and not deny_list_applied(report)):
                     report["status"] = "audit_violation"
             except (LauncherError, policy.PolicyStop, OSError) as audit_error:
                 report["status"] = "audit_violation"
@@ -3148,6 +3384,16 @@ def summary_lines(report: Dict[str, Any]) -> List[str]:
         lines.append(f"violation: {violation['path']} ({violation['reason']})")
     for test in report.get("tests", []):
         lines.append(f"test {json.dumps(test['command'])}: {test['status']}")
+    record = report.get("permissions") or {}
+    if record.get("deny_list_applied"):
+        lines.append(f"permissions: deny list applied, {len(record.get('denials') or [])} "
+                     "denial(s)")
+    else:
+        lines.append(f"permissions: deny list NOT applied ({record.get('reason') or 'no reason recorded'})")
+    if report.get("primary_changed_during_job"):
+        lines.append("primary checkout: changed during job, not attributed"
+                     if record.get("deny_list_applied") else
+                     "primary checkout: changed during job (deny list not applied)")
     sandbox = report.get("sandbox") or {}
     if sandbox.get("backend") == FULL_HOST_BACKEND:
         lines.append(f"backend: {FULL_HOST_BACKEND} confined=no network=enabled "

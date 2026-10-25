@@ -96,14 +96,15 @@ class TerminalRun(sp.FakeRun):
     """A worker that documents a terminal failure and still exits 0."""
 
     def __call__(self, argv, *, cwd, env, timeout, stdin_data=None):
-        if list(argv)[1:2] != ["exec"]:
+        inner, _ = sp.deny_wrapped([str(item) for item in argv])
+        if inner[1:2] != ["exec"]:
             return super().__call__(argv, cwd=cwd, env=env, timeout=timeout,
                                     stdin_data=stdin_data)
         self.exec_calls += 1
         if self.worker_edit:
             self.worker_edit(Path(cwd), self.exec_calls)
         events = [{"type": "thread.started", "thread_id": "thr-1"},
-                  {"type": "turn.completed", "model": sp.worker_model(argv),
+                  {"type": "turn.completed", "model": sp.worker_model(inner),
                    "usage": {"input_tokens": 11, "output_tokens": 7}},
                   {"type": "turn.failed", "error": {"message": "the turn was aborted"}}]
         return sp.result(list(argv), 0, "".join(json.dumps(e) + "\n" for e in events))

@@ -238,7 +238,7 @@ class Profile(PermissionsCase):
         statements = text.splitlines()
         self.assertEqual(statements[:2], ["(version 1)", "(allow default)"])
         for line in statements[2:]:
-            self.assertRegex(line, r"^\((deny file-read\*|deny file-write\*|allow file-write\*) ")
+            self.assertRegex(line, r"^\((deny file-read\*|deny file-write\*|allow file-write\*|deny file-clone) ")
         allows = [line for line in statements if line.startswith("(allow ")]
         self.assertEqual(allows, ["(allow default)",
                                   f'(allow file-write* (subpath "{real(self.repo)}/.git"))'])
@@ -321,7 +321,7 @@ class Profile(PermissionsCase):
         perms = dataclasses.replace(self.perms, deny_read=[str(vault)])
         text = permissions.seatbelt_profile(perms, primary_repo=self.repo)
         self.assertIn(f'(deny file-write* (subpath "{real(vault)}"))', text.splitlines())
-        (literals,) = [line for line in text.splitlines() if "(literal " in line and "/.git/HEAD" not in line]
+        literals = text.splitlines()[-1]  # the rename protection is the last statement
         for guarded in [real(vault), real(vault.parent), real(self.root), "/"]:
             self.assertIn(f'(literal "{guarded}")', literals)
         self.assertTrue(literals.startswith("(deny file-write* "))
@@ -398,6 +398,119 @@ class Profile(PermissionsCase):
             permissions.seatbelt_profile(dataclasses.replace(self.perms, mode="sandboxed"),
                                          primary_repo=self.repo)
         self.assertIn("sandboxed mode is reserved", str(caught.exception))
+
+    def test_the_docstring_states_that_missing_parents_of_hidden_paths_cannot_be_created(self):
+        doc = " ".join(permissions.seatbelt_profile.__doc__.split())
+        self.assertIn("~/.docker", doc)
+        self.assertIn("cannot be created", doc)
+
+
+class StateProtection(PermissionsCase):
+    """R16: a wrapped process cannot write the launcher's state, only this job's own paths."""
+
+    def setUp(self):
+        super().setUp()
+        self.report_dir = self.state / "reports" / "job-1"
+        self.worktree = self.state / "worktrees" / "job-1"
+        for directory in (self.report_dir, self.worktree):
+            directory.mkdir(parents=True)
+        self.allowed = [self.worktree, self.report_dir / "codex-home",
+                        self.report_dir / "attempt-1.last-message.txt"]
+
+    def profile(self, perms=None, allowed=None):
+        return permissions.seatbelt_profile(perms or self.perms, primary_repo=self.repo,
+                                            state_dir=self.state,
+                                            allowed_writes=self.allowed if allowed is None else allowed)
+
+    def test_the_state_directory_is_write_denied_and_only_this_jobs_paths_reopened(self):
+        lines = self.profile().splitlines()
+        state = real(self.state)
+        deny = lines.index(f'(deny file-write* (subpath "{state}"))')
+        reopen = lines[deny + 1]
+        self.assertEqual(reopen, "(allow file-write* " + " ".join(
+            f'(subpath "{real(path)}")' for path in self.allowed) + ")")
+
+    def test_the_state_rules_come_before_every_rule_that_must_outrank_them(self):
+        """A job path can never re-open the primary checkout or a hidden path."""
+        lines = self.profile().splitlines()
+        state = real(self.state)
+        reopen = [i for i, line in enumerate(lines) if line.startswith("(allow file-write* ")
+                  and state in line]
+        primary = lines.index(f'(deny file-write* (subpath "{real(self.repo)}"))')
+        hidden = [i for i, line in enumerate(lines) if line.startswith("(deny file-write* (subpath")
+                  and real(os.path.expanduser("~/.ssh")) in line]
+        self.assertLess(reopen[0], primary)
+        self.assertLess(reopen[0], hidden[0])
+
+    def test_paths_outside_the_state_directory_are_not_reopened(self):
+        """They are writable already; one *above* the state (a TMPDIR that holds it) would
+        otherwise re-open the whole state directory."""
+        above = self.root
+        outside = self.root / "elsewhere"
+        text = self.profile(allowed=[above, outside, self.state, self.worktree])
+        (reopen,) = [line for line in text.splitlines() if line.startswith("(allow file-write* ")
+                     and real(self.state) in line]
+        self.assertEqual(reopen, f'(allow file-write* (subpath "{real(self.worktree)}"))')
+        self.assertNotIn(f'(subpath "{real(above)}")', text)
+        self.assertNotIn(f'(subpath "{real(outside)}")', text)
+
+    def test_nothing_inside_the_state_to_reopen_writes_no_allow(self):
+        text = self.profile(allowed=[])
+        self.assertIn(f'(deny file-write* (subpath "{real(self.state)}"))', text)
+        self.assertEqual([line for line in text.splitlines() if line.startswith("(allow file-write*")],
+                         [f'(allow file-write* (subpath "{real(self.repo)}/.git"))'])
+
+    def test_the_state_its_parents_and_the_permissions_files_cannot_be_moved(self):
+        rename = self.profile().splitlines()[-1]
+        state = real(self.state)
+        for guarded in (state, f"{state}/permissions.json", f"{state}/permissions.log",
+                        real(self.state.parent), "/"):
+            with self.subTest(guarded=guarded):
+                self.assertIn(f'(literal "{guarded}")', rename)
+        self.assertTrue(rename.startswith("(deny file-write* (literal "))
+
+    def test_without_a_state_directory_the_profile_is_the_task_8_profile(self):
+        self.assertEqual(permissions.seatbelt_profile(self.perms, primary_repo=self.repo),
+                         permissions.seatbelt_profile(self.perms, primary_repo=self.repo,
+                                                      state_dir=None, allowed_writes=()))
+        self.assertNotIn(real(self.state), permissions.seatbelt_profile(self.perms,
+                                                                        primary_repo=self.repo))
+
+
+class PlantingAndCloning(PermissionsCase):
+    """R18: no hook can be planted in the primary checkout, no hidden file cloned out."""
+
+    def test_hooks_info_modules_and_alternates_are_shut_after_the_git_reopening(self):
+        lines = permissions.seatbelt_profile(self.perms, primary_repo=self.repo).splitlines()
+        git = real(self.repo) + "/.git"
+        reopen = lines.index(f'(allow file-write* (subpath "{git}"))')
+        (planting,) = [i for i, line in enumerate(lines) if f'(subpath "{git}/hooks")' in line]
+        self.assertGreater(planting, reopen)
+        self.assertEqual(lines[planting], f'(deny file-write* (subpath "{git}/hooks") '
+                                          f'(subpath "{git}/info") (subpath "{git}/modules") '
+                                          f'(literal "{git}/objects/info/alternates"))')
+
+    def test_no_planting_rule_without_primary_protection(self):
+        text = permissions.seatbelt_profile(
+            dataclasses.replace(self.perms, protect_primary_checkout=False), primary_repo=self.repo)
+        self.assertNotIn("/.git/hooks", text)
+
+    def test_cloning_a_hidden_path_or_any_parent_of_one_is_denied(self):
+        vault = self.root / "outer" / "vault"
+        vault.mkdir(parents=True)
+        perms = dataclasses.replace(self.perms, deny_read=[str(vault)])
+        lines = permissions.seatbelt_profile(perms, primary_repo=self.repo).splitlines()
+        (clone,) = [line for line in lines if line.startswith("(deny file-clone ")]
+        for parent in [real(vault.parent), real(self.root), "/"]:
+            self.assertIn(f'(literal "{parent}")', clone)
+        self.assertIn(f'(subpath "{real(vault)}")', clone)
+        self.assertNotIn(f'(literal "{real(vault)}")', clone)
+        self.assertLess(lines.index(clone), len(lines) - 1)  # the rename rule stays last
+
+    def test_nothing_hidden_means_no_clone_rule(self):
+        text = permissions.seatbelt_profile(dataclasses.replace(self.perms, deny_read=[]),
+                                            primary_repo=self.repo)
+        self.assertNotIn("file-clone", text)
 
 
 class Conflicts(PermissionsCase):
@@ -677,6 +790,49 @@ class FindDenials(PermissionsCase):
     def test_empty_text_has_no_denials(self):
         self.assertEqual(permissions.find_denials("", self.perms, self.repo), [])
 
+    def test_a_rename_reports_both_denied_paths_and_not_the_word_between_them(self):
+        repo = real(self.repo)
+        self.assertEqual(self.find(f"mv: rename {repo}/a.py to {repo}/b.py: Operation not permitted"),
+                         [{"path": f"{repo}/a.py", "kind": "write"},
+                          {"path": f"{repo}/b.py", "kind": "write"}])
+        self.assertEqual(self.find(f"mv: rename {self.vault}/s3 to /x/out: Operation not permitted"),
+                         [{"path": f"{self.vault}/s3", "kind": "read"}])
+
+    def test_the_sentence_after_a_path_is_not_part_of_it(self):
+        repo = real(self.repo)
+        cases = {
+            f"error: could not open {repo}/a.py for writing: Operation not permitted": f"{repo}/a.py",
+            f"open {repo}/x failed (Operation not permitted)": f"{repo}/x",
+            f"error: couldn't create {repo}/y (Operation not permitted)": f"{repo}/y",
+            f"cp {repo}/a -> {repo}: Operation not permitted": f"{repo}/a",
+            f"Error Domain=NSCocoaErrorDomain Code=513 UserInfo={{NSFilePath={repo}/z.swift, "
+            f'NSUnderlyingError=0x6 {{Error Domain=NSPOSIXErrorDomain Code=1 "Operation not permitted"}}}}':
+                f"{repo}/z.swift",
+        }
+        for line, path in cases.items():
+            with self.subTest(line=line):
+                self.assertEqual(self.find(line)[0], {"path": path, "kind": "write"})
+
+    def test_a_capitalised_or_prose_word_inside_a_path_name_survives(self):
+        with mock.patch.dict(os.environ, {"HOME": str(self.root)}):
+            perms = dataclasses.replace(self.perms, deny_read=["~/Library/Application Support/Google/Chrome"])
+            login = f"{self.root}/Library/Application Support/Google/Chrome/Default/Login Data"
+            nested = f"{self.root}/Library/Application Support/Google/Chrome/notes to self/for me.txt"
+            found = self.find(f"mv: rename {login} to /tmp/x: Operation not permitted",
+                              f"cat: {nested}: Operation not permitted", perms=perms)
+        # A prose word with more path after it ("notes to self/...") is part of a name.
+        self.assertEqual(found, [{"path": login, "kind": "read"}, {"path": nested, "kind": "read"}])
+
+    def test_a_write_into_the_state_directory_is_reported_when_it_is_given(self):
+        state = real(self.state)
+        line = f"touch: {state}/permissions.json: Operation not permitted"
+        self.assertEqual(self.find(line), [])
+        self.assertEqual(permissions.find_denials(line, self.perms, self.repo, state_dir=self.state),
+                         [{"path": f"{state}/permissions.json", "kind": "write"}])
+        unprotected = dataclasses.replace(self.perms, protect_primary_checkout=False)
+        self.assertEqual(permissions.find_denials(line, unprotected, self.repo, state_dir=self.state),
+                         [{"path": f"{state}/permissions.json", "kind": "write"}])
+
 
 @unittest.skipUnless(sys.platform == "darwin" and permissions.wrapper_available(), "Seatbelt only")
 class RealWrapper(PermissionsCase):
@@ -893,6 +1049,105 @@ class RealWrapper(PermissionsCase):
         outcome = self.sandboxed(profile, ["/bin/cat", str(vault / "s")])
         self.assert_not_readable(outcome, b"SECRET")
         self.assertIn(b"Operation not permitted", outcome.stderr)
+
+    def state_profile(self, perms):
+        """A profile with the launcher state shut and one job's own paths re-opened."""
+        self.job_report = self.state / "reports" / "job-1"
+        self.job_tree = self.state / "worktrees" / "job-1"
+        self.other_tree = self.state / "worktrees" / "job-0"
+        for directory in (self.job_report / "codex-home", self.job_tree, self.other_tree):
+            directory.mkdir(parents=True, exist_ok=True)
+        self.last_message = self.job_report / "attempt-1.last-message.txt"
+        profile = self.root / "state.sb"
+        profile.write_text(permissions.seatbelt_profile(
+            perms, primary_repo=self.repo, state_dir=self.state,
+            allowed_writes=[self.job_tree, self.job_report / "codex-home", self.last_message,
+                            Path(os.environ.get("TMPDIR", "/tmp"))]), encoding="utf-8")
+        probe = subprocess.run(permissions.wrap_argv(["/usr/bin/true"], profile), capture_output=True)
+        if probe.returncode == NESTED_SANDBOX:
+            self.skipTest("already inside a sandbox")
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        return profile
+
+    def test_the_launcher_state_cannot_be_written_but_the_jobs_own_paths_can(self):
+        profile = self.state_profile(self.perms)
+        before = self.file.read_bytes()
+        write = ["/bin/sh", "-c", 'echo x >> "$1"', "sh"]
+        denied = {
+            "permissions.json": self.sandboxed(profile, ["/usr/bin/touch", str(self.file)]),
+            "append permissions.json": self.sandboxed(profile, write + [str(self.file)]),
+            "permissions.log": self.sandboxed(profile, write + [str(self.state / "permissions.log")]),
+            "report.json": self.sandboxed(profile, write + [str(self.job_report / "report.json")]),
+            "another job's worktree": self.sandboxed(profile, write + [str(self.other_tree / "a")]),
+            "a lock": self.sandboxed(profile, write + [str(self.state / "worker.lock")]),
+            "move the state": self.sandboxed(profile, ["/bin/mv", str(self.state), str(self.root / "s2")]),
+            "replace permissions.json": self.sandboxed(profile, ["/bin/sh", "-c",
+                'echo "{}" > "$2" && mv "$2" "$1"', "sh", str(self.file), str(self.root / "decoy")]),
+        }
+        for name, outcome in denied.items():
+            with self.subTest(denied=name):
+                self.assertNotEqual(outcome.returncode, 0)
+                self.assertIn(b"Operation not permitted", outcome.stderr)
+        self.assertEqual(self.file.read_bytes(), before)
+        self.assertTrue(self.state.is_dir())
+        allowed = {
+            "worktree": write + [str(self.job_tree / "add.py")],
+            "codex home": write + [str(self.job_report / "codex-home" / "log")],
+            "last message": write + [str(self.last_message)],
+            "elsewhere": write + [str(self.root / "elsewhere.txt")],
+        }
+        for name, argv in allowed.items():
+            with self.subTest(allowed=name):
+                outcome = self.sandboxed(profile, argv)
+                self.assertEqual(outcome.returncode, 0, outcome.stderr)
+
+    def test_cloning_a_parent_of_a_hidden_path_cannot_copy_it_out(self):
+        perms, vault, _, deep = self.hidden_tree()
+        plain = deep.parent / "plain.txt"
+        plain.write_text("plain\n")
+        profile = self.write_profile(perms)
+        out = sp.tmpdir()  # outside every source, so a clone is never into itself
+        self.addCleanup(sp.cleanup, out)
+        clone = ("import ctypes, sys\n"
+                 "libc = ctypes.CDLL(None, use_errno=True)\n"
+                 "rc = libc.clonefile(sys.argv[1].encode(), sys.argv[2].encode(), 0)\n"
+                 "sys.exit(0 if rc == 0 else ctypes.get_errno())\n")
+        for source, target, leak in ((self.root, out / "root", out / "root" / "vault" / "Secret.txt"),
+                                     (deep.parent, out / "outer", out / "outer" / "inner" / "token"),
+                                     (deep, out / "inner", out / "inner" / "token"),
+                                     (vault, out / "vault", out / "vault" / "Secret.txt")):
+            with self.subTest(source=str(source)):
+                outcome = self.sandboxed(profile, [sys.executable, "-c", clone, str(source), str(target)])
+                self.assertEqual(outcome.returncode, 1, outcome.stderr)  # EPERM
+                self.assertFalse(leak.exists())
+        copied = self.sandboxed(profile, ["/bin/cp", "-c", str(plain), str(out / "plain.txt")])
+        self.assertEqual(copied.returncode, 0, copied.stderr)
+        self.assertEqual((out / "plain.txt").read_text(), "plain\n")
+
+    def test_no_hook_can_be_planted_while_a_linked_worktree_still_commits(self):
+        worktree = self.root / "wt"
+        sp.git(self.repo, "worktree", "add", "-q", "--detach", str(worktree))
+        profile = self.write_profile(dataclasses.replace(self.perms, deny_read=[]))
+        git_dir = self.repo / ".git"
+        (git_dir / "modules").mkdir(exist_ok=True)
+        write = ["/bin/sh", "-c", 'mkdir -p "$(dirname "$1")" ; echo "#!/bin/sh" > "$1"', "sh"]
+        for planted in (git_dir / "hooks" / "post-checkout", git_dir / "info" / "attributes",
+                        git_dir / "objects" / "info" / "alternates",
+                        git_dir / "modules" / "sub" / "hooks" / "post-checkout"):
+            with self.subTest(planted=str(planted.relative_to(git_dir))):
+                outcome = self.sandboxed(profile, write + [str(planted)])
+                self.assertNotEqual(outcome.returncode, 0)
+                self.assertIn(b"Operation not permitted", outcome.stderr)
+                self.assertFalse(planted.exists())
+        moved = self.sandboxed(profile, ["/bin/mv", str(git_dir / "hooks"), str(self.root / "hooks")])
+        self.assertNotEqual(moved.returncode, 0)
+        (worktree / "new.txt").write_text("n")
+        git = ["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"]
+        add = self.sandboxed(profile, git + ["-C", str(worktree), "add", "new.txt"])
+        commit = self.sandboxed(profile, git + ["-C", str(worktree), "commit", "-q", "-m", "from worktree"])
+        self.assertEqual((add.returncode, commit.returncode), (0, 0), (add.stderr, commit.stderr))
+        self.assertNotEqual(sp.git(worktree, "rev-parse", "HEAD").stdout,
+                            sp.git(self.repo, "rev-parse", "main").stdout)
 
     def test_an_awkward_path_is_escaped_so_seatbelt_parses_and_still_denies(self):
         parent = self.root / 'with space "quote" ü'

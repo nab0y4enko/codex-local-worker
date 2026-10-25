@@ -355,23 +355,51 @@ def worker_model(argv):
     return argv[argv.index("-m") + 1] if "-m" in argv else MODEL
 
 
+# The job's deny wrapper: ``sandbox-exec -f <report_dir>/permissions.sb <command...>``, probed
+# once per job with this trivial command before anything model-influenced runs under it.
+DENY_PROFILE_NAME = "permissions.sb"
+WRAPPER_PROBE = ["/usr/bin/true"]
+
+
+def deny_wrapped(argv):
+    """``(inner argv, True)`` when ``argv`` is a command run under the job's deny profile, else
+    ``(argv, False)``. The legacy Apple backend's own ``sandbox-exec`` profile is not stripped."""
+    if (len(argv) > 3 and argv[0] == lw.permissions.SANDBOX_EXEC and argv[1] == "-f"
+            and Path(argv[2]).name == DENY_PROFILE_NAME):
+        return argv[3:], True
+    return argv, False
+
+
 class FakeRun:
-    """Stand-in for run_bounded: the worker and the sandbox are mocked, every git call is real."""
+    """Stand-in for run_bounded: the worker and the sandbox are mocked, every git call is real.
+
+    A command wrapped in the job's deny profile is recorded and answered as its inner command:
+    each call keeps ``argv`` (the inner command, so ``calls_of`` works whether or not the wrapper
+    was applied), ``raw_argv`` (exactly what the launcher ran) and ``wrapped``. The wrapper probe
+    answers ``wrapper_rc`` (71 is ``sandbox-exec`` failing to apply the profile).
+    """
 
     def __init__(self, worker_rc=0, test_rc=0, probe_ok=True, worker_edit=None,
-                 worker_timed_out=False, worker_stderr="", apple=None, routed_model=None):
+                 worker_timed_out=False, worker_stderr="", apple=None, routed_model=None,
+                 wrapper_rc=0, wrapper_stderr=""):
         self.worker_rc, self.test_rc, self.probe_ok = worker_rc, test_rc, probe_ok
         # The model the worker's events name: the job's own ``-m`` model unless a test routes
         # the worker somewhere else on purpose.
         self.routed_model = routed_model
         self.worker_edit, self.worker_timed_out, self.worker_stderr = (worker_edit,
             worker_timed_out, worker_stderr)
+        self.wrapper_rc, self.wrapper_stderr = wrapper_rc, wrapper_stderr
         # Knobs for the mocked /usr/bin/sandbox-exec backend: devices, verdicts, failures.
         self.apple = dict(apple or {})
         self.calls, self.exec_calls = [], 0
 
     def calls_of(self, kind):
         return [call for call in self.calls if call["argv"][1:2] == [kind]]
+
+    def verification_calls(self):
+        """Every command the launcher ran that is neither the worker nor a readiness probe: the
+        contract's verification commands (and native steps, which take the same path here)."""
+        return [call for call in self.calls if call.get("kind") == "verification"]
 
     def apple_calls(self):
         return [call for call in self.calls if call["argv"][0] == lw.apple.SANDBOX_EXEC]
@@ -436,27 +464,45 @@ class FakeRun:
         # verdict the mocked codex sandbox gives, so pass/fail knobs stay comparable.
         return result(argv, self.test_rc, "Ran 1 test OK\n")
 
+    def worker_jsonl(self, argv, cwd, attempt):
+        """The worker's JSONL stdout for one attempt (a subclass can add events)."""
+        return json.dumps({"type": "turn.completed",
+                           "model": self.routed_model or worker_model(argv),
+                           "usage": {"input_tokens": 11, "output_tokens": 7}}) + "\n"
+
+    def verification_output(self, argv, cwd):
+        """What a verification command prints (a subclass can change it)."""
+        return "Ran 1 test OK\n"
+
     def __call__(self, argv, *, cwd, env, timeout, stdin_data=None):
-        argv = [str(item) for item in argv]
-        self.calls.append({"argv": argv, "cwd": Path(cwd) if cwd else None, "env": dict(env),
-                           "timeout": timeout, "stdin": (stdin_data or b"").decode("utf-8", "replace")})
+        raw = [str(item) for item in argv]
+        argv, wrapped = deny_wrapped(raw)
+        call = {"argv": argv, "raw_argv": raw, "wrapped": wrapped,
+                "cwd": Path(cwd) if cwd else None, "env": dict(env), "timeout": timeout,
+                "stdin": (stdin_data or b"").decode("utf-8", "replace")}
+        self.calls.append(call)
+        if wrapped and argv == WRAPPER_PROBE:
+            call["kind"] = "wrapper_probe"
+            return result(raw, self.wrapper_rc, "", self.wrapper_stderr)
         if argv[0] == lw.apple.SANDBOX_EXEC:
+            call["kind"] = "apple"
             return self._sandbox_exec(argv)
         if argv == list(lw.FULL_HOST_PROBE_ARGV):
             # The default readiness probe is one trivial command on the host: answer it the way
             # the host would, so ``probe_ok`` still decides whether execution is available.
+            call["kind"] = "probe"
             return result(argv, 0 if self.probe_ok else 1,
                           lw.PROBE_MARKER if self.probe_ok else "full host refused")
         if argv[1:2] == ["sandbox"] and lw.PROBE_MARKER in argv:
+            call["kind"] = "probe"
             return result(argv, 0 if self.probe_ok else 1,
                           lw.PROBE_MARKER if self.probe_ok else "sandbox refused")
         if argv[1:2] == ["exec"]:
+            call["kind"] = "exec"
             self.exec_calls += 1
             if self.worker_edit:
                 self.worker_edit(Path(cwd), self.exec_calls)
-            stream = json.dumps({"type": "turn.completed",
-                                 "model": self.routed_model or worker_model(argv),
-                                 "usage": {"input_tokens": 11, "output_tokens": 7}})
-            return result(argv, self.worker_rc, stream + "\n", self.worker_stderr,
-                          timed_out=self.worker_timed_out)
-        return result(argv, self.test_rc, "Ran 1 test OK\n")
+            return result(argv, self.worker_rc, self.worker_jsonl(argv, cwd, self.exec_calls),
+                          self.worker_stderr, timed_out=self.worker_timed_out)
+        call["kind"] = "verification"
+        return result(argv, self.test_rc, self.verification_output(argv, cwd))
