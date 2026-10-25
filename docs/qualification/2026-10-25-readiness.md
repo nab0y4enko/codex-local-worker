@@ -1,9 +1,10 @@
 # Readiness — 2026-10-25
 
 The **0.3.0 core CLI is qualified on this Mac**. All core review findings are addressed.
-The complete 28-task plan remains open at the optional desktop gate: Task27 has a prepared,
-reviewed protocol spike but no desktop observation; Task28 is conditional and has not started.
-Computer Use denies control of Codex itself, so manual desktop observation is required. This restriction does not establish host capability.
+Tasks 27 (dashboard spike/desktop gate) and 28 (dashboard widget) are **deferred to future work**
+(user decision 2026-10-25); the core CLI is the deliverable. Task27 has a prepared, reviewed
+protocol spike but desktop rendering was never observed, and Task28 has not started. Computer Use
+denies control of Codex itself; this restriction does not establish host capability.
 
 | Check | Result |
 |---|---|
@@ -33,17 +34,17 @@ configuration is not traversed.
 Real cloud authentication refresh/inference and a second Mac were not exercised. Cloud catalog,
 argv and authentication boundaries have synthetic/no-inference coverage. No real Codex-home migration was performed. The user approved the temporary desktop test and
 restart if needed, and explicitly chose to keep cloud tests synthetic. The temporary plugin
-installation and exact rollback passed; desktop UI automation was blocked by policy. A repeat
-installation is being prepared for user manual observation. Desktop rendering is not counted as
-passing. The prepared
+installation and exact rollback passed; desktop UI automation was blocked by policy. No temporary
+plugin is installed now and no repeat installation is planned for this release. Desktop rendering
+was never observed and is not counted as passing. The prepared
 v0.1.2 dashboard spike has seven protocol tests and actual isolated CLI MCP startup/listing
-coverage, but rendering, host modes, PiP and mounted refresh remain unobserved.
+coverage, but rendering, host modes, PiP and mounted refresh remain unobserved (deferred to future work).
 
 Detailed records:
 
 - [Core fixes and exact verification commands](2026-10-25-core-fixes.md)
 - [Cleanup and recovery indexes](2026-10-25-cleanup.md)
-- [Dashboard approval gate and reversible package](2026-10-25-dashboard-spike.md)
+- [Dashboard spike record (deferred)](2026-10-25-dashboard-spike.md)
 - [All recovered continuation rulings](2026-10-25-decisions.md)
 - [Measured usage snapshot and unknown-count caveats](2026-10-25-usage.md)
 

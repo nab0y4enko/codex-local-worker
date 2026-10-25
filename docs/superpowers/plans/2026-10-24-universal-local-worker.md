@@ -1395,9 +1395,11 @@ def test_doctor_reports_every_section(self):
 
 ---
 
-## Phase J — Dashboard widget (later phase; gated)
+## Phase J — Dashboard widget (later phase; deferred to future work)
 
-### Task 27: Spike — MCP Apps widget in Codex desktop (gate)
+### Task 27: Spike — MCP Apps widget in Codex desktop (gate) — DEFERRED
+
+**Deferred — planned for future work (user decision 2026-10-25).** The v0.1.2 spike passed protocol tests and an isolated CLI app-server startup; desktop rendering was never observed (Computer Use policy blocks driving the Codex app) and no temporary plugin is installed now. The core CLI is the deliverable of this release.
 
 **Files:**
 - Create: `spikes/dashboard/server.py` (stdlib stdio MCP server), `spikes/dashboard/widget.html`,
@@ -1414,7 +1416,9 @@ def test_doctor_reports_every_section(self):
 - [ ] **Step 3:** Decide go/no-go in the record. No-go ⇒ stop here; Task 28 is dropped.
 - [ ] **Step 4:** Commit `docs: record the dashboard widget spike`.
 
-### Task 28: Dashboard widget (only after a go)
+### Task 28: Dashboard widget (only after a go) — DEFERRED
+
+**Deferred — planned for future work (user decision 2026-10-25).** The v0.1.2 spike passed protocol tests and an isolated CLI app-server startup; desktop rendering was never observed (Computer Use policy blocks driving the Codex app) and no temporary plugin is installed now. Not started; the core CLI is the deliverable of this release.
 
 **Files:**
 - Create: `src/dashboard/server.py`, `src/dashboard/widget.html`, `.mcp.json`

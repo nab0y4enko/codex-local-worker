@@ -1,4 +1,4 @@
-# Task 26 live qualification — OleksiiacStudio.localdomain
+# Task 26 live qualification — this Mac (Mac Studio)
 
 Date: 2026-10-25T05:24:17.826395-04:00
 Platform: macOS-27.0.1-arm64-arm-64bit arm64

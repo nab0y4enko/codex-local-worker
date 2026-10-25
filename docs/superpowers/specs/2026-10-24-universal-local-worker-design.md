@@ -434,6 +434,8 @@ the writable roots or network access its servers need, recorded in the report.
 
 ### 6.13 Dashboard widget (later phase, Codex desktop only)
 
+**Deferred to future work (user decision 2026-10-25); not part of this release.**
+
 A live dashboard rendered in the Codex desktop conversation through the MCP Apps standard, as
 OpenAI's own `creative-production` plugin does (local MCP server, `ui://` HTML resource with MIME
 `text/html;profile=mcp-app`, host bridge `ui/*` messages, display modes `inline`, `fullscreen`,

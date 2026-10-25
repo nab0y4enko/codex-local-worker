@@ -13,8 +13,8 @@ Commit reviewed changes and push this task branch under the current user complet
 - Plan: `docs/superpowers/plans/2026-10-24-universal-local-worker.md` (28 tasks).
 - Current ignored ledger and all temporary briefs/reviews/logs: `.superpowers/sdd/2026-10-24-universal-local-worker/`.
   Never force-add this workspace. Durable evidence is under `docs/qualification/`.
-- Original ignored R1–R25 ledger was absent at resume; do not invent its wording.
-  Recovered continuation rulings are preserved in `docs/qualification/2026-10-25-decisions.md`.
+- The original R1–R25 rulings (from the git-ignored task ledger) and the recovered continuation rulings
+  are preserved in `docs/qualification/2026-10-25-decisions.md`.
 - Tasks **1–26 complete and reviewed** through `0777c63`, including two Task26 fix/re-review rounds.
   Package version **0.3.0**, sole manifest `.codex-plugin/plugin.json`.
 - Reviewed core/source evidence through `eb77c06` and the prepared dashboard spike pushed to `origin/universal-local-worker`.
@@ -73,28 +73,21 @@ in the ignored ledger folder before continuing. Root must not stage agent source
 
 ## Dashboard gate and remaining sequence
 
-- Task27 prepared/reviewed v0.1.2 spike,7protocoltests plus actual isolated CLI app-server
-  startup/tool-list, no inference. Package `/tmp/codex-dashboard-mcpapps-spike-20261025`;
-  plugin `dashboard-mcpapps-spike-20261025@dashboard-spike-20261025`, distinct from real plugin.
-  Synthetic fixed fixture only, no environment override/symlink escapes. Scope re-review clean.
-- User approved temporary desktop installation/test/removal, and restart if needed. User explicitly
-  chose **Keep cloud tests synthetic**; do not perform launcher cloud inference or live auth refresh.
-- Temporary v0.1.2 plugin was installed and its exact rollback verified; baseline registries restored.
-  Actual desktop rendering remains unobserved: supported Computer Use API explicitly rejects
-  `com.openai.codex` for safety reasons. Do not work around that policy using alternate UI control,
-  debugger, raw IPC, or app modifications. No permissions changed or restart performed.
-- A second identical temporary installation is being prepared solely for USER manual navigation
-  and observation through the app-supported deep-link candidate. Coordinate with Luna desktop_gate;
-  it owns installation/rollback and external evidence. Do not remove it before user observations.
-  No programmatic UI interaction is allowed. After observations, remove exact plugin/marketplace,
-  verify baseline, archive/remove owned temporary package. GO/NO-GO still undecided; Task28 not started.
-  See `docs/qualification/2026-10-25-dashboard-spike.md` and ignored task-27-desktop-report.md.
+- **Tasks 27 and 28 are deferred — planned for future work (user decision 2026-10-25).** The core
+  CLI is the deliverable of this release.
+- Task27 prepared/reviewed v0.1.2 spike: 7 protocol tests plus actual isolated CLI app-server
+  startup/tool-list, no inference. Synthetic fixed fixture only, no environment override/symlink
+  escapes. Scope re-review clean. Record: `docs/qualification/2026-10-25-dashboard-spike.md`.
+- Actual desktop rendering was never observed (supported Computer Use API rejects `com.openai.codex`
+  for safety reasons) and is not counted as passing. Do not work around that policy with alternate UI
+  control, debugger, raw IPC, or app modifications. No permissions changed.
+- A temporary v0.1.2 plugin was installed and rolled back once with registries verified; no temporary
+  plugin is installed now and no second installation is being prepared.
+- User chose to keep cloud tests synthetic; do not perform launcher cloud inference or live auth refresh.
 - Core review, final offline/live/install checks, push and owned-worktree cleanup are complete.
-- Obtain user manual observations of rendering/hostmodes/PiP/mountedrefresh and decide GO/NO-GO;
-  Task28 only after observedGO (or explicit user choice to keep CLI-only). Never fabricate GO.
 - Durable readiness/usage/decisions records distinguish actual/synthetic/skipped/unapproved checks.
-  The whole28-task plan remains incomplete at the desktop27/conditional28 scope.
-  Report missing observations candidly; do not claim the dashboard is qualified.
+  When the dashboard is revisited, obtain real desktop observations (rendering, host modes, PiP,
+  mounted refresh) and decide GO/NO-GO then; never fabricate a GO.
 
 ## Standing boundaries
 
