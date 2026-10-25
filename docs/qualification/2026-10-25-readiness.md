@@ -3,7 +3,7 @@
 The **0.3.0 core CLI is qualified on this Mac**. All core review findings are addressed.
 The complete 28-task plan remains open at the optional desktop gate: Task27 has a prepared,
 reviewed protocol spike but no desktop observation; Task28 is conditional and has not started.
-Missing authorization is not a host capability failure or an observed GO.
+Computer Use denies control of Codex itself, so manual desktop observation is required. This restriction does not establish host capability.
 
 | Check | Result |
 |---|---|
@@ -31,9 +31,11 @@ probes use the job deadline. Base submodules deliberately fail closed as unaudit
 configuration is not traversed.
 
 Real cloud authentication refresh/inference and a second Mac were not exercised. Cloud catalog,
-argv and authentication boundaries have synthetic/no-inference coverage. No real Codex-home
-migration or desktop plugin installation was performed. The desktop test request and separate
-minimal cloud-smoke request remain unanswered; neither is counted as passing. The prepared
+argv and authentication boundaries have synthetic/no-inference coverage. No real Codex-home migration was performed. The user approved the temporary desktop test and
+restart if needed, and explicitly chose to keep cloud tests synthetic. The temporary plugin
+installation and exact rollback passed; desktop UI automation was blocked by policy. A repeat
+installation is being prepared for user manual observation. Desktop rendering is not counted as
+passing. The prepared
 v0.1.2 dashboard spike has seven protocol tests and actual isolated CLI MCP startup/listing
 coverage, but rendering, host modes, PiP and mounted refresh remain unobserved.
 

@@ -1,4 +1,4 @@
-# Handoff: universal local worker (2026-10-25, core qualified; desktop gate pending)
+# Handoff: universal local worker (2026-10-25, core qualified; approved desktop gate awaits manual observation)
 
 ## Objective and instructions
 
@@ -77,18 +77,24 @@ in the ignored ledger folder before continuing. Root must not stage agent source
   startup/tool-list, no inference. Package `/tmp/codex-dashboard-mcpapps-spike-20261025`;
   plugin `dashboard-mcpapps-spike-20261025@dashboard-spike-20261025`, distinct from real plugin.
   Synthetic fixed fixture only, no environment override/symlink escapes. Scope re-review clean.
-- Real desktop **NOT installed/tested**; GO/NO-GO undecided, Task28 not started.
-  Explicit async question allowing temporary desktop installation/test/removal is UNANSWERED.
-  Do not infer a failed capability from missing authorization. Do not restart app or mutate
-  real home without authorization. See `docs/qualification/2026-10-25-dashboard-spike.md`.
-- Separate one-minimal-cloud-smoke async request also UNANSWERED. No launcher cloud inference.
-  Cloud authentication/catalog tested synthetically; actual refresh remains unverified.
+- User approved temporary desktop installation/test/removal, and restart if needed. User explicitly
+  chose **Keep cloud tests synthetic**; do not perform launcher cloud inference or live auth refresh.
+- Temporary v0.1.2 plugin was installed and its exact rollback verified; baseline registries restored.
+  Actual desktop rendering remains unobserved: supported Computer Use API explicitly rejects
+  `com.openai.codex` for safety reasons. Do not work around that policy using alternate UI control,
+  debugger, raw IPC, or app modifications. No permissions changed or restart performed.
+- A second identical temporary installation is being prepared solely for USER manual navigation
+  and observation through the app-supported deep-link candidate. Coordinate with Luna desktop_gate;
+  it owns installation/rollback and external evidence. Do not remove it before user observations.
+  No programmatic UI interaction is allowed. After observations, remove exact plugin/marketplace,
+  verify baseline, archive/remove owned temporary package. GO/NO-GO still undecided; Task28 not started.
+  See `docs/qualification/2026-10-25-dashboard-spike.md` and ignored task-27-desktop-report.md.
 - Core review, final offline/live/install checks, push and owned-worktree cleanup are complete.
-- If desktop test approved, observe rendering/hostmodes/PiP/mountedrefresh and decide GO/NO-GO;
+- Obtain user manual observations of rendering/hostmodes/PiP/mountedrefresh and decide GO/NO-GO;
   Task28 only after observedGO (or explicit user choice to keep CLI-only). Never fabricate GO.
 - Durable readiness/usage/decisions records distinguish actual/synthetic/skipped/unapproved checks.
-  The whole28-task plan remains incomplete only at the approval-gated desktop27/conditional28 scope.
-  If no approval arrives, report this gate candidly; do not claim the dashboard is qualified.
+  The whole28-task plan remains incomplete at the desktop27/conditional28 scope.
+  Report missing observations candidly; do not claim the dashboard is qualified.
 
 ## Standing boundaries
 
