@@ -1,43 +1,72 @@
-# Handoff: universal local worker (2026-10-25)
+# Handoff: universal local worker (2026-10-25, live qualification in progress)
 
-## Where things are
-- Branch `universal-local-worker` (local only, nothing pushed). Base `codex/unify-local-worker` @ dc88cad.
-- Spec: `docs/superpowers/specs/2026-10-24-universal-local-worker-design.md`
-- Plan: `docs/superpowers/plans/2026-10-24-universal-local-worker.md` (28 tasks)
-- Ledger (git-ignored, the recovery map): `.superpowers/sdd/2026-10-24-universal-local-worker/progress.md`
-  holds the pre-flight table, rulings R1–R25, per-task status and deferred minors. Task briefs
-  `task-N-brief.md` for every task are already extracted there, plus reports and review files.
-- Done and reviewed: Tasks 1–8. Task 9: main 193c26f and fix round 1 8d122af. The full suite was 892 OK, and the live wrapper smoke passed.
-- In flight when this was written: Task 9 fix round 2, a Sonnet implementer working on rulings
-  R22–R24 (protect the resolved git common dir, a safe job-file read helper, moving the catalog to
-  the report dir, pre-creating apple-scratch and screenshots, deny_write conflicts, gitlink
-  exclusion). Its findings are in `task-9-review-round1.md`, and it appends to `task-9-report.md`.
-  - **Update:** fix round 2 landed as 7a87b53. The full suite is 939 OK, and the live smoke passed.
-    Its concerns are logged in `task-9-report.md`: harmless `packed-refs.lock` noise on worktree
-    commits, `objects/` stays writable, and gitlink changes are unreported.
-  - **First step on resume:** run a scoped Sonnet re-review of 8d122af..7a87b53 against
-    `task-9-review-round1.md`. If it is clean, add `Task 9: complete` to the ledger and start the T10–12 batch.
+## Objective and instructions
 
-## How to finish
-Process: superpowers:subagent-driven-development. All subagents run on Sonnet (ruling R21).
-- **Batches:** T10–12, T13–14, T15–17, T18–19, T20–22, T23–25, T26, T27–28.
-- **Per batch:** one implementer reads its `task-N-brief.md` files, then one combined reviewer. Fix rounds resume the implementer.
-- **Faster mode:** skip the per-batch reviewer and rely on the final review.
-- **Tests:** `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests`. Python 3.9 stdlib only.
-- **Rulings already made for upcoming tasks:**
-  - R20 (T10): the reaper matches the unwrapped command and follows the current child group.
-  - Carry items: grep "Carry to" in the ledger (T11 bounds `--load` by the deadline, T12 cleans codex-home, T15 classification hints, T21 notifies when the deny list is not applied, T25 fixes the stale "unwrapped" docs, doctor checks the wrapper).
-- **Stop and ask the user:**
-  - Before installing the dashboard into the real Codex desktop (R7).
-  - Before any push.
-- **Finish:**
-  - Final whole-branch review including the deferred minors (R25 root timestamps; out-of-scope items in `task-9-review-round1.md`).
-  - Squash T2 commits 169aa88 and c97a255 before any push.
-  - List every `Ruling:` line in the final summary.
-  - Then superpowers:finishing-a-development-branch.
+User: **Finish all, test on the real local model, analyse results and fix all issues; fully ready tool.**
+Continue with **gpt-6-luna subagents**, explicitly requested instead of historical Sonnet/local-worker routing.
+Use the current primary checkout on `universal-local-worker`; no extra planner worktrees.
+Commit reviewed changes and push this task branch under the current user completion rule; no force push or main-branch merge.
 
-## Standing rules
-- **Commits:** no AI attribution; use Conventional Commits.
-- **Secrets:** never print the oMLX API key; never read `~/.ssh`, the real git config or `~/.omlx/settings.json` values.
-- **Live Codex runs:** use a throwaway CODEX_HOME, make no cloud model calls, and don't touch `~/.codex`.
-- **Completion rule:** the user's commit/push/worktree rule lives in their own `~/.codex/AGENTS.md`. The plugin does not manage it.
+## Recovery map
+
+- Spec: `docs/superpowers/specs/2026-10-24-universal-local-worker-design.md`.
+- Plan: `docs/superpowers/plans/2026-10-24-universal-local-worker.md`.
+- Current ignored ledger: `.superpowers/sdd/2026-10-24-universal-local-worker/progress.md`.
+- Briefs, reports, reviews and logs live beside the ledger. Do not force-add this temporary workspace to Git.
+- Original ignored ledger/reviews R1–R25 were missing at resume. Their wording cannot be recovered or invented.
+  The current ledger reconstructs completed work from the earlier handoff and commits, then records this continuation.
+- Tasks **1–25 complete and reviewed**. Do not redispatch them. Reviewed product code through `b9484c4`;
+  `3830bd7` removes accidentally tracked temporary evidence while keeping local copies. Those changes are pushed.
+- Package version **0.3.0**; first-party manifest `.codex-plugin/plugin.json`.
+- Latest full offline run: **960 tests, OK, 135.916s**. Later focused checks 85/21 and archive-install check passed.
+  The install check verifies exact archived manifest version plus all three skills using disposable HOME/CODEX_HOME.
+
+## Current work: Task 26
+
+Luna implementer `task26_live` is building/running live qualification and fixing observed failures.
+Its report and compact jobs manifest will be in the ignored plan workspace; read them before further work.
+Supporting native plan: `native-live-pilot-plan.md`. Read-only dashboard investigation: `dashboard-readiness.md`.
+
+- oMLX app was started; actual model discovered/loaded: `Qwen3.8-Flash-Next-UD-Q4_K_XL`,
+  alias `qwen-3.8-nf-splash`, context 262144, fallback disabled. Rediscover live; do not hardcode this into product code.
+- Own qualification root: `~/.local/share/codex-local-worker/task26-live-2026-10-25`.
+- Own iOS simulator: `24033911-49F7-4D8F-ADDD-233ECB533393`. Two unrelated booted tvOS devices must remain untouched.
+- First native plan had an invalid result-bundle path; corrected to report-owned `apple-scratch`.
+- Native fixture built/installed/launched with positive PID, but XCTest failed because SDK27.1 requires UIScene lifecycle.
+  Fixture generator was corrected with SceneDelegate. Keep failed jobs/results; never claim this was a pass.
+- Actual impossible-test local job classified `tests_failed -> escalate_cloud` correctly:
+  24565 input / 19200 cached / 2598 output, 27.64 worker seconds. Reasoning count not reported.
+- A 4096 metadata-cap case did not force server overflow: server still has its discovered larger context.
+  Genuine overflow test must exceed discovered server window, or explicitly report the plan assumption mismatch;
+  never classify model narration as a typed environment error.
+- An async request for **one minimal real cloud smoke call is unanswered**. No cloud inference is authorized yet.
+  Local inference is explicitly authorized. Synthetic cloud authentication tests already passed; real refresh remains unverified.
+
+## Remaining sequence
+
+1. Finish Task26: real read/write/environment/capability/summary cases; real native build, test and images where feasible;
+   analyse/fix failures; review actual images; full offline suite and scoped review. Commit durable qualification record.
+2. Archive/remove ONLY owned completed live-job worktrees after review and task-branch push; keep verified bundles,
+   receipts, reports and required artifacts outside removed worktrees. Manifest must include failed/superseded jobs.
+3. Tasks27–28: desktop MCP Apps spike first. Rendering/modes/pip/update behavior remain unproven.
+   Do not mark GO from static code or standard protocol support. Task28 is conditional on an observed GO.
+   The old approval gate before installing into the real desktop remains relevant; prepare a concrete reversible spike first.
+4. Final whole-branch review and fixes, final checks/install qualification, commit/push, archive/cleanup, final report.
+   No history squash: T2 commits were already published before this continuation; do not force-rewrite them.
+
+## Final-review carry items
+
+- Historical Task9: root timestamp handling, writable Git objects, gitlink reporting, packed-refs.lock noise.
+- Check orphan process-group tracking/reaping for native/capture phases before the worker starts, especially SIGKILL.
+- Cloud authentication uses Codex-managed actual cloud CODEX_HOME, no plugin copy/writeback; profile grants only
+  home metadata, literal auth.json, and observed tmp/arg0-macos helper subtree. Local jobs retain isolated homes.
+- Capture checkout commands are wrapped and deadline-bound; all source simulator locks are sorted and acquired
+  after global worker lock; overlay ancestors are strict; artifact roots are preopened under apple-scratch.
+- Preserve all new `Ruling:` lines from the ledger in final reporting; do not invent missing original rulings.
+
+## Standing boundaries
+
+No AI attribution in Conventional Commits. Never print the oMLX key or read ~/.ssh, real Git configuration,
+or oMLX settings values. Discovery may handle credentials programmatically without exposing them.
+Live worker runs use isolated homes, no cloud calls without approval, no real global-home migration during qualification.
+Do not delete unrelated work, jobs, simulators, or user evidence. A failed/skipped/blocked check is not success.
