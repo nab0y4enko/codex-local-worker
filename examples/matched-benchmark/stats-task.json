@@ -1,0 +1,30 @@
+{
+  "task_id": "add-word-frequencies",
+  "kind": "write",
+  "base_ref": "main",
+  "goal": "Implement word_frequencies(text) in textkit/stats.py and unittest tests in tests/test_stats.py. Standard library only. Return a plain dict mapping lowercase words to integer counts. Lowercase text using str.lower; tokenize as maximal Unicode alphanumeric runs (letters and digits), with underscores and all punctuation/whitespace as separators. Thus apostrophes split words. Empty/no-word input returns {}. Include a docstring that makes tokenization explicit. Follow existing direct-import unittest conventions. Do not edit other files.",
+  "acceptance_criteria": [
+    "word_frequencies(\"Hello, hello WORLD!\") == {\"hello\": 2, \"world\": 1}",
+    "Empty, whitespace-only and punctuation-only inputs yield {}",
+    "Tests directly assert explicit expected dictionaries for mixed case, repeated words, tabs/newlines, digits, punctuation, underscores, apostrophes, and Unicode letters",
+    "Repeated calls are independent",
+    "All tests pass via unittest discovery"
+  ],
+  "allowed_paths": [
+    "textkit/stats.py",
+    "tests/test_stats.py"
+  ],
+  "test_commands": [
+    [
+      "python3",
+      "-m",
+      "unittest",
+      "discover",
+      "-s",
+      "tests",
+      "-v"
+    ]
+  ],
+  "timeout_seconds": 600,
+  "max_attempts": 2
+}

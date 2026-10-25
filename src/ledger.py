@@ -514,7 +514,9 @@ def render_markdown(summary: Dict) -> str:
     lines.append(summary.get("planner_linkage", "Unlinked subagent usage may be absent."))
     lines += ["", "Local share of job plus planner input/output tokens: %s." % (
         "not reported" if summary.get("local_share") is None else "%.1f%%" %
-        (summary["local_share"] * 100)), "First-try success rate: %s." % (
+        (summary["local_share"] * 100)),
+        "Local share measures token placement, not savings against direct cloud execution.",
+        "First-try success rate: %s." % (
             "not reported" if summary.get("first_try_success_rate") is None else
             "%.1f%%" % (summary["first_try_success_rate"] * 100)), "",
         "## Escalations", ""]

@@ -51,9 +51,20 @@ previous `AGENTS.md` before an atomic change. It does not add new global instruc
 `--apply --pointer` opts into two marker lines pointing at the skill and read-only doctor command.
 See [the setup skill](skills/setup/SKILL.md) for override handling and the migration receipt.
 
+## Cloud-efficient orchestration
+
+Use `local-worker orchestrate` to run a sequential queue through bounded local repairs and all
+existing checks, then inspect its launcher-built review package. `local-worker decide` resumes
+only after an explicit cloud semantic review bound to the exact evidence. Optional planner-owned
+acceptance checks run before review and again after integration. See the
+[workflow guide](docs/qualification/cloud-token-workflow.md) for contracts, protection requirements,
+review decisions, failure recovery and matched benchmark accounting. No measured token saving is
+claimed without a paired benchmark.
+
 ## Job workflow
 
-1. **Inspect.** Run doctor/preflight and use a read job when repository behavior needs evidence.
+1. **Inspect.** Run doctor/preflight. Use a separate read job only when its findings affect planning
+   or will be reused; an already-scoped write job can inspect relevant files itself.
    Read jobs specify a question, allowed `scope_paths`, a JSON `answer_schema`, and a size limit;
    the launcher validates the answer and citations. Start from [`examples/read-task.json`](examples/read-task.json);
    set the repository, existing scope paths, question and answer schema. Read contracts require

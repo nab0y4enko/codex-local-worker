@@ -25,6 +25,28 @@ checks the installed Codex CLI and live local model endpoint. `models` shows dis
 models and their limits. Treat unavailable discovery as an environment problem; do not guess a
 model or endpoint.
 
+## Prefer deterministic coordination
+
+For scoped work, prefer `<root>/bin/local-worker orchestrate --manifest <absolute-queue.json>`.
+The queue contains `{"tasks": ["/absolute/task.json"]}`. It pins tasks, runs sequentially through
+existing verification and bounded retries, and returns package paths and digests. Inspect the
+returned package and relevant full evidence once; do not repeatedly poll with model calls.
+
+Cloud semantic review remains mandatory: inspect diff, sources, tests, findings, audit and
+screenshots. Then use `local-worker decide --job-id <id> --decision <absolute-decision.json>`
+with an explicit cloud decision bound to `package_sha256`. This command validates unchanged
+review inputs, integrates exact bytes, reruns original/independent/combined checks, verifies
+archive recovery, and summarizes. It never creates semantic approval itself. Incomplete evidence,
+stale review, missing protection or failed checks block acceptance. Preserve failure receipts;
+never clear them to bypass a failed gate. See
+[the workflow guide](../../docs/qualification/cloud-token-workflow.md) for the exact decision schema.
+
+Supply independent acceptance checks for predictable edge cases before implementation using the
+optional write-contract `acceptance_checks` manifest. Keep definitions outside worker-writable
+locations, pin script dependencies, and retain the normal tests and semantic review. Never edit
+trusted checks to make a candidate pass. Use conditional reads and coherent bounded jobs to reduce
+handoffs. Compare final matched runs with `local-worker benchmark`; local share alone is not savings.
+
 ## Planner loop
 
 Follow these steps for each repository request:
@@ -32,7 +54,9 @@ Follow these steps for each repository request:
 1. **Decompose.** Turn the request into small, ordered jobs with clear acceptance criteria and
    disjoint `allowed_paths` for write jobs. Use a read job first when repository behavior or
    facts need inspection before implementation. Keep the user's main checkout intact.
-2. **Read job.** Create a `kind: "read"` contract with a question, `scope_paths`, an
+2. **Optional read job.** Skip a separate read when the change is already scoped; let the write
+   worker inspect relevant files itself. Use a read when findings affect planning or will be reused.
+   Create a `kind: "read"` contract with a question, `scope_paths`, an
    `answer_schema`, and an answer-size limit. The launcher validates the JSON answer and checks
    its citations against the worktree. Review the answer and the cited files before planning
    edits. Start from [`examples/read-task.json`](../../examples/read-task.json); read contracts require `goal` and

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -53,6 +54,7 @@ class Contract:
     answer_schema: Optional[Dict[str, Any]] = None
     max_answer_bytes: int = 65536
     capture: Optional[Dict[str, Any]] = None
+    acceptance_checks: Optional[Path] = None
 
     @classmethod
     def from_payload(cls, payload: Any) -> "Contract":
@@ -72,7 +74,8 @@ class Contract:
         kind = payload.get("kind", "write")
         if kind == "write":
             allowed = common | {"acceptance_criteria", "allowed_paths", "test_commands",
-                                "max_attempts", "native", "native_plan", "ui_review"}
+                                "max_attempts", "native", "native_plan", "ui_review",
+                                "acceptance_checks"}
             required = required_common | {"acceptance_criteria", "allowed_paths", "test_commands",
                                          "max_attempts"}
         elif kind == "read":
@@ -150,9 +153,20 @@ class Contract:
             ui_review = payload.get("ui_review", False)
             if not isinstance(ui_review, bool):
                 raise ContractError("ui_review: must be a boolean")
+            acceptance_raw = payload.get("acceptance_checks")
+            acceptance_checks = None
+            if acceptance_raw is not None:
+                acceptance_raw = _string(acceptance_raw, "acceptance_checks")
+                acceptance_checks = Path(acceptance_raw)
+                if not acceptance_checks.is_absolute():
+                    raise ContractError("acceptance_checks: must be an absolute manifest path")
+                if acceptance_checks.is_symlink():
+                    raise ContractError("acceptance_checks: manifest must not be a symlink")
+                acceptance_checks = Path(os.path.realpath(acceptance_raw))
             kwargs.update(acceptance_criteria=criteria, allowed_paths=paths,
                           test_commands=commands, max_attempts=attempts,
-                          native_plan=native_plan, ui_review=ui_review)
+                          native_plan=native_plan, ui_review=ui_review,
+                          acceptance_checks=acceptance_checks)
         elif kind == "read":
             question = _string(payload["question"], "question")
             scope_paths = [_relative_path(item, "scope_paths[]") for item in
@@ -190,6 +204,8 @@ class Contract:
                           max_attempts=self.max_attempts, ui_review=self.ui_review)
             if self.native_plan is not None:
                 result["native_plan"] = str(self.native_plan)
+            if self.acceptance_checks is not None:
+                result["acceptance_checks"] = str(self.acceptance_checks)
         elif self.kind == "read":
             result.update(question=self.question, scope_paths=self.scope_paths,
                           answer_schema=self.answer_schema, max_answer_bytes=self.max_answer_bytes)

@@ -118,6 +118,25 @@ def review_python_tests(worktree: Path, changed_paths: Sequence[str]) -> List[Di
             if sum(1 for _ in ast.walk(tree)) > _MAX_AST_NODES:
                 raise ValueError("syntax tree limit exceeded")
             file_findings = []
+            # Literal keys are safe to evaluate without importing or executing worker code.
+            # Python equality semantics intentionally catch True/1 as well as exact strings.
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Dict):
+                    continue
+                seen = set()
+                for key in node.keys:
+                    if key is None:
+                        continue
+                    try:
+                        value = ast.literal_eval(key)
+                        hash(value)
+                    except (ValueError, TypeError, SyntaxError, RecursionError):
+                        continue
+                    if value in seen:
+                        file_findings.append(_finding(
+                            display, key.lineno, "", "duplicate_dictionary_key",
+                            "Advisory: duplicate literal dictionary key overwrites an earlier expected value."))
+                    seen.add(value)
             for function in _test_functions(tree):
                 if _is_skipped(function) or _contains_assertion(function.body):
                     continue

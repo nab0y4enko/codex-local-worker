@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "benchmark_id": "replace-with-run-pair-id",
+  "tasks": [
+    {
+      "task_id": "replace-with-stable-task-id",
+      "specification": {
+        "goal": "Replace with the exact task goal used in every arm",
+        "base_ref": "replace-with-base-commit-or-ref",
+        "base_commit": "replace-with-common-base-commit-sha",
+        "acceptance_criteria": [
+          "Replace with each frozen acceptance criterion"
+        ],
+        "test_commands": [
+          ["python3", "-m", "unittest", "discover", "-s", "tests"]
+        ],
+        "acceptance_checks_sha256": null
+      },
+      "specification_sha256": "e5d98bcf9a28cb396d0fc9938028f146f993dacd25435d8c6f8b6d3169cc4884",
+      "arms": {
+        "direct_cloud": {
+          "summary": "evidence/direct-cloud/session-summary.json",
+          "reports": [],
+          "acceptance": "evidence/direct-cloud/semantic-acceptance.json"
+        },
+        "launcher": {
+          "summary": "evidence/launcher/session-summary.json",
+          "reports": [
+            "evidence/launcher/reports/initial-attempt/report.json",
+            "evidence/launcher/reports/repair-attempt/report.json"
+          ],
+          "accepted_job_id": "accepted-final-job-id",
+          "package": "evidence/launcher/reviews/accepted-final-job/package.json",
+          "receipt": "evidence/launcher/reviews/accepted-final-job/decision-result.json",
+          "elapsed_seconds": 720.0,
+          "review_calls": 2,
+          "review_records": [
+            {
+              "job_id": "rejected-initial-job-id",
+              "package": "evidence/launcher/reviews/rejected-initial-job/package.json",
+              "receipt": "evidence/launcher/reviews/rejected-initial-job/decision-result.json"
+            }
+          ]
+        },
+        "direct_luna": {
+          "summary": "evidence/direct-luna/session-summary.json",
+          "reports": [],
+          "acceptance": "evidence/direct-luna/semantic-acceptance.json"
+        }
+      }
+    }
+  ]
+}

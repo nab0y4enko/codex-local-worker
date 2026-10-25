@@ -65,6 +65,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import apple_verification as apple
+import acceptance_checks
 import classify as failure_classify
 import contract
 import codex_catalog
@@ -2568,7 +2569,14 @@ def summarize_failure(attempt: Dict[str, Any], tests: Sequence[Dict[str, Any]],
             lines.append(f"- Model routing evidence: {attempt.get('observed_models')}")
     for test in tests:
         if test.get("status") == "blocked":
-            lines.append(f"- Verification could not run: {test.get('command')}")
+            detail = test.get("reason")
+            lines.append(f"- Verification could not run: {test.get('command')}"
+                         + (f"; {detail}" if detail else ""))
+        elif test.get("status") == "failed" and test.get("returncode") is None:
+            detail = test.get("reason") or "no exit status was available"
+            if test.get("changed_inputs"):
+                detail += "; changed inputs: " + ", ".join(test["changed_inputs"])
+            lines.append(f"- Acceptance check {test.get('name') or test.get('command')} failed: {detail}")
         elif test.get("returncode") not in (0, None):
             lines.append(f"- Command {json.dumps(test.get('command'))} exited "
                          f"{test.get('returncode')}; output tail: {test.get('stdout_tail', '')}")
@@ -3074,6 +3082,16 @@ def setup_deny_wrapper(options: "JobOptions", report: Dict[str, Any],
     blocked.
     """
     record = report["permissions"]
+    acceptance_manifest = None
+    if options.task.acceptance_checks is not None:
+        if not options.verify:
+            raise BlockedError("trusted acceptance checks require verification; --no-verify cannot bypass them")
+        try:
+            acceptance_manifest = acceptance_checks.load_manifest(
+                options.task.acceptance_checks, repo=options.task.repo_path,
+                writable_roots=[options.state_dir, report_dir, worktree, codex_home])
+        except acceptance_checks.AcceptanceCheckError as error:
+            raise PreflightError("trusted acceptance checks could not be pinned: %s" % error) from None
     # Codex needs metadata on CODEX_HOME itself during startup; all child content stays hidden
     # except for auth.json and the observed temporary helper subtree.
     cloud_home = Path(report["cloud_auth"]["source_home"]) if report.get("cloud_auth") else None
@@ -3099,7 +3117,9 @@ def setup_deny_wrapper(options: "JobOptions", report: Dict[str, Any],
                          cloud_home / "tmp" / "arg0-macos"] if cloud_home else (),
             allow_write_subpaths=[helper_scratch] if helper_scratch else (),
             deny_write_subpaths=([str(Path(git_layout["GIT_OBJECT_DIRECTORY"]) / "info")]
-                                 if "GIT_OBJECT_DIRECTORY" in git_layout else ()))
+                                 if "GIT_OBJECT_DIRECTORY" in git_layout else []) +
+                                ([str(path) for path in acceptance_manifest.protected_paths]
+                                 if acceptance_manifest else []))
         primary_git_dirs = permissions.resolve_git_dirs(options.task.repo_path)
     except permissions.PermissionsError as error:
         raise PreflightError(f"the permissions deny profile cannot be built: {error}") from None
@@ -3107,6 +3127,17 @@ def setup_deny_wrapper(options: "JobOptions", report: Dict[str, Any],
     profile.write_text(text, encoding="utf-8")
     record.update(mode=perms.mode, profile=str(profile), deny_list_applied=False,
                   profile_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest())
+    if acceptance_manifest is not None:
+        report["_acceptance_manifest"] = acceptance_manifest
+        report["acceptance_checks"] = {
+            "manifest_path": str(acceptance_manifest.path),
+            "manifest_sha256": acceptance_manifest.sha256,
+            "status": "pending", "checks": [],
+            "protected_inputs": [str(path) for path in acceptance_manifest.protected_paths],
+            "input_pins": [{"path": str(pin.path), "sha256": pin.sha256,
+                            "device": pin.device, "inode": pin.inode}
+                           for pin in acceptance_manifest.pins],
+        }
     wrapper = DenyWrapper(profile_perms, options.task.repo_path, options.state_dir, record,
                           worktree=worktree, configured_permissions=perms,
                           git_dirs=(Path(git_layout["GIT_COMMON_DIR"]),
@@ -3114,6 +3145,8 @@ def setup_deny_wrapper(options: "JobOptions", report: Dict[str, Any],
     if not permissions.wrapper_available():
         record["reason"] = (f"{permissions.SANDBOX_EXEC} is not available on this host, so the "
                             "deny list was not applied: the job ran with full host access")
+        if acceptance_manifest is not None:
+            raise BlockedError("trusted acceptance checks require the deny wrapper, which is unavailable")
         return wrapper
     timeout = deadline.cap(PROBE_TIMEOUT_SECONDS)
     if timeout < MIN_ATTEMPT_BUDGET_SECONDS:
@@ -3136,6 +3169,8 @@ def setup_deny_wrapper(options: "JobOptions", report: Dict[str, Any],
                             "could not apply the deny profile here (the launcher is probably "
                             "itself inside a sandbox), so the deny list was not applied and the "
                             f"job ran with full host access: {detail or 'no output'}")
+        if acceptance_manifest is not None:
+            raise BlockedError("trusted acceptance checks require the deny wrapper: " + record["reason"])
         return wrapper
     state = "timed out" if result["timed_out"] else f"exited {result['returncode']}"
     raise BlockedError(f"the deny wrapper probe {state} under {profile}: {detail or 'no output'}; "
@@ -3170,7 +3205,8 @@ def worker_command_outputs(text: str) -> List[str]:
 
 def run_verification(task: Task, worktree: Path, env: Dict[str, str], codex_bin: str,
                      sandbox: Dict[str, Any], secrets: Sequence[str],
-                     deadline: Deadline, wrapper: Optional[DenyWrapper] = None
+                     deadline: Deadline, wrapper: Optional[DenyWrapper] = None,
+                     commands: Optional[Sequence[Sequence[str]]] = None
                      ) -> List[Dict[str, Any]]:
     """Run each contract command, or report it blocked, exactly as the backend runs it.
 
@@ -3190,7 +3226,7 @@ def run_verification(task: Task, worktree: Path, env: Dict[str, str], codex_bin:
     backend = FULL_HOST_BACKEND
     full_host = True
     denied = wrapper is not None and wrapper.applied
-    for index, argv in enumerate(task.test_commands, start=1):
+    for index, argv in enumerate(commands if commands is not None else task.test_commands, start=1):
         left = deadline.remaining()
         if left < MIN_ATTEMPT_BUDGET_SECONDS:
             results.append({
@@ -3255,6 +3291,53 @@ def run_verification(task: Task, worktree: Path, env: Dict[str, str], codex_bin:
     return results
 
 
+def run_acceptance_checks(task: Task, manifest: acceptance_checks.Manifest,
+                          report: Dict[str, Any], worktree: Path, env: Dict[str, str],
+                          codex_bin: str, sandbox: Dict[str, Any], secrets: Sequence[str],
+                          deadline: Deadline, wrapper: Optional[DenyWrapper]
+                          ) -> List[Dict[str, Any]]:
+    """Run pinned planner checks through the same bounded verification backend and deadline."""
+    outcomes = []
+    if wrapper is None or not wrapper.applied:
+        for index, check in enumerate(manifest.checks, start=1):
+            outcomes.append({"name": check["name"], "command": check["argv"],
+                             "check_index": index, "status": "blocked", "returncode": None,
+                             "reason": "trusted acceptance checks require an applied deny wrapper"})
+        result = report.get("acceptance_checks")
+        if isinstance(result, dict):
+            result["checks"] = outcomes
+            result["status"] = "failed"
+        return outcomes
+    for index, check in enumerate(manifest.checks, start=1):
+        snapshot = acceptance_checks.verify_snapshot(manifest)
+        if not snapshot.ok:
+            outcome = {"name": check["name"], "command": check["argv"], "status": "failed",
+                       "returncode": None, "reason": "trusted acceptance inputs changed before execution",
+                       "changed_inputs": snapshot.changed_paths}
+        else:
+            outcome = run_verification(task, worktree, env, codex_bin, sandbox, secrets,
+                                       deadline, wrapper, commands=[check["argv"]])[0]
+            outcome["name"] = check["name"]
+            after = acceptance_checks.verify_snapshot(manifest)
+            if not after.ok:
+                outcome.update(status="failed", reason="trusted acceptance inputs changed during execution",
+                               changed_inputs=after.changed_paths)
+        outcome["check_index"] = index
+        outcomes.append(outcome)
+    after_all = acceptance_checks.verify_snapshot(manifest)
+    if not after_all.ok:
+        for outcome in outcomes:
+            outcome.update(status="failed", reason="trusted acceptance inputs changed during verification",
+                           changed_inputs=after_all.changed_paths)
+    result = report.get("acceptance_checks")
+    if isinstance(result, dict):
+        result["checks"] = outcomes
+        result["status"] = ("passed" if outcomes and all(item.get("status") == "passed"
+                                                         for item in outcomes)
+                             else "failed")
+    return outcomes
+
+
 # --------------------------------------------------------------------------------------
 # Job orchestration
 # --------------------------------------------------------------------------------------
@@ -3294,6 +3377,7 @@ def new_report(options: JobOptions) -> Dict[str, Any]:
         "started_at": datetime.now(timezone.utc).isoformat(),
         "job_id": f"{_now_stamp()}-{task.task_id}-{uuid.uuid4().hex[:6]}",
         "task_id": task.task_id,
+        "contract": task.to_dict(),
         "kind": task.kind,
         "status": "worker_failed",
         "tier": "cloud" if task.tier.kind == "cloud" else "local",
@@ -3349,6 +3433,7 @@ def new_report(options: JobOptions) -> Dict[str, Any]:
         "auto_retries": [],
         "screenshots": [],
         "tests": [],
+        "acceptance_checks": None,
         "review_findings": None,
         "changed_paths": [],
         "violations": [],
@@ -4574,6 +4659,14 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
             progress(report, "verification")
             tests = run_verification(task, worktree, verify_env, options.codex_bin, sandbox,
                                      secrets, deadline, wrapper)
+            pinned_checks = report.get("_acceptance_manifest")
+            if pinned_checks is not None:
+                acceptance_results = run_acceptance_checks(
+                    task, pinned_checks, report, worktree, verify_env, options.codex_bin,
+                    sandbox, secrets, deadline, wrapper)
+                for check_index, check_result in enumerate(acceptance_results, start=1):
+                    check_result["log"] = "acceptance-%d" % check_index
+                tests.extend(acceptance_results)
             for test in tests:
                 text = test.pop("output_text", "")
                 # Keep the evidence for anything that actually ran, confined or not: an
@@ -4660,6 +4753,9 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
             feedback = summarize_failure(attempt, tests, audit.violations)
         attempt_number += 1
 
+    acceptance_result = report.get("acceptance_checks")
+    if isinstance(acceptance_result, dict) and acceptance_result.get("status") == "pending":
+        acceptance_result["status"] = "not_run"
     if audit is None:
         # No attempt reached verification (unsupported tool, exhausted budget, ...). Audit
         # what the worker left behind anyway, still against the original base commit.
@@ -5054,6 +5150,14 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
             except (policy.PolicyStop, OSError) as error:
                 report["status"] = "blocked"
                 report["failure_reason"] = str(error)
+        # Bind later cloud review to the actual final verified candidate, not a fresh
+        # snapshot of files that may have changed after verification finished.
+        if report.get("status") == "ok" and report.get("worktree"):
+            try:
+                report["worker_fingerprint_after"] = primary_fingerprint(Path(report["worktree"]))
+            except (LauncherError, OSError) as error:
+                report["status"] = "audit_violation"
+                report["failure_reason"] = "cannot fingerprint verified candidate: " + str(error)
         left = deadline.remaining()
         report["budget"] = {
             "total_seconds": deadline.total_seconds,
@@ -5072,6 +5176,7 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
             classification["next_action"] = report["policy_stop_next_action"]
         report["classification"] = classification
         report.pop("_worker_authored", None)
+        report.pop("_acceptance_manifest", None)
         report.pop("_git_layout", None)
         report.pop("_git_admin_before", None)
         ensure_report_dir(options, report)
@@ -5203,6 +5308,13 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run one local Codex CLI worker against the loaded loopback oMLX model.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    for name, description in (
+            ("orchestrate", "run a sequential queue through verification to cloud review"),
+            ("review-package", "assemble complete evidence for cloud semantic review"),
+            ("decide", "apply an explicit cloud review decision bound to evidence"),
+            ("benchmark", "compare matched usage evidence without inference")):
+        sub.add_parser(name, help=description)
 
     run = sub.add_parser("run", help="run one job from a task contract file")
     run.add_argument("--task-file", required=True, help="JSON task contract")
@@ -5347,7 +5459,7 @@ def summary_lines(report: Dict[str, Any]) -> List[str]:
 def planner_json(report: Dict[str, Any]) -> Dict[str, Any]:
     """Stable, compact ``run --json`` contract for the planner (spec §11)."""
     report_dir = report.get("report_dir")
-    return {
+    result = {
         "job_id": report.get("job_id"),
         "kind": report.get("kind", "write"),
         "tier": report.get("tier", "local"),
@@ -5364,6 +5476,9 @@ def planner_json(report: Dict[str, Any]) -> Dict[str, Any]:
         "durations": report.get("timing", {}),
         "report_path": str(Path(report_dir) / "report.json") if report_dir else None,
     }
+    if report.get("acceptance_checks") is not None:
+        result["acceptance_checks"] = report["acceptance_checks"]
+    return result
 
 
 def status_snapshot(item):
@@ -5509,8 +5624,15 @@ def main(argv: Optional[Sequence[str]] = None, *,
          omlx_fetch: omlx_discovery.HttpFetch = omlx_discovery.http_fetch,
          codex_run: Callable[..., Any] = subprocess.run,
          simctl_run: Optional[Callable[[Sequence[str]], Any]] = None) -> int:
+    arguments = list(argv) if argv is not None else sys.argv[1:]
+    if arguments and arguments[0] in ("orchestrate", "review-package", "decide"):
+        import review_workflow
+        return review_workflow.main(arguments)
+    if arguments and arguments[0] == "benchmark":
+        import benchmark
+        return benchmark.main(arguments[1:])
     parser = build_parser()
-    args = parser.parse_args(list(argv) if argv is not None else None)
+    args = parser.parse_args(arguments)
     try:
         if args.command == "doctor":
             report = doctor_report(settings_path=Path(os.path.expanduser(args.settings)),

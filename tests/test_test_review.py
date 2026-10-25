@@ -39,6 +39,16 @@ class TestReviewPythonTests(unittest.TestCase):
         self.assertEqual(findings[0]["line"], 1)
         self.assertIn("advisory", findings[0]["message"].lower())
 
+    def test_flags_duplicate_literal_dictionary_keys_even_with_assertion(self):
+        _write(self.root, "tests/test_counts.py", "def test_counts():\n    assert counts() == {'word': 1, 'word': 2, True: 3, 1: 4}\n")
+        findings = review_python_tests(self.root, ["tests/test_counts.py"])
+        self.assertEqual([f["code"] for f in findings], ["duplicate_dictionary_key", "duplicate_dictionary_key"])
+        self.assertTrue(all(f["line"] == 2 for f in findings))
+
+    def test_dynamic_dictionary_keys_are_not_evaluated(self):
+        _write(self.root, "tests/test_counts.py", "def test_counts():\n    assert counts() == {key(): 1, other(): 2}\n")
+        self.assertEqual(review_python_tests(self.root, ["tests/test_counts.py"]), [])
+
     def test_accepts_direct_assertions_and_unittest_assertions(self):
         _write(self.root, "tests/test_result.py", """import unittest
 def test_plain():

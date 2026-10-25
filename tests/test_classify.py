@@ -105,6 +105,11 @@ class ClassifyTests(unittest.TestCase):
                                         "classification", "answer", "answer_evidence", "patch_path", "screenshots",
                                         "tests", "review_findings", "tokens", "durations", "report_path"])
 
+    def test_planner_json_includes_opt_in_acceptance_evidence(self):
+        evidence = {"status": "passed", "checks": [{"name": "independent", "status": "passed"}]}
+        result = lw.planner_json({"acceptance_checks": evidence})
+        self.assertEqual(result["acceptance_checks"], evidence)
+
     def test_classifier_ignores_worker_prose(self):
         result = classify.classify({"status": "worker_failed", "failure_reason": "I think the server was down"})
         self.assertEqual(result.code, "verification_blocked")

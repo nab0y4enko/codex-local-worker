@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "checks": [{
+    "name": "independent-behavior",
+    "argv": ["/absolute/path/to/python3", "/absolute/trusted/check_behavior.py"],
+    "scripts": ["/absolute/trusted/check_behavior.py"]
+  }]
+}

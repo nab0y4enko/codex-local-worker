@@ -1,0 +1,30 @@
+{
+  "task_id": "add-slugify",
+  "kind": "write",
+  "base_ref": "main",
+  "goal": "Implement slugify(text) in textkit/slug.py and unittest tests in tests/test_slug.py. Standard library only. Normalize with Unicode NFKD then ASCII encode ignoring non-ASCII, lowercase, replace each run of characters outside a-z and 0-9 with one hyphen, strip leading/trailing hyphens. Add a docstring describing behavior. Use direct module imports matching existing conventions. Do not edit other files.",
+  "acceptance_criteria": [
+    "slugify(\" Hello, WORLD! \") == \"hello-world\"",
+    "slugify(\"Café déjà vu\") == \"cafe-deja-vu\"",
+    "Empty, whitespace-only, punctuation-only and non-ASCII-only input produce empty string",
+    "Tests use direct assertEqual assertions with explicit expected strings and cover digits, underscores, repeated hyphens, tabs/newlines and idempotence",
+    "All unittest discovery tests pass"
+  ],
+  "allowed_paths": [
+    "textkit/slug.py",
+    "tests/test_slug.py"
+  ],
+  "test_commands": [
+    [
+      "python3",
+      "-m",
+      "unittest",
+      "discover",
+      "-s",
+      "tests",
+      "-v"
+    ]
+  ],
+  "timeout_seconds": 600,
+  "max_attempts": 2
+}

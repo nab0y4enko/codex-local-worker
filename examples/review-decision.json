@@ -1,0 +1,9 @@
+{
+  "action": "accept",
+  "package_sha256": "REPLACE_WITH_REVIEWED_PACKAGE_SHA256",
+  "reviewer": "cloud-planner",
+  "semantic_review": true,
+  "reviewed_sections": ["diff", "sources", "tests", "findings", "audit", "screenshots"],
+  "rationale": "REPLACE_WITH_ACTUAL_CLOUD_SEMANTIC_REVIEW_FINDINGS",
+  "combined_commands": []
+}
