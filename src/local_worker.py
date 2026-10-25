@@ -4242,13 +4242,14 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
                 report["codex_home_cleanup_error"] = redact(str(cleanup_error), secrets)
         progress(report, report["status"])
         write_report(report, secrets)
-        try:
-            ledger.append_job(options.state_dir, ledger.session_id(), report)
-        except (OSError, ValueError) as ledger_error:
-            # Observability must never rewrite the job outcome. Preserve the failure in the
-            # report, but never copy untrusted report or model prose into the ledger.
-            report["ledger_error"] = "ledger append failed (%s)" % ledger_error.__class__.__name__
-            write_report(report, secrets)
+        if not _inside(options.state_dir, options.task.repo_path):
+            try:
+                ledger.append_job(options.state_dir, ledger.session_id(), report)
+            except (OSError, ValueError) as ledger_error:
+                # Observability must never rewrite the job outcome. Preserve the failure in the
+                # report, but never copy untrusted report or model prose into the ledger.
+                report["ledger_error"] = "ledger append failed (%s)" % ledger_error.__class__.__name__
+                write_report(report, secrets)
         _notify_job(report, secrets)
     return report
 
