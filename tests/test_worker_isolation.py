@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import os
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -49,6 +50,16 @@ class IsolationCase(unittest.TestCase):
 
 
 class JobHome(IsolationCase):
+    def test_capture_checkout_git_environment_drops_private_object_redirects(self):
+        source = {"GIT_OBJECT_DIRECTORY": "/job/private/objects",
+                  "GIT_ALTERNATE_OBJECT_DIRECTORIES": "/primary/objects",
+                  "IBToolNeverDeque": "1", "PATH": "/usr/bin"}
+        captured = lw.capture_source_env(source)
+        self.assertNotIn("GIT_OBJECT_DIRECTORY", captured)
+        self.assertNotIn("GIT_ALTERNATE_OBJECT_DIRECTORIES", captured)
+        self.assertEqual(captured["PATH"], source["PATH"])
+        self.assertEqual(captured["IBToolNeverDeque"], "1")
+
     def test_worker_never_sees_the_users_codex_home(self):
         user_home = sp.tmpdir()
         self.addCleanup(sp.cleanup, user_home)
@@ -239,6 +250,40 @@ class Compatibility(IsolationCase):
         compat = lw.codex_compat("codex", run=sp.fake_help(version="codex-cli 0.163.0"))
         self.assertFalse(compat["ok"]); self.assertIn("0.164.0", compat["reason"])
         self.assertTrue(lw.codex_compat("codex", run=sp.fake_help(version="codex-cli 0.164.0"))["ok"])
+
+    def test_compatibility_stops_after_version_probe_uses_the_job_deadline(self):
+        class Budget:
+            def __init__(self):
+                self.values = iter((2.0, 0.0))
+
+            def remaining(self):
+                return next(self.values)
+
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, b"codex-cli 0.164.0", b"")
+
+        result = lw.codex_compat("codex", run=run, deadline=Budget())
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["budget_exhausted"])
+        self.assertEqual(calls, [["codex", "--version"]])
+
+    def test_changed_model_diagnostic_does_not_probe_again_after_deadline(self):
+        class Budget:
+            def __init__(self):
+                self.values = iter((2.0, 0.0))
+
+            def remaining(self):
+                return next(self.values)
+
+        settings = sp.write_settings(self.root / "omlx" / "settings.json")
+        fake = sp.FakeOmlx("none_loaded")
+        result = lw.recheck_pinned_model(self.profile, settings, fake, 1, Budget())
+        self.assertEqual(result[0], "model_changed")
+        self.assertIn("budget_exhausted", result[1])
+        self.assertEqual(fake.calls, ["/v1/models/status"])
 
     def test_the_minimum_version_and_the_required_flags(self):
         self.assertEqual(lw.MIN_CODEX_VERSION, (0, 164, 0))

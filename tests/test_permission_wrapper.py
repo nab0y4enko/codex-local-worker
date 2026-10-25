@@ -373,13 +373,12 @@ class Denials(WrapperCase):
         denials = report["permissions"]["denials"]
         self.assertIn({"path": secret, "kind": "read", "cause": "deny_read",
                        "source": "worker attempt 1"}, denials)
-        self.assertIn({"path": f"{real(self.state)}/permissions.json", "kind": "write",
-                       "cause": "state_dir", "source": "worker attempt 1"}, denials)
+        self.assertNotIn(f"{real(self.state)}/permissions.json", json.dumps(denials))
         self.assertIn({"path": f"{primary}/generated.txt", "kind": "write",
                        "cause": "primary_checkout",
                        "source": "verification attempt 1 command 1"}, denials)
         self.assertNotIn(f"{primary}/quoted.py", json.dumps(denials))
-        self.assertEqual(len(denials), 3, denials)
+        self.assertEqual(len(denials), 2, denials)
 
     def test_worker_command_outputs_reads_only_shell_command_items(self):
         stream = "\n".join(json.dumps(event) for event in (
@@ -579,7 +578,7 @@ class RealWrappedJob(WrapperCase):
         for name in ("common_config", "common_attributes", "common_merge_head"):
             with self.subTest(name=name):
                 self.assertEqual(results[name], "Operation not permitted")
-        self.assertEqual(results["common_objects"], "ok")  # objects/ stays writable for commits
+        self.assertEqual(results["common_objects"], "Operation not permitted")
         self.assertEqual((sep / "config").read_bytes(), config_before)
         self.assertFalse((sep / "info" / "attributes").exists())
         self.assertFalse((sep / "MERGE_HEAD").exists())
@@ -874,8 +873,9 @@ class AuditSubmodules(WrapperCase):
                                   git_layout=self.layout)
         self.assertFalse(self.sentinel.exists(), "the nested repository's filter ran in the audit")
         # The rest of the audit is unaffected: the worker's real change is still reported.
-        self.assertEqual(audit.changed_paths, ["add.py"])
-        self.assertEqual(audit.violations, [])
+        self.assertEqual(audit.changed_paths, ["add.py", "sub"])
+        self.assertEqual([item["path"] for item in audit.violations], ["sub", "sub"])
+        self.assertIn("unknown", audit.violations[0]["reason"])
         self.assertIn(b"add.py", audit.patch)
         self.assertNotIn(b"sub", audit.patch.replace(b"subtract", b""))
 

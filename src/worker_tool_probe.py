@@ -45,7 +45,7 @@ class ToolProbeError(ValueError):
 
 
 def probe_tools(loaded, *, codex_bin, env, overrides, deadline, codex_home,
-                process_profile_path=None):
+                process_profile_path=None, popen_factory=None):
     """Return a copy of ``loaded['evidence']`` with every selected server marked probed.
 
     ``overrides`` is the launcher's own ``config_overrides(profile, context_window, catalog)``
@@ -68,7 +68,8 @@ def probe_tools(loaded, *, codex_bin, env, overrides, deadline, codex_home,
     home = Path(codex_home)
     if not home.is_dir():
         raise ToolProbeError("the job Codex home for the tool probe does not exist")
-    process = _spawn(codex_bin, overrides, loaded, env, str(home), process_profile_path)
+    process = _spawn(codex_bin, overrides, loaded, env, str(home), process_profile_path,
+                     popen_factory=popen_factory)
     try:
         discovered = _Session(process, budget).exchange(names)
     finally:
@@ -127,7 +128,8 @@ def _budget(deadline, servers, names):
     return budget
 
 
-def _spawn(codex_bin, overrides, loaded, env, home, process_profile_path=None):
+def _spawn(codex_bin, overrides, loaded, env, home, process_profile_path=None,
+           popen_factory=None):
     """Start the app-server in its own process group, with the job's CODEX_HOME as home and cwd.
 
     The user's Codex home is never used: ``home`` is the job's own, the same one the worker runs
@@ -143,9 +145,10 @@ def _spawn(codex_bin, overrides, loaded, env, home, process_profile_path=None):
     probe_env.pop(MODEL_KEY_ENV, None)
     probe_env["CODEX_HOME"] = home
     try:
-        return subprocess.Popen(argv, cwd=home, env=probe_env,
-                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, start_new_session=True)
+        factory = popen_factory or subprocess.Popen
+        return factory(argv, cwd=home, env=probe_env,
+                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, start_new_session=True)
     except OSError as error:
         raise ToolProbeError("the Codex app-server could not be started for the tool probe (%s)"
                              % (error.strerror or error.__class__.__name__,)) from None

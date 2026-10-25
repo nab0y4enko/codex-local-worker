@@ -24,7 +24,9 @@ CASES = [
     ({"status": "worker_failed", "attempts": [{"stalled": True}]}, ("stall", "retry_local")),
     ({"status": "tests_failed", "attempts": [{}, {}], "max_attempts": 2}, ("tests_failed", "escalate_cloud")),
     ({"status": "audit_violation", "violations": [{"path": "x", "reason": "outside allowed_paths"}]}, ("out_of_scope", "escalate_cloud")),
-    ({"status": "worker_failed", "permissions": {"denials": [{"path": "~/.npmrc", "kind": "read"}]}}, ("secret_read_denied", "needs_user")),
+    ({"status": "worker_failed", "attempts": [{"sandbox_denial": {
+        "source": "sandboxed_command_output", "kind": "read", "path": "~/.npmrc",
+        "known_secret": True}}]}, ("secret_read_denied", "needs_user")),
     ({"status": "answer_invalid", "citations": {"total": 3, "verified": 1}}, ("unverified_answer", "escalate_cloud")),
     ({"status": "preflight_failed", "discovery_error": {"code": "model_ambiguous"}}, ("model_ambiguous", "needs_user")),
 ]
@@ -100,6 +102,44 @@ class ClassifyTests(unittest.TestCase):
     def test_classifier_ignores_worker_prose(self):
         result = classify.classify({"status": "worker_failed", "failure_reason": "I think the server was down"})
         self.assertEqual(result.code, "verification_blocked")
+
+    def test_typed_sandbox_denial_is_actionable_without_relaxing_permissions(self):
+        result = classify.classify({"status": "worker_failed", "kind": "read",
+            "attempts": [{"returncode": 1, "sandbox_denial": {
+                "source": "codex_terminal_error", "kind": "read", "path": "/private/data.txt"}}]})
+        self.assertEqual((result.cls, result.code, result.next_action),
+                         ("environment", "sandbox_denied", "needs_user"))
+        self.assertIn("keep", result.remediation.lower())
+
+    def test_launcher_promotes_only_parsed_known_read_and_protected_write_denials(self):
+        perms = lw.permissions.default_permissions()
+        known_read = lw.typed_sandbox_denial([{"path": str(Path.home() / ".ssh" / "id_ed25519"),
+                                               "kind": "read", "cause": "deny_read"}],
+                                              perms, source="sandboxed_command_output")
+        self.assertIs(known_read["known_secret"], True)
+        protected_write = lw.typed_sandbox_denial([{"path": "/repo/private", "kind": "write",
+                                                     "cause": "primary_checkout"}],
+                                                    perms, source="sandboxed_command_output")
+        self.assertIs(protected_write["known_out_of_scope"], True)
+        unknown = lw.typed_sandbox_denial([{"path": "/elsewhere/private", "kind": "read",
+                                            "cause": "deny_read"}], perms,
+                                          source="sandboxed_command_output")
+        self.assertIs(unknown["known_secret"], False)
+
+    def test_sandbox_denial_does_not_classify_from_worker_prose_or_raw_stderr(self):
+        result = classify.classify({"status": "worker_failed", "failure_reason": "Permission denied",
+            "attempts": [{"returncode": 1, "stderr_excerpt": "Permission denied /private/data.txt"}]})
+        self.assertNotEqual(result.code, "sandbox_denied")
+
+    def test_untyped_global_read_denials_and_blocked_out_of_scope_writes_are_not_misreported(self):
+        global_only = classify.classify({"status": "worker_failed", "permissions": {
+            "denials": [{"kind": "read", "path": "/private/file"}]}})
+        self.assertNotEqual(global_only.code, "secret_read_denied")
+        blocked_write = classify.classify({"status": "worker_failed", "attempts": [{
+            "returncode": 1, "sandbox_denial": {"source": "sandboxed_command_output",
+                "kind": "write", "path": "/repo/secret", "known_out_of_scope": True}}]})
+        self.assertEqual(blocked_write.code, "sandbox_denied")
+        self.assertIn("out-of-scope", " ".join(blocked_write.evidence))
 
     def test_raw_stderr_infrastructure_phrases_are_not_classification_evidence(self):
         report = {"status": "worker_failed", "attempts": [{"returncode": 1,

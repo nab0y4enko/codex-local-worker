@@ -69,11 +69,32 @@ class LedgerTests(unittest.TestCase):
         self.assertIn("J2", md)
         self.assertIn("Unlinked subagent usage may be absent", md)
 
+    def test_retry_after_exit_zero_terminal_failure_is_not_first_try_success(self):
+        report = self.job("retry", status="ok")
+        report["attempts"] = [
+            {"attempt": 1, "returncode": 0, "terminal_failures": ["turn.failed"]},
+            {"attempt": 2, "returncode": 0},
+        ]
+        self.assertFalse(ledger._safe_report(report)["first_try_success"])
+
+    def test_first_try_metric_requires_single_successful_attempt(self):
+        report = self.job("single", status="ok")
+        report["attempts"] = [{"attempt": 1, "returncode": 0, "terminal_failures": []}]
+        self.assertTrue(ledger._safe_report(report)["first_try_success"])
+
     def test_missing_data_is_shown_as_missing(self):
         ledger.append_job(self.state, "S2", self.job("J3", tokens=None))
         summary = ledger.build_summary(self.state, "S2", self.home)
         self.assertIn("not reported", ledger.render_markdown(summary))
         self.assertNotIn("| 0 |", ledger.render_markdown(summary))
+
+    def test_global_permission_history_is_not_attributed_to_current_session(self):
+        self.state.mkdir(parents=True)
+        (self.state / "permissions.log").write_text(
+            json.dumps({"at": "2020-01-01T00:00:00Z", "action": "deny-read", "path": "/x"}) + "\n")
+        summary = ledger.build_summary(self.state, "S-old", self.home)
+        self.assertIn("Review global permissions changes recorded in launcher state.",
+                      summary["suggested_plugin_fixes"])
 
     def test_planner_usage_only_reads_matching_session_token_counts(self):
         home = self.planner_home(session="another-session")

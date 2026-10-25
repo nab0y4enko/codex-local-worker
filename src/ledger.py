@@ -83,8 +83,12 @@ def _safe_report(report: Dict[str, Any]) -> Dict[str, Any]:
         "model": str(model),
         "profile": profile_value,
         "attempts": len(attempts),
-        "first_try_success": bool(report.get("status") in ("ok", "ready") and attempts
-                                  and attempts[0].get("returncode") == 0),
+        "first_try_success": bool(report.get("status") in ("ok", "ready") and len(attempts) == 1
+                                  and attempts[0].get("returncode") == 0
+                                  and not attempts[0].get("terminal_failures")
+                                  and not attempts[0].get("timed_out")
+                                  and not attempts[0].get("stalled")
+                                  and not attempts[0].get("interrupted")),
         "durations": {
             "worker": _finite_number(timings.get("worker_seconds")),
             "verification": _finite_number(timings.get("verification_seconds")),
@@ -352,7 +356,7 @@ def build_summary(state_dir: Path, session: str, codex_home: Path) -> Dict:
         except OSError:
             pass
     if permission_actions:
-        suggestions.append("Review permissions changes recorded during this session.")
+        suggestions.append("Review global permissions changes recorded in launcher state.")
     escalations = []
     for row in rows:
         if row.get("escalates"):

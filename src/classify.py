@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 ENVIRONMENT_CODES = (
     "server_unreachable", "server_loading", "model_not_loaded", "model_ambiguous",
     "model_changed", "context_overflow", "server_memory", "tool_unavailable",
-    "secret_read_denied", "missing_env", "missing_tool", "simulator_unavailable",
+    "secret_read_denied", "sandbox_denied", "missing_env", "missing_tool", "simulator_unavailable",
     "stall", "budget_exhausted", "policy_refused", "verification_blocked",
     "deny_list_unavailable", "interrupted",
 )
@@ -49,6 +49,7 @@ _MESSAGES = {
     "server_memory": ("Free local model-server memory or reduce the request size.", "needs_user", None),
     "tool_unavailable": ("The installed worker tool surface does not provide a requested tool.", "retry_local", None),
     "secret_read_denied": ("Review the denied path and explicitly allow it only if needed.", "needs_user", None),
+    "sandbox_denied": ("A sandboxed command was denied. Review the reported path and command; keep the current permission policy unless a human decides a specific access change is needed.", "needs_user", None),
     "missing_env": ("Provide the required environment variable through the task contract.", "needs_user", None),
     "missing_tool": ("Install or expose the missing verification tool, then retry.", "needs_user", None),
     "simulator_unavailable": ("Make the selected simulator available and retry.", "needs_user", None),
@@ -96,9 +97,20 @@ def _pick(report: Dict[str, Any]) -> tuple:
     if isinstance(citations, dict) and citations.get("failures"):
         return "unverified_answer", ["launcher recorded failed citation verification"]
 
-    for denial in (report.get("permissions") or {}).get("denials", []) or []:
-        if isinstance(denial, dict) and denial.get("kind") == "read":
-            return "secret_read_denied", ["permissions.denials recorded a read denial"]
+    attempts = [item for item in report.get("attempts", []) or [] if isinstance(item, dict)]
+    if attempts:
+        denial = attempts[-1].get("sandbox_denial")
+        if (isinstance(denial, dict) and denial.get("source") in (
+                    "sandboxed_command_output", "codex_native_readonly_command",
+                    "codex_terminal_error")
+                and denial.get("kind") in ("read", "write")
+                and isinstance(denial.get("path"), str)):
+            if denial["kind"] == "read" and denial.get("known_secret") is True:
+                return "secret_read_denied", ["launcher promoted a typed read denial for a configured secret path"]
+            evidence = ["launcher promoted a typed sandbox command denial"]
+            if denial["kind"] == "write" and denial.get("known_out_of_scope") is True:
+                evidence.append("the blocked write targeted a protected out-of-scope path")
+            return "sandbox_denied", evidence
     if status == "audit_violation" or report.get("violations"):
         return "out_of_scope", ["launcher audit recorded an out-of-scope violation"]
     if status == "no_changes":

@@ -749,6 +749,18 @@ def archive(repo_arg: Any, state_dir_arg: Any, job_id: str, *, resume: bool = Fa
         if ref_exists(repo, ref):
             raise Refusal(f"recovery ref {ref} already exists; archives are never overwritten")
         worktree, _ = resolve_worktree(repo, state_dir, report)
+        # Worker-created commits and blobs live outside the shared primary object database.
+        # Validate them in isolation and import only hash-verified objects before any archive
+        # Git operation can resolve a worker-controlled OID (HEAD, index entries, or refs).
+        private_objects = report.get("git_object_store")
+        if private_objects:
+            expected_objects = state_dir / "reports" / job_id / "git-objects"
+            if Path(os.path.abspath(str(private_objects))) != expected_objects:
+                raise Refusal("report names an unexpected private object-store path")
+            try:
+                lw.promote_job_object_store(worktree, expected_objects)
+            except (lw.GitError, OSError, ValueError) as error:
+                raise Refusal(f"job object store could not be safely promoted: {error}") from error
         ignored_paths, ignored_bytes = ignored_inventory(worktree)
         if ignored_bytes > ignored_cap and not skip_ignored:
             raise Refusal("ignored files total %d bytes, above the %d byte cap; use "

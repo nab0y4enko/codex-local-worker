@@ -10,6 +10,7 @@ import contextlib
 from datetime import datetime, timezone
 import json
 import os
+import process_supervisor
 from pathlib import Path
 import re
 import selectors
@@ -429,7 +430,7 @@ def _terminate(process):
 
 def run_streaming(argv, *, cwd, env, timeout, stdin_data=None, observer=None,
                   terminate_group=None, capture_limit_bytes=None, stall_seconds=None,
-                  on_stall=None):
+                  on_stall=None, popen_factory=None):
     """Drain both pipes and feed stdin concurrently, bounded even with orphaned pipes.
 
     The callback receives raw bytes and must sanitize before persistence. Returned
@@ -444,7 +445,8 @@ def run_streaming(argv, *, cwd, env, timeout, stdin_data=None, observer=None,
     limit = CAPTURE_LIMIT_BYTES if capture_limit_bytes is None else max(0, int(capture_limit_bytes))
     started = time.monotonic()
     deadline = started + max(0, timeout)
-    process = subprocess.Popen(list(argv), cwd=str(cwd) if cwd else None, env=env,
+    factory = popen_factory or subprocess.Popen
+    process = factory(list(argv), cwd=str(cwd) if cwd else None, env=env,
         stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     selector = selectors.DefaultSelector()
@@ -640,6 +642,7 @@ class RunObserver:
                             if self.active_dir is not None and self.job_id else None)
         self.attempt = attempt
         self.launcher_pid = os.getpid()
+        self.launcher_start_identity = process_supervisor.process_start_identity(self.launcher_pid)
         self.worker_pid = None
         self.files = {}
         for name, suffix in (("stdout", ".jsonl"), ("stderr", ".stderr.log")):
@@ -665,8 +668,13 @@ class RunObserver:
         if self.active_path is not None:
             self.active_dir.mkdir(parents=True, exist_ok=True)
             _atomic_json(self.active_path, {
+                "schema": "local-worker-active-group/1",
                 "job_id": self.job_id, "launcher_pid": self.launcher_pid,
+                "launcher_start_identity": self.launcher_start_identity,
                 "worker_pgid": pid, "worker_command": self.worker_command,
+                "owner_pid": pid,
+                "owner_start_identity": process_supervisor.process_start_identity(pid),
+                "owner_sid": pid,
                 "started_at": self.started_at,
             })
         self._write_progress(force=True)

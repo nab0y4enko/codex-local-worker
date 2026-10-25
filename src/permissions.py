@@ -87,17 +87,10 @@ DEFAULT_DENY_WRITE = (
     "~/.bashrc", "~/.bash_profile", "~/.profile", "~/Library/LaunchAgents",
 )
 
-# Inside the primary's git common dir the profile is an allowlist: every write is denied except
-# these subtrees, which a commit in the job's linked worktree needs (it writes loose objects and
-# packs there). The job's own admin dir (``worktrees/<name>``) is re-opened separately. Everything
-# else -- config, hooks, info/, refs, logs, HEAD, packed-refs, shallow, MERGE_HEAD, index.lock,
-# modules/, reftable/, worktrees/ of other jobs -- stays read-only, so there is no list of planting
-# places to keep complete: what would run, unwrapped, the next time the user runs git there cannot
-# be written.
-GIT_WRITABLE_DIRS = ("objects",)
-# Inside a re-opened subtree: ``objects/info`` (alternates, packs lists, commit-graph) is shut again,
-# so the object store cannot be pointed at a directory the worker controls.
-GIT_SHUT_BELOW = (os.path.join("objects", "info"),)
+# The primary's complete git common directory is read-only. Job commits write to a private object
+# store with the primary object directory configured as a read-only alternate.
+GIT_WRITABLE_DIRS = ()
+GIT_SHUT_BELOW = ()
 # The admin files of a linked worktree that redirect where its git dir, common dir or config
 # come from. Writable they would point the launcher's own (unwrapped) git at a directory the
 # worker controls; the rest of the admin dir (index, HEAD, logs, ORIG_HEAD, …) stays writable so
@@ -524,7 +517,8 @@ def seatbelt_profile(perms: Permissions, *, primary_repo: Path, state_dir: Any =
                      allow_read: Iterable[Any] = (),
                      allow_read_subpaths: Iterable[Any] = (),
                      allow_write: Iterable[Any] = (),
-                     allow_write_subpaths: Iterable[Any] = ()) -> str:
+                     allow_write_subpaths: Iterable[Any] = (),
+                     deny_write_subpaths: Iterable[Any] = ()) -> str:
     """The Seatbelt profile text for ``perms`` (write it as UTF-8).
 
     ``(allow default)`` first, then denials (and the re-openings named below), in the order that
@@ -540,9 +534,9 @@ def seatbelt_profile(perms: Permissions, *, primary_repo: Path, state_dir: Any =
        the *resolved* common dir (``resolve_git_dirs``, plus ``git_common_dir`` when the caller
        knows one -- the launcher passes the job worktree's own ``GIT_COMMON_DIR``) and, when the
        primary is itself a linked worktree, its own admin dir. Never a hardcoded ``<repo>/.git``:
-       a ``--separate-git-dir`` primary keeps its refs, config and hooks elsewhere. Inside the
-       common dir this is an allowlist -- only ``objects/`` (``GIT_WRITABLE_DIRS``) is re-opened,
-       with ``objects/info`` shut again (``GIT_SHUT_BELOW``) -- so config, hooks, ``info/``, refs,
+       a ``--separate-git-dir`` primary keeps its refs, config and hooks elsewhere. The common
+       directory remains write-denied, including ``objects/``; job commits use a private object
+       store with the primary as a read-only alternate. Thus config, hooks, ``info/``, refs,
        ``MERGE_HEAD``, ``index.lock``, ``shallow``, ``reftable/`` and every other job's admin dir
        are refused without a list of planting places to keep complete. When the job's own linked
        worktree is known, its admin dir under ``worktrees/<name>`` is re-opened (so its commit
@@ -577,10 +571,8 @@ def seatbelt_profile(perms: Permissions, *, primary_repo: Path, state_dir: Any =
     ``docker login`` fail under the wrapper; create the directory outside a job, or lift the
     entry with ``allow-read``.
 
-    Not covered: ``objects/`` stays writable (a commit needs it), so a worker can still damage
-    or delete the primary's object store, though it cannot repoint or extend it; and a git
-    feature that writes elsewhere in the common dir during a worktree commit (``gc --auto``,
-    ``packed-refs``) warns or fails inside the job.
+    Git objects are job-private and the primary objects are a read-only alternate; a feature that
+    tries to maintain the primary common directory (``gc --auto``, ``packed-refs``) is refused.
     """
     _validate(perms, "the permissions list")
     lines = ["(version 1)", "(allow default)"]
@@ -635,8 +627,10 @@ def seatbelt_profile(perms: Permissions, *, primary_repo: Path, state_dir: Any =
         reshut_git = [os.path.join(common, name) for common in commons for name in GIT_SHUT_BELOW]
         lines.append(f"(deny file-write* (subpath {_quote(repo)}))")
         lines.append("(deny file-write* " + " ".join(f"(subpath {_quote(path)})" for path in shut) + ")")
-        lines.append("(allow file-write* " + " ".join(f"(subpath {_quote(path)})" for path in reopened_git) + ")")
-        lines.append("(deny file-write* " + " ".join(f"(subpath {_quote(path)})" for path in reshut_git) + ")")
+        if reopened_git:
+            lines.append("(allow file-write* " + " ".join(f"(subpath {_quote(path)})" for path in reopened_git) + ")")
+        if reshut_git:
+            lines.append("(deny file-write* " + " ".join(f"(subpath {_quote(path)})" for path in reshut_git) + ")")
         guarded += [repo, *shut, *reopened_git, *reshut_git]
         if job_git_admin is not None:
             admin = os.path.realpath(str(job_git_admin))
@@ -655,6 +649,11 @@ def seatbelt_profile(perms: Permissions, *, primary_repo: Path, state_dir: Any =
     if denied_writes:
         lines.append("(deny file-write* " + " ".join(f"(subpath {_quote(path)})" for path in denied_writes) + ")")
         guarded += denied_writes
+    private_write_denials = _reals(deny_write_subpaths)
+    if private_write_denials:
+        lines.append("(deny file-write* " + " ".join(
+            f"(subpath {_quote(path)})" for path in private_write_denials) + ")")
+        guarded += private_write_denials
     if hidden:
         lines.append("(deny file-write* " + " ".join(f"(subpath {_quote(path)})" for path in hidden) + ")")
         parents: Dict[str, str] = {}

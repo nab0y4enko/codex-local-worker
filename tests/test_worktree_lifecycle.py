@@ -87,6 +87,32 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(receipt["original_report"],
                          str(self.state / "reports" / JOB / "report.json"))
 
+    def test_archive_promotes_validated_private_worker_objects_before_resolving_head(self):
+        worktree = self.finish()
+        report_dir = self.state / "reports" / JOB
+        object_layout = lw.prepare_job_object_store(report_dir, self.repo)
+        env = dict(lw.worktree_git_layout(worktree), **object_layout)
+        (worktree / "private-commit.txt").write_text("worker-only commit\n")
+        lw.git(worktree, "add", "private-commit.txt", env=env)
+        lw.git(worktree, "-c", "user.name=Worker", "-c", "user.email=worker@test",
+               "commit", "-q", "-m", "private worker commit", env=env)
+        worker_head = lw.git(worktree, "rev-parse", "HEAD", env=env).stdout.decode().strip()
+        report_path = report_dir / "report.json"
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        report["git_object_store"] = str(report_dir / "git-objects")
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        self.assertNotEqual(lw.git(self.repo, "cat-file", "-e", worker_head,
+                                   check=False).returncode, 0)
+        result = self.run_archive()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receipt = json.loads(result.stdout)
+        self.assertEqual(lw.rev_parse(self.repo, receipt["recovery_commit"]),
+                         receipt["recovery_commit"])
+        self.assertEqual(sp.git(self.repo, "show",
+                         f"{receipt['recovery_ref']}:private-commit.txt").stdout.decode(),
+                         "worker-only commit\n")
+        self.assertEqual(lw.git(self.repo, "cat-file", "-e", worker_head).returncode, 0)
+
     def test_preexisting_recovery_ref_is_never_moved(self):
         worktree = self.finish()
         self.dirty(worktree)

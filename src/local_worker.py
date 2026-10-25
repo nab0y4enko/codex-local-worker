@@ -70,6 +70,7 @@ import contract
 import codex_catalog
 import ledger
 import omlx_discovery
+import process_supervisor
 import permissions
 import plugin_setup
 import notify
@@ -83,6 +84,72 @@ import worker_tools as tools
 from worker_tool_probe import ToolProbeError, probe_tools
 
 _RUN_OBSERVER = contextvars.ContextVar("local_worker_observer", default=None)
+_ACTIVE_GROUP_TRACKER = contextvars.ContextVar("local_worker_group_tracker", default=None)
+
+
+class ActiveGroupTracker:
+    """Persist every launcher-owned long process group while a job is running."""
+
+    def __init__(self, state_dir: Path, job_id: str) -> None:
+        self.active_dir = Path(state_dir) / "active"
+        self.path = self.active_dir / (str(job_id) + "-groups.json")
+        self.job_id = str(job_id)
+        self.launcher_pid = os.getpid()
+        self.launcher_start_identity = process_supervisor.process_start_identity(self.launcher_pid)
+        self.groups: Dict[int, Dict[str, Any]] = {}
+
+    def begin(self) -> None:
+        if not self.launcher_start_identity:
+            raise BlockedError("cannot record a verifiable launcher birth identity")
+        self._persist()
+
+    def finish(self) -> None:
+        for pgid in list(self.groups):
+            if not observation._group_exists(pgid):
+                self.groups.pop(pgid, None)
+        if self.groups:
+            self._persist()
+        else:
+            with contextlib.suppress(OSError):
+                self.path.unlink()
+
+    def _persist(self) -> None:
+        self.active_dir.mkdir(parents=True, exist_ok=True)
+        payload = {"schema": "local-worker-active-groups/1", "job_id": self.job_id,
+                   "launcher_pid": self.launcher_pid,
+                   "launcher_start_identity": self.launcher_start_identity,
+                   "process_groups": list(self.groups.values())}
+        temp = self.path.with_name(self.path.name + ".tmp-" + uuid.uuid4().hex[:8])
+        try:
+            temp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+            os.replace(str(temp), str(self.path))
+        finally:
+            with contextlib.suppress(OSError):
+                temp.unlink()
+
+    def started(self, pgid: int, argv: Sequence[str]) -> None:
+        identity = process_supervisor.process_start_identity(pgid)
+        if not identity:
+            raise BlockedError("cannot record a verifiable process birth identity; command was not started")
+        try:
+            owner_sid = os.getsid(int(pgid))
+        except OSError as error:
+            raise BlockedError("cannot confirm the supervised process session identity") from error
+        if owner_sid != int(pgid):
+            raise BlockedError("supervised process group does not own its recorded session")
+        self.groups[int(pgid)] = {"pgid": int(pgid), "owner_pid": int(pgid),
+                                  "owner_start_identity": identity, "owner_sid": owner_sid,
+                                  "command": str(argv[0]) if argv else ""}
+        self._persist()
+
+    def finished(self, pgid: int) -> None:
+        if not observation._group_exists(int(pgid)):
+            self.groups.pop(int(pgid), None)
+            if self.groups:
+                self._persist()
+            else:
+                with contextlib.suppress(OSError):
+                    self.path.unlink()
 
 # --------------------------------------------------------------------------------------
 # Fixed local policy
@@ -324,7 +391,7 @@ def _pid_alive(pid: int) -> bool:
 
 
 def reap_orphans(state_dir: Path) -> List[Dict[str, Any]]:
-    """Stop recorded worker groups only after their launcher died and command identity matches."""
+    """Stop only groups whose kept leader and session identity prove launcher ownership."""
     active_dir = Path(state_dir) / "active"
     killed: List[Dict[str, Any]] = []
     if not active_dir.is_dir():
@@ -333,41 +400,140 @@ def reap_orphans(state_dir: Path) -> List[Dict[str, Any]]:
         try:
             record = json.loads(record_path.read_text(encoding="utf-8"))
             launcher_pid = int(record["launcher_pid"])
-            pgid = int(record["worker_pgid"])
-            command = str(record["worker_command"])
+            launcher_identity = record.get("launcher_start_identity")
         except (OSError, ValueError, TypeError, KeyError):
             continue
-        if launcher_pid <= 0 or pgid <= 0 or not command or _pid_alive(launcher_pid):
+        if launcher_pid <= 0:
             continue
-        if not observation._group_exists(pgid):
+        current_launcher = process_supervisor.process_start_identity(launcher_pid)
+        if (_pid_alive(launcher_pid) and
+                (not launcher_identity or current_launcher == launcher_identity)):
+            continue
+
+        records = record.get("process_groups")
+        groups = records if isinstance(records, list) else [record]
+        remaining = []
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            try:
+                pgid = int(group.get("pgid", group.get("worker_pgid")))
+                owner_pid = int(group.get("owner_pid", pgid))
+                owner_sid = int(group.get("owner_sid", pgid))
+                owner_identity = str(group.get("owner_start_identity") or "")
+                command = str(group.get("command", group.get("worker_command", "")))
+            except (TypeError, ValueError):
+                remaining.append(group)
+                continue
+            if pgid <= 0 or owner_pid != pgid or owner_sid != pgid or not owner_identity:
+                # Old records without a birth/session proof are intentionally preserved.
+                remaining.append(group)
+                continue
+            members = process_supervisor.process_group_members(pgid)
+            if members is None:
+                remaining.append(group)
+                killed.append({"job_id": record.get("job_id"), "worker_pgid": pgid,
+                               "action": "ownership_uncertain_preserved"})
+                continue
+            owner_member = next((item for item in members if item["pid"] == owner_pid and
+                                 item["sid"] == owner_sid), None)
+            actual_identity = process_supervisor.process_start_identity(owner_pid)
+            if owner_member is None or actual_identity != owner_identity:
+                live_members = [item for item in members if not str(item.get("state", "")).startswith("Z")]
+                if live_members:
+                    remaining.append(group)
+                    killed.append({"job_id": record.get("job_id"), "worker_pgid": pgid,
+                                   "action": "ownership_uncertain_preserved"})
+                continue
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                remaining.append(group)
+                continue
+            uncertain = False
+            members_alive = True
+            deadline = time.monotonic() + .5
+            while time.monotonic() < deadline:
+                members_now = process_supervisor.process_group_members(pgid)
+                if members_now is None:
+                    uncertain = True
+                    break
+                live_now = [item for item in members_now
+                            if not str(item.get("state", "")).startswith("Z")]
+                if not live_now:
+                    members_alive = False
+                    break
+                keeper = next((item for item in live_now if item["pid"] == owner_pid and
+                               item["sid"] == owner_sid), None)
+                if (keeper is None or
+                        process_supervisor.process_start_identity(owner_pid) != owner_identity):
+                    uncertain = True
+                    break
+                time.sleep(.02)
+            if uncertain:
+                remaining.append(group)
+                killed.append({"job_id": record.get("job_id"), "worker_pgid": pgid,
+                               "action": "ownership_uncertain_preserved"})
+                continue
+            if members_alive:
+                # Revalidate the still-running keeper immediately before escalation. If it exited
+                # or process-table evidence is unavailable, a reused PGID is never signalled.
+                final_members = process_supervisor.process_group_members(pgid)
+                final_keeper = (next((item for item in final_members or []
+                                      if item["pid"] == owner_pid and item["sid"] == owner_sid and
+                                      not str(item.get("state", "")).startswith("Z")), None)
+                                if final_members is not None else None)
+                if (final_keeper is None or
+                        process_supervisor.process_start_identity(owner_pid) != owner_identity):
+                    remaining.append(group)
+                    killed.append({"job_id": record.get("job_id"), "worker_pgid": pgid,
+                                   "action": "ownership_uncertain_preserved"})
+                    continue
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    members_alive = False
+                except PermissionError:
+                    remaining.append(group)
+                    continue
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline:
+                    after_kill = process_supervisor.process_group_members(pgid)
+                    if after_kill is None:
+                        uncertain = True
+                        break
+                    if not any(not str(item.get("state", "")).startswith("Z")
+                               for item in after_kill):
+                        members_alive = False
+                        break
+                    time.sleep(.02)
+                if uncertain or members_alive:
+                    remaining.append(group)
+                    killed.append({"job_id": record.get("job_id"), "worker_pgid": pgid,
+                                   "action": "ownership_uncertain_preserved"})
+                    continue
+            item = {"job_id": record.get("job_id"), "launcher_pid": launcher_pid,
+                    "worker_pgid": pgid, "worker_command": command, "action": "killed"}
+            killed.append(item)
+            try:
+                with (active_dir / "reaped.jsonl").open("a", encoding="utf-8") as log:
+                    log.write(json.dumps(item, sort_keys=True) + "\n")
+            except OSError:
+                pass
+        if remaining:
+            if isinstance(records, list):
+                record["process_groups"] = remaining
+                with contextlib.suppress(OSError, TypeError, ValueError):
+                    record_path.write_text(json.dumps(record, sort_keys=True) + "\n",
+                                            encoding="utf-8")
+        else:
             with contextlib.suppress(OSError):
                 record_path.unlink()
-            continue
-        try:
-            actual = subprocess.run(["ps", "-o", "command=", "-p", str(pgid)],
-                                    capture_output=True, text=True, timeout=2, check=False).stdout.strip()
-        except (OSError, subprocess.TimeoutExpired):
-            continue
-        if not actual.startswith(command):
-            continue
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(pgid, signal.SIGTERM)
-        deadline = time.monotonic() + .5
-        while time.monotonic() < deadline and observation._group_exists(pgid):
-            time.sleep(.02)
-        if observation._group_exists(pgid):
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(pgid, signal.SIGKILL)
-        item = {"job_id": record.get("job_id"), "launcher_pid": launcher_pid,
-                "worker_pgid": pgid, "worker_command": command, "action": "killed"}
-        killed.append(item)
-        with contextlib.suppress(OSError):
-            record_path.unlink()
-        try:
-            with (active_dir / "reaped.jsonl").open("a", encoding="utf-8") as log:
-                log.write(json.dumps(item, sort_keys=True) + "\n")
-        except OSError:
-            pass
+        if not groups:
+            with contextlib.suppress(OSError):
+                record_path.unlink()
     return killed
 
 
@@ -597,7 +763,8 @@ def load_requested_model(settings_path: Path, model: str,
 
 
 def discover_job_profile(settings_path: Path, requested_model: Optional[str],
-                         context_cap: Optional[int], fetch: omlx_discovery.HttpFetch
+                         context_cap: Optional[int], fetch: omlx_discovery.HttpFetch,
+                         deadline: Optional["Deadline"] = None
                          ) -> Tuple[omlx_discovery.ServerProfile, int]:
     """Ask the live server what a worker will run on: its profile and the window to pin.
 
@@ -606,7 +773,8 @@ def discover_job_profile(settings_path: Path, requested_model: Optional[str],
     """
     cap = None if context_cap is None else validate_context_cap(context_cap)
     try:
-        profile = omlx_discovery.discover(Path(settings_path), requested_model, fetch=fetch)
+        profile = omlx_discovery.discover(Path(settings_path), requested_model, fetch=fetch,
+                                          deadline=deadline.remaining if deadline else None)
     except omlx_discovery.DiscoveryError as error:
         raise _discovery_failure(error) from error
     return profile, profile.effective_context(cap)
@@ -642,19 +810,30 @@ def _output_text(value: Any) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _run_codex_info(codex_bin: str, args: Sequence[str], run: Callable[..., Any]
+def _run_codex_info(codex_bin: str, args: Sequence[str], run: Callable[..., Any],
+                    deadline: Optional["Deadline"] = None
                     ) -> Tuple[Optional[Any], Optional[str]]:
     """One bounded informational Codex call: ``(completed process, None)`` or ``(None, why)``."""
     argv = [str(codex_bin), *args]
+    timeout = CODEX_COMPAT_TIMEOUT_SECONDS
+    if deadline is not None:
+        timeout = min(timeout, deadline.remaining())
+        if timeout <= 0:
+            return None, "job deadline expired before `%s`" % " ".join(argv)
     try:
+        if run is subprocess.run:
+            bounded = run_bounded(argv, cwd=None, env=dict(os.environ), timeout=timeout)
+            return subprocess.CompletedProcess(argv, bounded["returncode"],
+                                               bounded["stdout"], bounded["stderr"]), None
         return run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                   stderr=subprocess.PIPE, timeout=CODEX_COMPAT_TIMEOUT_SECONDS,
+                   stderr=subprocess.PIPE, timeout=timeout,
                    check=False), None
     except (OSError, subprocess.SubprocessError) as error:
         return None, "`%s` could not be run (%s)" % (" ".join(argv), error)
 
 
-def codex_compat(codex_bin: str, run: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
+def codex_compat(codex_bin: str, run: Callable[..., Any] = subprocess.run,
+                 deadline: Optional["Deadline"] = None) -> Dict[str, Any]:
     """Whether the installed Codex CLI can run the worker invocation, without starting a model.
 
     Two informational calls: ``codex --version`` must report at least ``MIN_CODEX_VERSION``, and
@@ -664,9 +843,11 @@ def codex_compat(codex_bin: str, run: Callable[..., Any] = subprocess.run) -> Di
     result: Dict[str, Any] = {"ok": False, "version": None, "missing_flags": [], "reason": None}
     minimum = ".".join(str(part) for part in MIN_CODEX_VERSION)
     problems: List[str] = []
-    version, failure = _run_codex_info(codex_bin, ["--version"], run)
+    version, failure = _run_codex_info(codex_bin, ["--version"], run, deadline)
     if version is None:
         result["reason"] = failure
+        if deadline is not None and deadline.remaining() <= 0:
+            result["budget_exhausted"] = True
         return result
     match = VERSION_RE.search(_output_text(version.stdout))
     if version.returncode != 0 or match is None:
@@ -678,9 +859,15 @@ def codex_compat(codex_bin: str, run: Callable[..., Any] = subprocess.run) -> Di
         if found < MIN_CODEX_VERSION:
             problems.append("Codex CLI %s is older than %s, the oldest version this launcher "
                             "supports" % (result["version"], minimum))
-    help_run, failure = _run_codex_info(codex_bin, ["exec", "--help"], run)
+    if deadline is not None and deadline.remaining() <= 0:
+        result["reason"] = "job deadline expired before `%s exec --help`" % codex_bin
+        result["budget_exhausted"] = True
+        return result
+    help_run, failure = _run_codex_info(codex_bin, ["exec", "--help"], run, deadline)
     if help_run is None:
         problems.append(str(failure))
+        if deadline is not None and deadline.remaining() <= 0:
+            result["budget_exhausted"] = True
     else:
         text = _output_text(help_run.stdout) + "\n" + _output_text(help_run.stderr)
         result["missing_flags"] = [
@@ -883,7 +1070,8 @@ def model_label(name: str) -> str:
 
 
 def describe_model_change(profile: omlx_discovery.ServerProfile, settings_path: Path,
-                          fetch: omlx_discovery.HttpFetch) -> str:
+                          fetch: omlx_discovery.HttpFetch,
+                          deadline: Optional[Deadline] = None) -> str:
     """What oMLX reports now, in words, once a recheck found the pinned model gone or changed.
 
     One more discovery, made only on the way to a refusal: the recheck already reached the
@@ -891,7 +1079,9 @@ def describe_model_change(profile: omlx_discovery.ServerProfile, settings_path: 
     """
     pinned = profile.model
     try:
-        now = omlx_discovery.discover(Path(settings_path), None, fetch=fetch).model
+        now = omlx_discovery.discover(
+            Path(settings_path), None, fetch=fetch,
+            deadline=deadline.remaining if deadline else None).model
     except omlx_discovery.DiscoveryError as error:
         if error.code == "model_not_loaded":
             return "no chat model is loaded"
@@ -911,12 +1101,14 @@ def describe_model_change(profile: omlx_discovery.ServerProfile, settings_path: 
 
 
 def recheck_pinned_model(profile: omlx_discovery.ServerProfile, settings_path: Path,
-                         fetch: omlx_discovery.HttpFetch, attempt_number: int
+                         fetch: omlx_discovery.HttpFetch, attempt_number: int,
+                         deadline: Optional[Deadline] = None
                          ) -> Optional[Tuple[str, str]]:
     """``None`` while oMLX still serves the model this job pinned, else ``(reason, message)``
     for an attempt that must not start: ``model_changed`` or ``server_unreachable``, with a
     message naming the pinned model and what the server reports now."""
-    reason = omlx_discovery.recheck(profile, Path(settings_path), fetch)
+    reason = omlx_discovery.recheck(profile, Path(settings_path), fetch,
+                                    deadline=deadline.remaining if deadline else None)
     if reason is None:
         return None
     pinned = model_label(profile.model.api_model)
@@ -925,18 +1117,22 @@ def recheck_pinned_model(profile: omlx_discovery.ServerProfile, settings_path: P
             "before attempt %d oMLX at %s could not be re-read, so the pinned model %s cannot "
             "be confirmed (server unreachable, or settings.json no longer points at it); the "
             "attempt did not start (%s)" % (attempt_number, profile.base_url, pinned, reason))
+    if reason == "budget_exhausted":
+        return reason, ("before attempt %d the shared job deadline was exhausted during the "
+                        "oMLX model recheck; the attempt did not start" % attempt_number)
     return reason, (
         "before attempt %d oMLX no longer serves the model pinned for this job, %s: %s; the "
         "attempt did not start (%s)" % (
-            attempt_number, pinned, describe_model_change(profile, settings_path, fetch), reason))
+            attempt_number, pinned,
+            describe_model_change(profile, settings_path, fetch, deadline), reason))
 
 
 # --------------------------------------------------------------------------------------
 # Git helpers (argument arrays only, no shell, no inherited hooks)
 # --------------------------------------------------------------------------------------
 def git_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-    """Never a pager, never an editor, never a terminal prompt, never system attributes."""
-    env = dict(os.environ)
+    """Never inherit repository redirects, object stores, config injection or Git helpers."""
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env.update(GIT_SAFE_ENV)
     if extra:
         env.update(extra)
@@ -1406,9 +1602,10 @@ def audit_worktree(worktree: Path, base_commit: str, allowed_paths: Sequence[str
     the worker ran -- is compared with the live files before *each* git call: on a difference the
     audit runs no more git, and records the violation instead.
 
-    Gitlinks present in the base tree are left out of staging (a pathspec exclusion) and of
-    ``status`` (``--ignore-submodules=all``), so git never descends into a nested repository the
-    worker may have planted at one; a change to such a path is therefore not reported.
+    Gitlinks present in the base tree are left out of staging and ``status`` ignores submodules,
+    so git never descends into a nested repository the worker may have planted there. Each such
+    path is consequently reported as changed with an explicit unaudited-state violation; the
+    launcher fails closed instead of claiming an unchanged submodule it did not inspect.
     """
     layout = dict(git_layout or {})
     audit = Audit(base_commit=base_commit)
@@ -1449,6 +1646,8 @@ def audit_worktree(worktree: Path, base_commit: str, allowed_paths: Sequence[str
         return status_entries(worktree, ignore_submodules=True, env=(layout or None), **options)
 
     try:
+        if "GIT_OBJECT_DIRECTORY" in layout:
+            validate_job_object_store(worktree, layout)
         audit.head_commit = run_git("rev-parse", "--verify", "--quiet", "HEAD",
                                     env=layout or None).stdout.decode("utf-8", "replace").strip()
         if audit.head_commit != base_commit:
@@ -1462,8 +1661,8 @@ def audit_worktree(worktree: Path, base_commit: str, allowed_paths: Sequence[str
 
         run_git("read-tree", base_commit, env=audit_env)
         untampered()
-        excluded = [f":(exclude,literal){path}"
-                    for path in base_gitlinks(worktree, base_commit, env=layout or None)]
+        gitlinks = base_gitlinks(worktree, base_commit, env=layout or None)
+        excluded = [f":(exclude,literal){path}" for path in gitlinks]
         run_git("add", "-A", *(["--", ".", *excluded] if excluded else []), env=audit_env)
         for entry_status, path in status():
             record(entry_status, path)
@@ -1488,6 +1687,15 @@ def audit_worktree(worktree: Path, base_commit: str, allowed_paths: Sequence[str
         diff = run_git("--no-optional-locks", "diff", "--cached", "--binary",
                        *DIFF_ARGS, base_commit, env=audit_env)
         audit.patch = redact(diff.stdout.decode("utf-8", "replace"), secrets).encode("utf-8")
+        for path in gitlinks:
+            record("??", path, "gitlink_uninspected")
+            audit.violations.append({
+                "path": path,
+                "reason": "gitlink state is unknown because the nested repository was not traversed",
+            })
+            if not is_allowed(path, allowed_paths):
+                audit.violations.append({"path": path, "reason": "outside allowed_paths"})
+        audit.changed_paths = sorted({entry["path"] for entry in entries})
         summary = run_git("--no-optional-locks", "diff", "--cached", "--stat",
                           *DIFF_ARGS, base_commit, env=audit_env)
         audit.diffstat = redact(summary.stdout.decode("utf-8", "replace"), secrets).strip()
@@ -1574,11 +1782,51 @@ def run_bounded(argv: Sequence[str], *, cwd: Optional[Path], env: Dict[str, str]
     descendant still held the redirected temporary file, so an orphaned writer kept growing it
     after ``run_bounded`` returned.
     """
-    return observation.run_streaming(
-        argv, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data,
-        observer=_RUN_OBSERVER.get() if stdin_data is not None else None,
-        stall_seconds=stall_seconds, on_stall=on_stall,
-        terminate_group=_terminate_group)
+    tracker = _ACTIVE_GROUP_TRACKER.get()
+    owned: List[int] = []
+
+    def spawn(command, **kwargs):
+        process = process_supervisor.popen(command, **kwargs)
+        owned.append(process.pid)
+        try:
+            if tracker is not None:
+                tracker.started(process.pid, command)
+            process_supervisor.release(process)
+        except BaseException:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            with contextlib.suppress(Exception):
+                process.wait(timeout=2)
+            raise
+        return process
+
+    try:
+        return observation.run_streaming(
+            argv, cwd=cwd, env=env, timeout=timeout, stdin_data=stdin_data,
+            observer=_RUN_OBSERVER.get() if stdin_data is not None else None,
+            stall_seconds=stall_seconds, on_stall=on_stall,
+            terminate_group=_terminate_group, popen_factory=spawn)
+    finally:
+        if tracker is not None:
+            for pgid in owned:
+                tracker.finished(pgid)
+
+
+def spawn_owned_popen(argv: Sequence[str], **kwargs: Any) -> subprocess.Popen:
+    """Start a kept, identity-recorded group for launcher probes that need a live protocol pipe."""
+    process = process_supervisor.popen(argv, **kwargs)
+    tracker = _ACTIVE_GROUP_TRACKER.get()
+    try:
+        if tracker is not None:
+            tracker.started(process.pid, argv)
+        process_supervisor.release(process)
+    except BaseException:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            process.wait(timeout=2)
+        raise
+    return process
 
 
 # --------------------------------------------------------------------------------------
@@ -2270,6 +2518,14 @@ def full_host_env(env: Dict[str, str]) -> Dict[str, str]:
     return bounded
 
 
+def capture_source_env(env: Dict[str, str]) -> Dict[str, str]:
+    """Capture/reference checkout Git must use its own object database, never the job's."""
+    result = full_host_env(env)
+    result.pop("GIT_OBJECT_DIRECTORY", None)
+    result.pop("GIT_ALTERNATE_OBJECT_DIRECTORIES", None)
+    return result
+
+
 def probe_sandbox(codex_bin: str, worktree: Path, env: Dict[str, str],
                   secrets: Sequence[str] = (),
                   deadline: Optional[Deadline] = None) -> Dict[str, Any]:
@@ -2321,6 +2577,7 @@ class DenyWrapper:
     record: Dict[str, Any]
     worktree: Optional[Path] = None
     profile: Optional[Path] = None
+    configured_permissions: Optional[permissions.Permissions] = None
     # The primary's git directories (common dir, own admin dir): a denial naming one is a write to
     # the primary checkout even when the checkout keeps its git dir elsewhere (R22).
     git_dirs: Tuple[Path, ...] = ()
@@ -2350,6 +2607,39 @@ class DenyWrapper:
             if (found["path"], found["kind"]) not in seen:
                 seen.add((found["path"], found["kind"]))
                 self.record["denials"].append(dict(found, source=source))
+
+
+def typed_sandbox_denial(denials: Sequence[Dict[str, Any]],
+                         configured_permissions: permissions.Permissions,
+                         *, source: str) -> Optional[Dict[str, Any]]:
+    """Promote launcher-parsed protected-path denials into a small typed attempt record.
+
+    Callers pass only denials extracted from completed command output by ``DenyWrapper``. Worker
+    prose and raw stderr are never inputs to this function.
+    """
+    for item in denials:
+        if not isinstance(item, dict) or item.get("kind") not in ("read", "write"):
+            continue
+        path = item.get("path")
+        if not isinstance(path, str) or not path:
+            continue
+        kind, cause = item["kind"], item.get("cause")
+        known_secret = False
+        if kind == "read" and cause == "deny_read":
+            observed = os.path.normcase(os.path.normpath(os.path.expanduser(path)))
+            for root in configured_permissions.deny_read:
+                for candidate in permissions._forms(root):
+                    normalized = os.path.normcase(os.path.normpath(candidate))
+                    if observed == normalized or observed.startswith(normalized.rstrip(os.sep) + os.sep):
+                        known_secret = True
+                        break
+                if known_secret:
+                    break
+        return {"source": source, "kind": kind, "path": path,
+                "known_secret": known_secret,
+                "known_out_of_scope": kind == "write" and cause in (
+                    "primary_checkout", "persistence_vector")}
+    return None
 
 
 def deny_list_applied(report: Dict[str, Any]) -> bool:
@@ -2395,7 +2685,8 @@ def _covers_path(parent: Path, child: Path) -> bool:
 def job_write_roots(report_dir: Path, worktree: Path, codex_home: Path) -> List[Path]:
     """The directory roots a wrapped process may write: the ones that are rename-protected so the
     launcher never follows one that was swapped for a symlink."""
-    return [worktree, codex_home, report_dir / NATIVE_SCRATCH_NAME, report_dir / SCREENSHOTS_DIR_NAME]
+    return [worktree, codex_home, report_dir / NATIVE_SCRATCH_NAME,
+            report_dir / SCREENSHOTS_DIR_NAME, report_dir / "git-objects"]
 
 
 def job_writable_paths(report_dir: Path, worktree: Path, codex_home: Path, attempts: int,
@@ -2431,6 +2722,122 @@ def worktree_git_layout(worktree: Path) -> Dict[str, str]:
     common = git(worktree, "rev-parse", "--path-format=absolute", "--git-common-dir")
     common_dir = common.stdout.decode("utf-8", "replace").strip()
     return {"GIT_DIR": git_dir, "GIT_COMMON_DIR": common_dir, "GIT_WORK_TREE": str(worktree)}
+
+
+def prepare_job_object_store(report_dir: Path, primary_repo: Path) -> Dict[str, str]:
+    """Create an empty per-job object store whose only alternate is the protected primary store."""
+    primary_objects = Path(permissions.resolve_git_dirs(primary_repo)[1]) / "objects"
+    object_dir = report_dir / "git-objects"
+    object_dir.mkdir(mode=0o700)
+    # Git reads alternates from objects/info/alternates. Pre-create the directory so the
+    # worker profile can deny all writes there before Git opens the private object store.
+    (object_dir / "info").mkdir(mode=0o500)
+    # Git's alternate list uses C-quoted path components to safely represent spaces and colons.
+    encoded = '"' + str(primary_objects).replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return {"GIT_OBJECT_DIRECTORY": str(object_dir),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": encoded}
+
+
+def _private_object_env(git_layout: Dict[str, str]) -> Dict[str, str]:
+    """Pin Git to the job store while deliberately hiding every alternate object store."""
+    env = {key: value for key, value in git_layout.items()
+           if key != "GIT_ALTERNATE_OBJECT_DIRECTORIES"}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null",
+               GIT_CONFIG_SYSTEM="/dev/null", GIT_ATTR_NOSYSTEM="1")
+    return env
+
+
+def _object_payload(worktree: Path, oid: str, env: Dict[str, str]) -> Optional[Tuple[str, bytes]]:
+    result = git(worktree, "cat-file", "--batch", stdin=(oid + "\n").encode(),
+                 check=False, env=env)
+    if result.returncode or not result.stdout:
+        return None
+    header, separator, tail = result.stdout.partition(b"\n")
+    fields = header.decode("ascii", "replace").split()
+    if len(fields) == 2 and fields[0] == oid and fields[1] == "missing":
+        return None
+    if not separator or len(fields) != 3 or fields[0] != oid:
+        raise GitError("object store returned a malformed object header")
+    try:
+        size = int(fields[2])
+    except ValueError as error:
+        raise GitError("object store returned an invalid object size") from error
+    if size < 0 or len(tail) != size + 1 or tail[-1:] != b"\n":
+        raise GitError("object store returned a truncated or overlong object")
+    return fields[1], tail[:size]
+
+
+def validate_job_object_store(worktree: Path, git_layout: Dict[str, str]) -> List[str]:
+    """Validate private objects before any parent Git read can resolve worker-controlled OIDs."""
+    object_dir = Path(git_layout["GIT_OBJECT_DIRECTORY"])
+    if object_dir.is_symlink() or not object_dir.is_dir():
+        raise GitError("job object store is missing or replaced")
+    info = object_dir / "info"
+    if info.is_symlink() or not info.is_dir() or any(info.iterdir()):
+        raise GitError("job object store contains mutable metadata; refusing to read its objects")
+    for base, dirs, files in os.walk(str(object_dir), followlinks=False):
+        for name in dirs + files:
+            if (Path(base) / name).is_symlink():
+                raise GitError("job object store contains a symlink; refusing to read its objects")
+    isolated_env = _private_object_env(git_layout)
+    listing = git(worktree, "cat-file", "--batch-all-objects",
+                  "--batch-check=%(objectname)", check=False, env=isolated_env)
+    if listing.returncode:
+        detail = listing.stderr.decode("utf-8", "replace").strip()[:500]
+        raise GitError("job object store cannot be enumerated: " + (detail or "git cat-file failed"))
+    oids = sorted(set(line.decode("ascii", "replace").strip()
+                      for line in listing.stdout.splitlines() if line.strip()))
+    fmt = git(worktree, "rev-parse", "--show-object-format", env=isolated_env).stdout.decode().strip()
+    if fmt not in ("sha1", "sha256"):
+        raise GitError("unsupported primary Git object format: " + fmt)
+    primary_objects = Path(permissions.resolve_git_dirs(worktree)[1]) / "objects"
+    primary_env = {key: value for key, value in git_layout.items()
+                   if key not in ("GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES")}
+    primary_env.update(GIT_OBJECT_DIRECTORY=str(primary_objects), GIT_CONFIG_NOSYSTEM="1",
+                       GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
+                       GIT_ATTR_NOSYSTEM="1")
+    for oid in oids:
+        payload = _object_payload(worktree, oid, isolated_env)
+        if payload is None:
+            raise GitError("job object disappeared during isolated validation")
+        kind, data = payload
+        digest = hashlib.new(fmt)
+        digest.update(kind.encode("ascii") + b" " + str(len(data)).encode("ascii") + b"\0" + data)
+        if digest.hexdigest() != oid:
+            raise GitError("job object hash does not match its object id: " + oid)
+        existing = _object_payload(worktree, oid, primary_env)
+        if existing is not None and existing != payload:
+            raise GitError("job object collides with different primary object: " + oid)
+    return oids
+
+
+def promote_job_object_store(worktree: Path, object_dir: Path) -> List[str]:
+    """Validate then import finished job objects without replacing existing primary OIDs."""
+    layout = worktree_git_layout(worktree)
+    layout["GIT_OBJECT_DIRECTORY"] = str(object_dir)
+    oids = validate_job_object_store(worktree, layout)
+    isolated_env = _private_object_env(layout)
+    primary_objects = Path(permissions.resolve_git_dirs(worktree)[1]) / "objects"
+    primary_env = {key: value for key, value in layout.items()
+                   if key not in ("GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES")}
+    primary_env.update(GIT_OBJECT_DIRECTORY=str(primary_objects), GIT_CONFIG_NOSYSTEM="1",
+                       GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
+                       GIT_ATTR_NOSYSTEM="1")
+    for oid in oids:
+        payload = _object_payload(worktree, oid, isolated_env)
+        if payload is None:
+            raise GitError("validated job object disappeared before archive promotion")
+        kind, data = payload
+        existing = _object_payload(worktree, oid, primary_env)
+        if existing is not None:
+            if existing != payload:
+                raise GitError("job object changed a primary OID during archive promotion")
+            continue
+        written = git(worktree, "hash-object", "-w", "-t", kind, "--stdin",
+                      stdin=data, env=primary_env).stdout.decode().strip()
+        if written != oid:
+            raise GitError("archive promotion produced an unexpected object ID")
+    return oids
 
 
 def git_admin_fingerprint(layout: Dict[str, str], worktree: Path) -> Dict[str, str]:
@@ -2560,7 +2967,9 @@ def setup_deny_wrapper(options: "JobOptions", report: Dict[str, Any],
             allow_read_subpaths=[helper_scratch] if helper_scratch else (),
             allow_write=[cloud_home / "auth.json", cloud_home / "tmp",
                          cloud_home / "tmp" / "arg0-macos"] if cloud_home else (),
-            allow_write_subpaths=[helper_scratch] if helper_scratch else ())
+            allow_write_subpaths=[helper_scratch] if helper_scratch else (),
+            deny_write_subpaths=([str(Path(git_layout["GIT_OBJECT_DIRECTORY"]) / "info")]
+                                 if "GIT_OBJECT_DIRECTORY" in git_layout else ()))
         primary_git_dirs = permissions.resolve_git_dirs(options.task.repo_path)
     except permissions.PermissionsError as error:
         raise PreflightError(f"the permissions deny profile cannot be built: {error}") from None
@@ -2568,7 +2977,8 @@ def setup_deny_wrapper(options: "JobOptions", report: Dict[str, Any],
     profile.write_text(text, encoding="utf-8")
     record.update(mode=perms.mode, profile=str(profile), deny_list_applied=False,
                   profile_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest())
-    wrapper = DenyWrapper(profile_perms, options.task.repo_path, options.state_dir, record, worktree=worktree,
+    wrapper = DenyWrapper(profile_perms, options.task.repo_path, options.state_dir, record,
+                          worktree=worktree, configured_permissions=perms,
                           git_dirs=(Path(git_layout["GIT_COMMON_DIR"]),
                                     *(Path(path) for path in primary_git_dirs)))
     if not permissions.wrapper_available():
@@ -2938,7 +3348,8 @@ def _execute_read_job(options: JobOptions, report: Dict[str, Any], deadline: Dea
     schema = read_answers.envelope_schema(task.answer_schema or {})
     schema_path.write_text(json.dumps(schema, indent=2) + "\n", encoding="utf-8")
     if (task.tier.kind != "cloud" and
-            recheck_pinned_model(profile, options.settings_path, options.omlx_fetch, 1) is not None):
+            recheck_pinned_model(profile, options.settings_path, options.omlx_fetch, 1,
+                                 deadline=deadline) is not None):
         report["status"] = "answer_invalid"
         report["failure_reason"] = "the pinned model changed before the read attempt"
         return
@@ -2976,6 +3387,7 @@ def _execute_read_job(options: JobOptions, report: Dict[str, Any], deadline: Dea
         job={"started_at": report.get("started_at"), "workstream": report.get("workstream"),
              "job_kind": report.get("job_kind")})
     token = _RUN_OBSERVER.set(observer)
+    denial_start = len(wrapper.record["denials"])
     timeout = deadline.cap(remaining)
     try:
         result = run_bounded(
@@ -2997,6 +3409,8 @@ def _execute_read_job(options: JobOptions, report: Dict[str, Any], deadline: Dea
 
     stdout_text = redact(result["stdout"].decode("utf-8", "replace"), secrets)
     stderr_text = redact(result["stderr"].decode("utf-8", "replace"), secrets)
+    for output in worker_command_outputs(stdout_text):
+        wrapper.collect(output, "read worker attempt 1")
     if observer.activity_count == 0:
         if result.get("stdout"):
             observer("stdout", result["stdout"])
@@ -3029,6 +3443,12 @@ def _execute_read_job(options: JobOptions, report: Dict[str, Any], deadline: Dea
                "stderr_excerpt": _tail(stderr_text),
                "last_message_excerpt": "", "logs": [str(prompt_path), str(jsonl_path),
                                                         str(stderr_path), str(last_path)]}
+    denial = typed_sandbox_denial(
+        wrapper.record["denials"][denial_start:],
+        wrapper.configured_permissions or wrapper.perms,
+                                  source="codex_native_readonly_command")
+    if denial:
+        attempt["sandbox_denial"] = denial
     report["attempts"].append(attempt)
     report["worker_patch_present"] = False
     report["tests"] = []
@@ -3314,7 +3734,7 @@ def _capture_all(options: JobOptions, report: Dict[str, Any], worktree: Path,
         deadline.require("screenshot command")
         wrapped = wrapper.wrap(verification_argv(report.get("sandbox") or {},
                                                  options.codex_bin, cwd, argv))
-        result = run_bounded(wrapped, cwd=cwd, env=full_host_env(verify_env),
+        result = run_bounded(wrapped, cwd=cwd, env=capture_source_env(verify_env),
                              timeout=deadline.require("screenshot command"))
         counter += 1
         output = redact((result["stdout"] + b"\n" + result["stderr"]).decode(
@@ -3403,7 +3823,10 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     perms = load_job_permissions(options, report_dir)
     # The installed Codex must run the qualified invocation before anything else is spent on
     # the job, a model load included.
-    report["codex_compat"] = codex_compat(options.codex_bin, run=options.codex_run)
+    report["codex_compat"] = codex_compat(options.codex_bin, run=options.codex_run,
+                                          deadline=deadline)
+    if report["codex_compat"].get("budget_exhausted"):
+        raise DeadlineExpired("job deadline expired during Codex compatibility probes")
     if not report["codex_compat"]["ok"]:
         raise CodexIncompatible(report["codex_compat"])
     if options.load_model and is_cloud:
@@ -3446,7 +3869,8 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         api_key = ""
     else:
         profile, context_window = discover_job_profile(
-            options.settings_path, options.requested_model, options.context_cap, options.omlx_fetch)
+            options.settings_path, options.requested_model, options.context_cap,
+            options.omlx_fetch, deadline=deadline)
         report["preflight"] = preflight_receipt(profile, context_window)
         report["endpoint"] = report["preflight"]["endpoint"]
         report["model_profile"] = report["preflight"]["profile"]
@@ -3487,6 +3911,9 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     # own (the worker has not run), and fingerprint the files that could repoint them. Every later
     # (unwrapped) audit pins this layout, and any change to the fingerprint is an audit violation.
     git_layout = worktree_git_layout(worktree)
+    if task.kind == "write":
+        git_layout.update(prepare_job_object_store(report_dir, task.repo_path))
+        report["git_object_store"] = git_layout["GIT_OBJECT_DIRECTORY"]
     report["_git_layout"] = git_layout
     report["_git_admin_before"] = git_admin_fingerprint(git_layout, worktree)
 
@@ -3535,6 +3962,9 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     else:
         env, stripped_proxies, cloud_names = worker_env(
             api_key, codex_home, task.environment_pass)
+    env.update({key: git_layout[key] for key in
+                ("GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES")
+                if key in git_layout})
     if options.native_preflight_plan is not None:
         # Native toolchain pin for the worker itself: ibtool/actool run in-process. HOME stays
         # exactly as the job had it, so the real simctl/Xcode state is used; CODEX_HOME is the
@@ -3620,7 +4050,8 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
                     config_overrides(profile, context_window, catalog_path,
                     sandbox_mode="read-only" if task.kind == "read" else REQUIRED_SANDBOX_MODE)),
                 deadline=deadline, codex_home=codex_home,
-                process_profile_path=(mcp_profile if task.kind == "read" else None))
+                process_profile_path=(mcp_profile if task.kind == "read" else None),
+                popen_factory=spawn_owned_popen)
         except ToolProbeError as error:
             raise BlockedError(f"required MCP tools could not be probed: {error}") from error
     else:
@@ -3753,7 +4184,7 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         # as blocked; the attempts that already ran stay audited and preserved below.
         changed = (None if is_cloud else
                    recheck_pinned_model(profile, options.settings_path, options.omlx_fetch,
-                                        attempt_number))
+                                        attempt_number, deadline=deadline))
         if changed is not None:
             reason, message = changed
             report["attempts"].append({"attempt": attempt_number, "skipped": message,
@@ -3793,6 +4224,7 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         # Snapshot every changed-from-base path *before* the worker runs, so whatever state a
         # path is in afterwards can be attributed to this attempt only if it actually changed.
         before_states = {path: path_state(worktree / path) for path in before_worker.changed_paths}
+        denial_start = len(wrapper.record["denials"])
         observer = observation.RunObserver(report_dir, secrets=secrets,
                                            attempt=attempt_number, job_id=report["job_id"],
                                            active_dir=state_dir / "active",
@@ -3838,7 +4270,7 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         observer.finish(result=result)
         stdout_text = redact(result["stdout"].decode("utf-8", "replace"), secrets)
         stderr_text = redact(result["stderr"].decode("utf-8", "replace"), secrets)
-        for text in [*worker_command_outputs(stdout_text), stderr_text]:
+        for text in worker_command_outputs(stdout_text):
             wrapper.collect(text, f"worker attempt {attempt_number}")
         evidence = parse_worker_log(stdout_text)
         report["tooling"] = tools.mark_observations(report.get("tooling"), stdout_text)
@@ -3902,6 +4334,11 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
             "last_message_excerpt": _tail(last_message),
             "logs": [str(prompt_path), str(jsonl_path), str(stderr_path), str(last_path)],
         }
+        denial = (typed_sandbox_denial(wrapper.record["denials"][denial_start:], perms,
+                                       source="sandboxed_command_output")
+                  if wrapper.applied else None)
+        if denial:
+            attempt["sandbox_denial"] = denial
         if last_message_missing:
             attempt["last_message_missing"] = last_message_missing
         if last_message_tampered:
@@ -3954,6 +4391,11 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
                      for argv in task.test_commands]
         attempt["tests"] = tests
         report["tests"] = tests
+        denial = (typed_sandbox_denial(wrapper.record["denials"][denial_start:], perms,
+                                       source="sandboxed_command_output")
+                  if wrapper.applied else None)
+        if denial:
+            attempt["sandbox_denial"] = denial
 
         # The audit runs *after* verification on every attempt: a test command can itself
         # write files, and the comparison target is the original base commit, so committed,
@@ -4279,18 +4721,27 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
             secrets.append(value)
     stream = None
     claimed = False
+    # Refuse before creating the active-group ledger inside a repository. Apart from leaving
+    # the checkout untouched, this keeps a preflight refusal from introducing launcher state
+    # into a path the worker is explicitly forbidden to own.
+    if _inside(options.state_dir, options.task.repo_path):
+        report["status"] = "contract_invalid"
+        report["failure_reason"] = (
+            f"state dir {options.state_dir} must live outside the repository "
+            f"{options.task.repo_path}; reports and logs must not be worker-writable")
+        report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        return report
+    group_tracker = ActiveGroupTracker(options.state_dir, report["job_id"])
+    group_tracker_token = None
     try:
+        group_tracker.begin()
+        group_tracker_token = _ACTIVE_GROUP_TRACKER.set(group_tracker)
         if options.native_preflight_plan is not None:
             destination = native_destination(options.native_preflight_plan,
                                              options.apple_simulator_udid)
             if "simulator" in destination:
                 options.apple_simulator_udid = destination["simulator"]
                 report["lease"]["resource"] = "simulator:" + destination["simulator"]
-        if _inside(options.state_dir, options.task.repo_path):
-            raise ContractError(
-                f"state dir {options.state_dir} must live outside the repository "
-                f"{options.task.repo_path}; reports and logs must not be worker-writable"
-            )
         try:
             stream = policy.Workstream(options.state_dir, repo_identity(options.task.repo_path),
                                        options.workstream or options.task.workstream,
@@ -4439,6 +4890,9 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
                 report["ledger_error"] = "ledger append failed (%s)" % ledger_error.__class__.__name__
                 write_report(report, secrets)
         _notify_job(report, secrets)
+    group_tracker.finish()
+    if group_tracker_token is not None:
+        _ACTIVE_GROUP_TRACKER.reset(group_tracker_token)
     return report
 
 

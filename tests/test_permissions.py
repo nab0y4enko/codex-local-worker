@@ -244,12 +244,11 @@ class Profile(PermissionsCase):
         self.assertTrue(text.startswith("(version 1)\n(allow default)"))
         self.assertIn(f'(subpath "{os.path.realpath(os.path.expanduser("~/.ssh"))}")', text)
         git = os.path.realpath(self.repo) + "/.git"
-        # The common dir is shut as a whole (an allowlist); only objects/ is re-opened after it.
+        # The common dir, including objects/, remains write-denied.
         self.assertIn(f'(deny file-write* (subpath "{git}"))', text)
         self.assertLess(text.index(f'(deny file-write* (subpath "{os.path.realpath(self.repo)}"))'),
                         text.index(f'(deny file-write* (subpath "{git}"))'))
-        self.assertLess(text.index(f'(deny file-write* (subpath "{git}"))'),
-                        text.index(f'(allow file-write* (subpath "{git}/objects"))'))
+        self.assertNotIn(f'(allow file-write* (subpath "{git}/objects"))', text)
 
     def test_every_statement_is_a_denial_except_the_two_defaults_the_design_names(self):
         text = permissions.seatbelt_profile(self.perms, primary_repo=self.repo)
@@ -258,8 +257,7 @@ class Profile(PermissionsCase):
         for line in statements[2:]:
             self.assertRegex(line, r"^\((deny file-read\*|deny file-write\*|allow file-write\*|deny file-clone) ")
         allows = [line for line in statements if line.startswith("(allow ")]
-        self.assertEqual(allows, ["(allow default)",
-                                  f'(allow file-write* (subpath "{real(self.repo)}/.git/objects"))'])
+        self.assertEqual(allows, ["(allow default)"])
         self.assertTrue(text.endswith("\n"))
 
     def test_the_documented_order_is_read_denials_then_the_primary_checkout_rules(self):
@@ -268,8 +266,7 @@ class Profile(PermissionsCase):
         positions = [text.index("(deny file-read*"),
                      text.index(f'(deny file-write* (subpath "{repo}"))'),
                      text.index(f'(deny file-write* (subpath "{repo}/.git"))'),
-                     text.index(f'(allow file-write* (subpath "{repo}/.git/objects"))'),
-                     text.index(f'(deny file-write* (subpath "{repo}/.git/objects/info"))')]
+                    ]
         self.assertEqual(positions, sorted(positions))
         # No file of the common dir is named: nothing in it is re-opened but objects/.
         for name in ("HEAD", "index", "config", "packed-refs"):
@@ -364,7 +361,7 @@ class Profile(PermissionsCase):
         text = permissions.seatbelt_profile(self.perms, primary_repo=repo)
         self.assertIn('\\"quote\\"', text)
         escaped = real(repo).replace("\\", "\\\\").replace('"', '\\"')
-        self.assertIn(f'(allow file-write* (subpath "{escaped}/.git/objects"))', text)
+        self.assertNotIn(f'(allow file-write* (subpath "{escaped}/.git/objects"))', text)
         self.assertIn("ü", text)
 
     def rule_after(self, text, marker):
@@ -387,7 +384,7 @@ class Profile(PermissionsCase):
         text = permissions.seatbelt_profile(self.perms, primary_repo=self.repo)
         repo = real(self.repo)
         literals = text.splitlines()[-1]  # the rename protection is the last statement
-        for guarded in (repo, f"{repo}/.git", f"{repo}/.git/objects", real(self.repo.parent), "/"):
+        for guarded in (repo, f"{repo}/.git", real(self.repo.parent), "/"):
             self.assertIn(f'(literal "{guarded}")', literals)
         # Children of the parents stay writable: only the directories themselves are guarded.
         self.assertNotIn(f'(literal "{repo}/.git/objects/pack")', text)
@@ -397,10 +394,8 @@ class Profile(PermissionsCase):
         text = permissions.seatbelt_profile(self.perms, primary_repo=self.repo)
         lines = text.splitlines()
         repo = real(self.repo)
-        reopen = lines.index(f'(allow file-write* (subpath "{repo}/.git/objects"))')
         guard = [i for i, line in enumerate(lines) if f'(literal "{repo}/.git")' in line]
         self.assertEqual(len(guard), 1)
-        self.assertGreater(guard[0], reopen)  # the last match wins, so the objects/ re-opening must not outrank it
         for tail in lines[guard[0]:]:
             self.assertTrue(tail.startswith("(deny file-write* "), tail)
 
@@ -513,8 +508,7 @@ class StateProtection(PermissionsCase):
     def test_nothing_inside_the_state_to_reopen_writes_no_allow(self):
         text = self.profile(allowed=[])
         self.assertIn(f'(deny file-write* (subpath "{real(self.state)}"))', text)
-        self.assertEqual([line for line in text.splitlines() if line.startswith("(allow file-write*")],
-                         [f'(allow file-write* (subpath "{real(self.repo)}/.git/objects"))'])
+        self.assertEqual([line for line in text.splitlines() if line.startswith("(allow file-write*")], [])
 
     def test_the_state_its_parents_and_the_permissions_files_cannot_be_moved(self):
         rename = self.profile().splitlines()[-1]
@@ -541,11 +535,8 @@ class PlantingAndCloning(PermissionsCase):
         git = real(self.repo) + "/.git"
         shut = lines.index(f'(deny file-write* (subpath "{git}"))')
         reopened = [line for line in lines if line.startswith("(allow file-write* ")]
-        # Nothing that would run, unwrapped, the next time the user runs git is re-opened: hooks,
-        # info/, modules/ and objects/info/alternates are covered by the shut common dir (objects/info
-        # is shut again after objects/ is re-opened), and no allow names them.
-        self.assertEqual(reopened, [f'(allow file-write* (subpath "{git}/objects"))'])
-        self.assertEqual(lines[shut + 2], f'(deny file-write* (subpath "{git}/objects/info"))')
+        # Nothing in the common directory is re-opened; the job has a separate object store.
+        self.assertEqual(reopened, [])
         for planting in ("hooks", "info", "modules", "objects/info/alternates"):
             with self.subTest(planting=planting):
                 self.assertTrue(sp.seatbelt_write_allowed("\n".join(lines), self.repo / ".git" / planting) is False)
@@ -662,7 +653,7 @@ class GitLayouts(GitLayoutCase):
         with self.assertRaises(permissions.PermissionsError):
             permissions.resolve_git_dirs(broken)
 
-    def test_the_common_dir_is_shut_and_only_objects_and_the_job_admin_are_reopened(self):
+    def test_the_common_dir_is_shut_and_only_the_job_admin_is_reopened(self):
         admin = self.repo / ".git" / "worktrees" / "job-1"
         worktree = self.state / "worktrees" / "job-1"
         lines = permissions.seatbelt_profile(self.perms, primary_repo=self.repo, job_git_admin=admin,
@@ -670,25 +661,23 @@ class GitLayouts(GitLayoutCase):
         git = real(self.repo) + "/.git"
         shut = lines.index(f'(deny file-write* (subpath "{git}"))')
         self.assertGreater(shut, lines.index(f'(deny file-write* (subpath "{real(self.repo)}"))'))
-        self.assertEqual(lines[shut + 1], f'(allow file-write* (subpath "{git}/objects"))')
-        self.assertEqual(lines[shut + 2], f'(deny file-write* (subpath "{git}/objects/info"))')
-        self.assertEqual(lines[shut + 3], f'(allow file-write* (subpath "{git}/worktrees/job-1"))')
+        self.assertEqual(lines[shut + 1], f'(allow file-write* (subpath "{git}/worktrees/job-1"))')
         # Nothing else of the common dir is ever re-opened: no allow names a path inside it.
         reopened = [line for line in lines if line.startswith("(allow file-write* ") and git in line]
-        self.assertEqual(len(reopened), 2, reopened)
+        self.assertEqual(len(reopened), 1, reopened)
         for old in ("(literal \"%s/HEAD\")", "(subpath \"%s/refs\")", "(subpath \"%s/hooks\")"):
             self.assertNotIn(old % git, "\n".join(lines))  # the denylist of rounds 1-2 is gone
 
-    def test_without_a_job_worktree_only_objects_are_writable_in_the_common_dir(self):
+    def test_without_a_job_worktree_the_common_dir_is_never_reopened(self):
         lines = permissions.seatbelt_profile(self.perms, primary_repo=self.repo).splitlines()
         git = real(self.repo) + "/.git"
         self.assertEqual([line for line in lines if line.startswith("(allow file-write*")],
-                         [f'(allow file-write* (subpath "{git}/objects"))'])
+                         [])
 
     def test_objects_and_its_info_directory_cannot_be_moved(self):
         rename = permissions.seatbelt_profile(self.perms, primary_repo=self.repo).splitlines()[-1]
         git = real(self.repo) + "/.git"
-        for guarded in (f"{git}/objects", git, real(self.repo), "/"):
+        for guarded in (git, real(self.repo), "/"):
             with self.subTest(guarded=guarded):
                 self.assertIn(f'(literal "{guarded}")', rename)
 
@@ -697,10 +686,10 @@ class GitLayouts(GitLayoutCase):
         text = permissions.seatbelt_profile(self.perms, primary_repo=repo)
         lines = text.splitlines()
         self.assertIn(f'(deny file-write* (subpath "{real(sep)}"))', lines)
-        self.assertIn(f'(allow file-write* (subpath "{real(sep)}/objects"))', lines)
-        self.assertIn(f'(deny file-write* (subpath "{real(sep)}/objects/info"))', lines)
+        self.assertNotIn(f'(allow file-write* (subpath "{real(sep)}/objects"))', lines)
+        self.assertNotIn(f'(deny file-write* (subpath "{real(sep)}/objects/info"))', lines)
         self.assertNotIn(f"{real(repo)}/.git/", text)  # the gitfile is a file, never a directory
-        self.assertIn(f'(literal "{real(sep)}/objects")', lines[-1])
+        self.assertNotIn(f'(literal "{real(sep)}/objects")', lines[-1])
         self.assertIn(f'(literal "{real(sep.parent)}")', lines[-1])
 
     def test_a_linked_worktree_primary_protects_the_common_dir_and_its_own_admin_dir(self):
@@ -709,7 +698,7 @@ class GitLayouts(GitLayoutCase):
         lines = permissions.seatbelt_profile(self.perms, primary_repo=primary).splitlines()
         self.assertEqual(common, real(self.repo) + "/.git")
         self.assertIn(f'(deny file-write* (subpath "{common}") (subpath "{git_dir}"))', lines)
-        self.assertIn(f'(allow file-write* (subpath "{common}/objects"))', lines)
+        self.assertNotIn(f'(allow file-write* (subpath "{common}/objects"))', lines)
         self.assertIn(f'(literal "{git_dir}")', lines[-1])
 
     def test_an_explicit_common_dir_is_protected_beside_the_resolved_one(self):
@@ -718,10 +707,7 @@ class GitLayouts(GitLayoutCase):
                                              git_common_dir=elsewhere).splitlines()
         resolved = real(self.repo) + "/.git"
         self.assertIn(f'(deny file-write* (subpath "{resolved}") (subpath "{real(elsewhere)}"))', lines)
-        self.assertIn(f'(allow file-write* (subpath "{resolved}/objects") '
-                      f'(subpath "{real(elsewhere)}/objects"))', lines)
-        self.assertIn(f'(deny file-write* (subpath "{resolved}/objects/info") '
-                      f'(subpath "{real(elsewhere)}/objects/info"))', lines)
+        self.assertNotIn(f'(allow file-write* (subpath "{resolved}/objects")', "\n".join(lines))
 
     def test_no_common_dir_rule_without_primary_protection(self):
         text = permissions.seatbelt_profile(dataclasses.replace(self.perms, protect_primary_checkout=False),
@@ -1137,6 +1123,7 @@ class FindDenials(PermissionsCase):
 class RealWrapper(PermissionsCase):
     def sandboxed(self, profile, argv, **kwargs):
         env = dict(os.environ, **sp.GIT_ID)
+        env.update(getattr(self, "object_env", {}) or {})
         return subprocess.run(permissions.wrap_argv(argv, profile), capture_output=True, env=env, **kwargs)
 
     def write_profile(self, perms, worktree=None):
@@ -1145,8 +1132,17 @@ class RealWrapper(PermissionsCase):
         kwargs = {}
         if worktree is not None:
             admin = sp.git(worktree, "rev-parse", "--absolute-git-dir").stdout.decode().strip()
+            objects = self.root / "job-objects"
+            objects.mkdir(exist_ok=True)
+            (objects / "info").mkdir(exist_ok=True)
+            common = Path(sp.git(worktree, "rev-parse", "--path-format=absolute",
+                                 "--git-common-dir").stdout.decode().strip())
             kwargs = {"job_git_admin": admin, "job_worktree": str(worktree),
-                      "protect_write_roots": [str(worktree)]}
+                      "allowed_writes": [objects],
+                      "protect_write_roots": [str(worktree), str(objects)],
+                      "deny_write_subpaths": [str(objects / "info")]}
+            self.object_env = {"GIT_OBJECT_DIRECTORY": str(objects),
+                               "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(common / "objects")}
         profile = self.root / "p.sb"
         profile.write_text(permissions.seatbelt_profile(perms, primary_repo=self.repo, **kwargs),
                            encoding="utf-8")
@@ -1367,9 +1363,9 @@ class RealWrapper(PermissionsCase):
         self.assertEqual(self.sandboxed(profile, ["/usr/bin/touch", str(sibling)]).returncode, 0)
         self.assertEqual(self.sandboxed(profile, ["/bin/mv", str(sibling), str(self.root / "sibling-moved")]).returncode, 0)
         self.assertEqual(self.sandboxed(profile, ["/bin/mkdir", str(self.root / "new-dir")]).returncode, 0)
-        # Inside the common dir only objects/ is writable (R22), so the scratch file goes there.
+        # The primary object database is read-only even when it is the direct target.
         scratch = self.repo / ".git" / "objects" / "scratch"
-        self.assertEqual(self.sandboxed(profile, ["/bin/sh", "-c", 'echo ok > "$1"', "sh", str(scratch)]).returncode, 0)
+        self.assertNotEqual(self.sandboxed(profile, ["/bin/sh", "-c", 'echo ok > "$1"', "sh", str(scratch)]).returncode, 0)
         beside = self.repo / ".git" / "scratch"
         self.assertNotEqual(self.sandboxed(profile, ["/bin/sh", "-c", 'echo ok > "$1"', "sh", str(beside)]).returncode, 0)
 
@@ -1383,7 +1379,8 @@ class RealWrapper(PermissionsCase):
         add = self.sandboxed(profile, git + ["-C", str(worktree), "add", "new.txt"])
         commit = self.sandboxed(profile, git + ["-C", str(worktree), "commit", "-q", "-m", "from worktree"])
         self.assertEqual((add.returncode, commit.returncode), (0, 0), (add.stderr, commit.stderr))
-        self.assertNotEqual(sp.git(worktree, "rev-parse", "HEAD").stdout, sp.git(self.repo, "rev-parse", "main").stdout)
+        head = self.sandboxed(profile, git + ["-C", str(worktree), "rev-parse", "HEAD"]).stdout
+        self.assertNotEqual(head, sp.git(self.repo, "rev-parse", "main").stdout)
 
     def test_a_case_variant_entry_still_hides_the_real_directory(self):
         vault = self.root / "Vault"
@@ -1493,8 +1490,8 @@ class RealWrapper(PermissionsCase):
         add = self.sandboxed(profile, git + ["-C", str(worktree), "add", "new.txt"])
         commit = self.sandboxed(profile, git + ["-C", str(worktree), "commit", "-q", "-m", "from worktree"])
         self.assertEqual((add.returncode, commit.returncode), (0, 0), (add.stderr, commit.stderr))
-        self.assertNotEqual(sp.git(worktree, "rev-parse", "HEAD").stdout,
-                            sp.git(self.repo, "rev-parse", "main").stdout)
+        head = self.sandboxed(profile, git + ["-C", str(worktree), "rev-parse", "HEAD"]).stdout
+        self.assertNotEqual(head, sp.git(self.repo, "rev-parse", "main").stdout)
 
     def test_a_deny_write_persistence_vector_cannot_be_planted(self):
         home = self.root / "home"
@@ -1584,7 +1581,7 @@ class RealWrapper(PermissionsCase):
             with self.subTest(name=name):
                 self.assertNotEqual(outcome.returncode, 0)
                 self.assertIn(b"Operation not permitted", outcome.stderr)
-        self.assertEqual(free.returncode, 0, free.stderr)  # the objects/ re-opening is escaped too
+        self.assertNotEqual(free.returncode, 0, free.stderr)  # primary objects stay write-denied
 
 
 @unittest.skipUnless(sys.platform == "darwin" and permissions.wrapper_available(), "Seatbelt only")
@@ -1605,8 +1602,13 @@ class RealGitLayouts(GitLayoutCase):
         job = self.root / f"job-{primary.name}-{suffix}"
         sp.git(primary, "worktree", "add", "-q", "--detach", str(job))
         layout = lw.worktree_git_layout(job)
+        objects = self.root / f"objects-{primary.name}-{suffix}"
+        objects.mkdir()
+        (objects / "info").mkdir()
         kwargs = {"job_git_admin": layout["GIT_DIR"], "job_worktree": str(job),
-                  "protect_write_roots": [str(job)]}
+                  "allowed_writes": [objects],
+                  "protect_write_roots": [str(job), str(objects)],
+                  "deny_write_subpaths": [str(objects / "info")]}
         if explicit:
             kwargs["git_common_dir"] = layout["GIT_COMMON_DIR"]
         profile = self.root / f"p-{primary.name}-{suffix}.sb"
@@ -1617,10 +1619,17 @@ class RealGitLayouts(GitLayoutCase):
         if probe.returncode == NESTED_SANDBOX:
             self.skipTest("already inside a sandbox")
         self.assertEqual(probe.returncode, 0, probe.stderr)
+        if not hasattr(self, "_object_envs"):
+            self._object_envs = {}
+        self._object_envs[str(job)] = {
+            "GIT_OBJECT_DIRECTORY": str(objects),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(Path(layout["GIT_COMMON_DIR"]) / "objects"),
+        }
         return profile, job, Path(layout["GIT_COMMON_DIR"]), Path(layout["GIT_DIR"])
 
     def sandboxed(self, profile, argv):
         env = dict(os.environ, **sp.GIT_ID)
+        env.update(getattr(self, "_active_object_env", {}) or {})
         return subprocess.run(permissions.wrap_argv(argv, profile), capture_output=True, env=env)
 
     def refused(self, profile, script, *args):
@@ -1670,19 +1679,32 @@ class RealGitLayouts(GitLayoutCase):
                 self.assertFalse((decoy / "alternates").exists())
                 self.assertFalse((info / "alternates").exists())
 
-    def test_the_job_worktree_still_adds_and_commits_for_every_checkout_shape(self):
+    def test_the_job_worktree_commits_to_private_objects_for_every_checkout_shape(self):
         for label, primary in self.shapes():
             with self.subTest(shape=label):
                 profile, job, common, _ = self.job_profile(primary, explicit=True)
+                self._active_object_env = self._object_envs[str(job)]
+                before = sorted(str(path.relative_to(common / "objects"))
+                                for path in (common / "objects").rglob("*") if path.is_file())
                 (job / "new.txt").write_text("n")
                 git = ["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"]
                 add = self.sandboxed(profile, git + ["-C", str(job), "add", "new.txt"])
                 commit = self.sandboxed(profile, git + ["-C", str(job), "commit", "-q", "-m", "from the job"])
                 self.assertEqual((add.returncode, commit.returncode), (0, 0), (add.stderr, commit.stderr))
-                self.assertNotEqual(sp.git(job, "rev-parse", "HEAD").stdout,
+                head = subprocess.run(git + ["-C", str(job), "rev-parse", "HEAD"],
+                                      capture_output=True, check=True,
+                                      env=dict(os.environ, **sp.GIT_ID, **self._active_object_env)).stdout
+                self.assertNotEqual(head,
                                     sp.git(primary, "rev-parse", "HEAD").stdout)
-                # objects/ itself stays writable: that is what the commit above wrote into.
-                self.assertEqual(self.sandboxed(profile, ["/usr/bin/touch", str(common / "objects" / "zz")]).returncode, 0)
+                after = sorted(str(path.relative_to(common / "objects"))
+                               for path in (common / "objects").rglob("*") if path.is_file())
+                self.assertEqual(after, before)
+                self.refused(profile, 'echo x > "$1"', common / "objects" / "zz")
+                objects = Path(self._active_object_env["GIT_OBJECT_DIRECTORY"])
+                self.assertTrue(any(path.is_file() for path in objects.rglob("*")))
+                self.refused(profile, 'echo "$2" > "$1"', objects / "info" / "alternates",
+                             common / "objects")
+                self._active_object_env = None
 
 
 class Cli(PermissionsCase):

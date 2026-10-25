@@ -355,8 +355,26 @@ def _number(value: Any) -> Optional[float]:
 # --------------------------------------------------------------------------------------
 # Discovery
 # --------------------------------------------------------------------------------------
-def _read_models_status(fetch: HttpFetch, settings: ServerSettings) -> Dict[str, Any]:
-    status, body = fetch(settings, "/v1/models/status", True)
+def _remaining(deadline: Optional[Callable[[], float]]) -> Optional[float]:
+    if deadline is None:
+        return None
+    remaining = float(deadline())
+    if remaining <= 0:
+        raise DiscoveryError("budget_exhausted", "job deadline expired before the next oMLX request")
+    return remaining
+
+
+def _deadline_fetch(fetch: HttpFetch, settings: ServerSettings, path: str, auth: bool,
+                    deadline: Optional[Callable[[], float]]) -> Tuple[int, Any]:
+    remaining = _remaining(deadline)
+    if remaining is not None and fetch is http_fetch:
+        return fetch(settings, path, auth, timeout=remaining)
+    return fetch(settings, path, auth)
+
+
+def _read_models_status(fetch: HttpFetch, settings: ServerSettings,
+                        deadline: Optional[Callable[[], float]] = None) -> Dict[str, Any]:
+    status, body = _deadline_fetch(fetch, settings, "/v1/models/status", True, deadline)
     if status != 200 or not isinstance(body, dict) or not isinstance(body.get("models"), list):
         raise DiscoveryError(
             "server_unreachable", "unexpected /v1/models/status answer from oMLX (HTTP %s)"
@@ -365,7 +383,8 @@ def _read_models_status(fetch: HttpFetch, settings: ServerSettings) -> Dict[str,
 
 
 def discover(settings_path: Path, requested_model: Optional[str] = None,
-             fetch: HttpFetch = http_fetch) -> ServerProfile:
+             fetch: HttpFetch = http_fetch,
+             deadline: Optional[Callable[[], float]] = None) -> ServerProfile:
     """Everything the launcher needs to know about the live oMLX server and its loaded model."""
     settings = read_server_settings(settings_path)
     if settings.model_fallback is not False:
@@ -374,7 +393,7 @@ def discover(settings_path: Path, requested_model: Optional[str] = None,
             "with fallback on, oMLX may serve a different model than the one pinned"
             % (settings.model_fallback,))
 
-    status, health = fetch(settings, "/health", False)
+    status, health = _deadline_fetch(fetch, settings, "/health", False, deadline)
     health_status = health.get("status") if isinstance(health, dict) else None
     if health_status == "loading":
         raise DiscoveryError("server_loading", "oMLX is still loading (/health reports "
@@ -383,7 +402,7 @@ def discover(settings_path: Path, requested_model: Optional[str] = None,
         raise DiscoveryError("server_unreachable", "oMLX /health is not healthy (HTTP %s, "
                              "status %r)" % (status, health_status))
 
-    models_status = _read_models_status(fetch, settings)
+    models_status = _read_models_status(fetch, settings, deadline)
     entry = select_model(models_status, health, requested_model)
     model = _build_model(entry)
 
@@ -391,8 +410,10 @@ def discover(settings_path: Path, requested_model: Optional[str] = None,
     # else. That covers a non-200 answer, a malformed body and a fetch that raises (reset,
     # timeout, 2xx body that is not JSON), because /health and the model list already succeeded.
     try:
-        api_status, api = fetch(settings, "/api/status", True)
-    except DiscoveryError:
+        api_status, api = _deadline_fetch(fetch, settings, "/api/status", True, deadline)
+    except DiscoveryError as error:
+        if error.code == "budget_exhausted":
+            raise
         api_status, api = 0, {}
     api = api if api_status == 200 and isinstance(api, dict) else {}
     prompt_tokens = api.get("total_prompt_tokens")
@@ -415,7 +436,8 @@ def discover(settings_path: Path, requested_model: Optional[str] = None,
 
 
 def recheck(profile: ServerProfile, settings_path: Path,
-            fetch: HttpFetch = http_fetch) -> Optional[str]:
+            fetch: HttpFetch = http_fetch,
+            deadline: Optional[Callable[[], float]] = None) -> Optional[str]:
     """Is the pinned model still what oMLX serves? ``None`` if so, else why the attempt must not
     start: ``"model_changed"`` (gone, unloaded, renamed, context shrank, fallback switched on) or
     ``"server_unreachable"`` (no usable answer, or the settings no longer point at the pinned
@@ -426,8 +448,10 @@ def recheck(profile: ServerProfile, settings_path: Path,
             return "server_unreachable"
         if settings.model_fallback is not False:
             return "model_changed"
-        models_status = _read_models_status(fetch, settings)
-    except DiscoveryError:
+        models_status = _read_models_status(fetch, settings, deadline)
+    except DiscoveryError as error:
+        if error.code == "budget_exhausted":
+            return "budget_exhausted"
         return "server_unreachable"
     pinned = profile.model
     for entry in _entries(models_status):

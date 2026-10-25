@@ -1,6 +1,8 @@
 """Post-run audit and primary-checkout fingerprint, against real disposable repos."""
 import sys
 import unittest
+import subprocess
+import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -95,6 +97,59 @@ class Audit(unittest.TestCase):
         self.assertNotEqual(lw.audit_scratch_dir(self.repo, self.repo), self.repo)
         self.assertFalse(lw._inside(lw.audit_scratch_dir(self.repo, self.repo), self.repo))
         self.assertFalse(lw._inside(lw.audit_scratch_dir(self.repo, None), self.repo))
+
+    def test_changed_base_gitlink_is_reported_without_traversing_nested_repo(self):
+        nested = self.root / "nested"
+        sp.git(self.repo, "init", "-q", str(nested))
+        sp.git(nested, "config", "user.email", "worker@test")
+        sp.git(nested, "config", "user.name", "Worker")
+        (nested / "nested.txt").write_text("base\n")
+        sp.git(nested, "add", "nested.txt")
+        sp.git(nested, "commit", "-q", "-m", "nested")
+        nested_head = lw.rev_parse(nested, "HEAD")
+        sp.git(self.repo, "update-index", "--add", "--cacheinfo", "160000", nested_head, "submod")
+        sp.git(self.repo, "commit", "-q", "-m", "gitlink")
+        base = lw.rev_parse(self.repo, "HEAD")
+        (self.repo / "submod").mkdir()
+        result = lw.audit_worktree(self.repo, base, ["submod"], [], scratch_dir=self.root / "scratch")
+        self.assertIn("submod", result.changed_paths)
+        self.assertTrue(any(entry.get("role") == "gitlink_uninspected" for entry in result.entries))
+        self.assertTrue(any("not traversed" in item["reason"] for item in result.violations))
+
+
+    def test_private_objects_are_validated_in_isolation_then_promoted_for_archive(self):
+        (self.root / "report").mkdir()
+        layout = lw.worktree_git_layout(self.repo)
+        layout.update(lw.prepare_job_object_store(self.root / "report", self.repo))
+        env = dict(layout)
+        (self.repo / "private.txt").write_text("private commit\n")
+        self.assertEqual(lw.git(self.repo, "add", "private.txt", env=env).returncode, 0)
+        self.assertEqual(lw.git(self.repo, "-c", "user.name=Worker", "-c",
+                                "user.email=worker@test", "commit", "-q", "-m",
+                                "private", env=env).returncode, 0)
+        head = lw.git(self.repo, "rev-parse", "HEAD", env=env).stdout.decode().strip()
+        primary_env = dict(layout)
+        primary_env.pop("GIT_OBJECT_DIRECTORY", None)
+        primary_env.pop("GIT_ALTERNATE_OBJECT_DIRECTORIES", None)
+        self.assertNotEqual(lw.git(self.repo, "cat-file", "-e", head, check=False,
+                                   env=primary_env).returncode, 0)
+        oids = lw.validate_job_object_store(self.repo, layout)
+        self.assertIn(head, oids)
+        self.assertEqual(lw.promote_job_object_store(self.repo,
+                         Path(layout["GIT_OBJECT_DIRECTORY"])), oids)
+        self.assertEqual(lw.git(self.repo, "cat-file", "-e", head, env=primary_env).returncode, 0)
+
+    def test_private_object_hash_is_checked_before_parent_alternate_can_resolve_it(self):
+        (self.root / "report").mkdir()
+        layout = lw.worktree_git_layout(self.repo)
+        layout.update(lw.prepare_job_object_store(self.root / "report", self.repo))
+        oid = lw.rev_parse(self.repo, "HEAD")
+        object_dir = Path(layout["GIT_OBJECT_DIRECTORY"])
+        path = object_dir / oid[:2] / oid[2:]
+        path.parent.mkdir(parents=True)
+        path.write_bytes(zlib.compress(b"commit 5\0evil!"))
+        with self.assertRaisesRegex(lw.GitError, "object|enumerated|hash"):
+            lw.validate_job_object_store(self.repo, layout)
 
 
 class PrimaryFingerprint(unittest.TestCase):
