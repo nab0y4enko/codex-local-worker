@@ -13,7 +13,7 @@ ENVIRONMENT_CODES = (
     "model_changed", "context_overflow", "server_memory", "tool_unavailable",
     "secret_read_denied", "sandbox_denied", "missing_env", "missing_tool", "simulator_unavailable",
     "stall", "budget_exhausted", "policy_refused", "verification_blocked",
-    "deny_list_unavailable", "interrupted",
+    "deny_list_unavailable", "interrupted", "worker_busy",
 )
 CAPABILITY_CODES = ("tests_failed", "out_of_scope", "no_change", "invalid_answer",
                     "unverified_answer")
@@ -56,6 +56,7 @@ _MESSAGES = {
     "stall": ("The worker stopped producing events; inspect the server and retry if healthy.", "retry_local", None),
     "budget_exhausted": ("Increase the job budget or reduce its scope.", "needs_user", None),
     "policy_refused": ("Review the launcher policy refusal before retrying.", "needs_user", None),
+    "worker_busy": ("Wait and retry, or pass --lock-timeout with enough job budget to wait for the worker.", "retry_local", None),
     "verification_blocked": ("Make the required verification command runnable and retry.", "needs_user", None),
     "deny_list_unavailable": ("Restore the deny wrapper before running this job.", "needs_user", None),
     "interrupted": ("Review the preserved partial job and start a new task if appropriate.", "needs_user", None),
@@ -85,6 +86,8 @@ def _texts(report: Dict[str, Any]) -> List[str]:
 
 def _pick(report: Dict[str, Any]) -> tuple:
     status = report.get("status")
+    if status == "worker_busy":
+        return "worker_busy", ["launcher status=worker_busy; job was not started"]
     discovery = report.get("discovery_error")
     if isinstance(discovery, dict) and discovery.get("code") in ENVIRONMENT_CODES:
         return discovery["code"], ["discovery_error.code=" + discovery["code"]]

@@ -118,9 +118,10 @@ class Processes(unittest.TestCase):
     def test_worker_lock_is_exclusive_then_released(self):
         with lw.job_lock(self.root):
             self.assertIn(str(os.getpid()), (self.root / "worker.lock").read_text())
-            with self.assertRaises(lw.BlockedError):
+            with self.assertRaises(lw.BlockedError) as caught:
                 with lw.job_lock(self.root, timeout=0.2):
                     pass
+        self.assertEqual(caught.exception.status, "worker_busy")
         with lw.job_lock(self.root, timeout=0.5):
             pass
 

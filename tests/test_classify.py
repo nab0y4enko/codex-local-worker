@@ -44,6 +44,12 @@ class ClassifyTests(unittest.TestCase):
                 result = classify.classify(report)
                 self.assertEqual((result.code, result.next_action), expected)
 
+
+    def test_worker_busy_is_retryable_without_verification(self):
+        result = classify.classify({"status": "worker_busy", "attempts": []})
+        self.assertEqual((result.code, result.next_action), ("worker_busy", "retry_local"))
+        self.assertIn("--lock-timeout", result.remediation)
+
     def test_recovered_historical_stall_does_not_override_success(self):
         report = {"status": "ok", "budget": {"exceeded": False}, "attempts": [
             {"stalled": True, "returncode": 1},

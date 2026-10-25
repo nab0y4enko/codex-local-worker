@@ -335,6 +335,7 @@ EXIT_CODES = {
     "interrupted": 11,
     "answer_invalid": 12,
     "capture_failed": 13,
+    "worker_busy": 14,
 }
 
 LIMITATIONS = (
@@ -564,6 +565,10 @@ class CodexIncompatible(PreflightError):
 
 class BlockedError(LauncherError):
     status = "blocked"
+
+
+class WorkerBusyError(BlockedError):
+    status = "worker_busy"
 
 
 class GitError(LauncherError):
@@ -1419,7 +1424,7 @@ def job_lock(state_dir: Path, timeout: float = LOCK_TIMEOUT_SECONDS):
                 if error.errno not in (11, 35, 13):  # EAGAIN/EWOULDBLOCK variants
                     raise BlockedError(f"cannot acquire worker lock: {error}") from error
                 if time.monotonic() >= deadline:
-                    raise BlockedError(
+                    raise WorkerBusyError(
                         f"another local worker holds {lock_path}; jobs are serialized and "
                         "this job was not started"
                     ) from error
@@ -1523,7 +1528,7 @@ def job_lease(options: JobOptions, report: Dict[str, Any], timeout: float,
     except pool.PoolConflictError as error:
         raise BlockedError(str(error)) from error
     except pool.PoolUnavailableError as error:
-        raise BlockedError(str(error)) from error
+        raise WorkerBusyError(str(error)) from error
     except pool.PoolConfigError as error:
         raise ContractError(str(error)) from error
 
