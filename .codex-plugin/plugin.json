@@ -1,0 +1,41 @@
+{
+  "name": "codex-local-worker",
+  "version": "0.2.0",
+  "description": "Plan with the model you selected in this window and implement with a pinned local worker model on your own machine. Setup checks and installs the user-wide routing (migrating the pre-rename pointer block), doctor verifies an existing install read-only, and the launcher runs scoped jobs in throwaway git worktrees, returning a patch, real test results and an audit of every changed file.",
+  "author": "OpenAI",
+  "homepage": "https://github.com/openai/codex-local-worker",
+  "repository": "https://github.com/openai/codex-local-worker",
+  "license": "MIT",
+  "keywords": [
+    "local-first",
+    "local-model",
+    "local-worker",
+    "omlx",
+    "worker",
+    "skills",
+    "task-contract",
+    "verification"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Local Worker",
+    "shortDescription": "Plan here, implement with a local worker",
+    "longDescription": "Build scoped Codex jobs with a local worker, verify the resulting changes, and review concise evidence before integrating.",
+    "developerName": "OpenAI",
+    "category": "Developer tools",
+    "capabilities": [
+      "local model discovery",
+      "scoped job execution",
+      "verification and review"
+    ],
+    "brandColor": "#005A9C",
+    "brandColorDark": "#8CCBFF",
+    "logo": "./assets/logo.png",
+    "logoDark": "./assets/logo-dark.png",
+    "composerIcon": "./assets/composer-icon.png",
+    "screenshots": [
+      "./assets/screenshot-summary.png"
+    ],
+    "defaultPrompt": "Inspect the task, create scoped local worker jobs, review each result, and summarize what changed."
+  }
+}

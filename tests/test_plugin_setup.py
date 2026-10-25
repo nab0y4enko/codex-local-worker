@@ -26,7 +26,7 @@ SENTINEL = "sk-SENTINEL-9f2c41d7b6e4"
 LEGACY_BYTES = (ROOT / "evidence" / "global-default" / "AGENTS.md").read_bytes()
 HEAD = b"# My own Codex defaults\n\n- Always run the focused tests before shipping.\n"
 TAIL = b"\n## Private notes\n- keep \xff\xfe these exact bytes\n"
-PACKAGE_KEYS = ("canonical_policy", "launcher", "launcher_skill", "setup_script",
+PACKAGE_KEYS = ("manifest", "canonical_policy", "launcher", "launcher_skill", "setup_script",
                 "launcher_engine", "skill_local-worker", "skill_setup", "skill_doctor",
                 "onboarding_skill")
 
@@ -192,7 +192,8 @@ class CheckReportTest(SetupCase):
         self.assertEqual(report["plugin"]["name"], "codex-local-worker")
         self.assertEqual(report["plugin"]["root"], str(self.package))
         self.assertEqual(report["plugin"]["version"], "0.2.0")
-        self.assertEqual(Path(report["plugin"]["manifest"]).name, "plugin.json")
+        self.assertEqual(Path(report["plugin"]["manifest"]).relative_to(self.package).as_posix(),
+                         ".codex-plugin/plugin.json")
         self.assertEqual(Path(report["plugin"]["onboarding_skill"]).name, "SKILL.md")
         self.assertEqual(Path(report["codex_home"]).resolve(), self.home.resolve())
         self.assertEqual(Path(report["state_dir"]).resolve(), self.state.resolve())
@@ -487,15 +488,17 @@ class ApplyTest(SetupCase):
         self.assertFalse(self.state.exists())
 
     def test_malformed_manifest_identity_refuses_with_a_nonzero_code(self):
-        (self.package / "plugin.json").write_text("{ not json at all", encoding="utf-8")
+        manifest_path = self.package / ".codex-plugin" / "plugin.json"
+        manifest_path.write_text("{ not json at all", encoding="utf-8")
         code, report, output = self.invoke()
         self.assertEqual(code, 3, output)
         self.assertEqual(report["error"]["stage"], "manifest")
         self.assertFalse(self.home.exists())
         wrong = self.copy_package("wrong name")
-        manifest = json.loads((wrong / "plugin.json").read_text(encoding="utf-8"))
+        manifest_path = wrong / ".codex-plugin" / "plugin.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["name"] = "some-other-plugin"
-        (wrong / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         code, report, output = self.invoke(package=wrong)
         self.assertEqual(code, 3, output)
         self.assertEqual(report["error"]["stage"], "manifest")

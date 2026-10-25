@@ -43,7 +43,7 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 PLUGIN_NAME = "codex-local-worker"
-PLUGIN_VERSION = "0.2.0"
+MANIFEST_RELATIVE = (".codex-plugin", "plugin.json")
 POLICY_RELATIVE = ("skills", "local-worker", "references", "global-policy.md")
 SKILL_RELATIVE = ("skills", "local-worker", "SKILL.md")
 SETUP_RELATIVE = ("src", "plugin_setup.py")
@@ -126,9 +126,27 @@ def inside_root(path, root):
 def package_root():
     """The plugin root, inferred from this file, validated before anything else reads it."""
     root = Path(absolute(Path(__file__).resolve().parents[1]))
-    if not (root / "plugin.json").is_file():
-        raise SetupError(EXIT_PACKAGE, "package", "no plugin.json above " + str(root))
+    if not manifest_path(root).is_file():
+        raise SetupError(EXIT_PACKAGE, "package", "no .codex-plugin/plugin.json above " + str(root))
     return root
+
+
+def manifest_path(root: Path) -> Path:
+    """Return the first-party plugin manifest path below ``root``."""
+    return Path(root).joinpath(*MANIFEST_RELATIVE)
+
+
+def plugin_version(root: Path) -> str:
+    """Read the package version from its sole source, the first-party manifest."""
+    path = manifest_path(root)
+    try:
+        manifest = json.loads(decode(read_bytes(path)))
+    except (OSError, ValueError) as error:
+        raise SetupError(EXIT_PACKAGE, "manifest", "cannot read plugin version: %s" % error)
+    version = manifest.get("version") if isinstance(manifest, dict) else None
+    if not isinstance(version, str) or not version:
+        raise SetupError(EXIT_PACKAGE, "manifest", "manifest version is missing")
+    return version
 
 
 def read_bytes(path):
@@ -229,11 +247,11 @@ def managed_block(root):
 
 def validate_package(root):
     """Manifest identity, the onboarding skill, the canonical policy, the launcher and its engine."""
-    manifest_path = root / "plugin.json"
-    if not manifest_path.is_file() or manifest_path.is_symlink():
-        raise SetupError(EXIT_PACKAGE, "manifest", "plugin.json is not a regular file")
+    manifest_file = manifest_path(root)
+    if not manifest_file.is_file() or manifest_file.is_symlink():
+        raise SetupError(EXIT_PACKAGE, "manifest", ".codex-plugin/plugin.json is not a regular file")
     try:
-        manifest = json.loads(decode(read_bytes(manifest_path)))
+        manifest = json.loads(decode(read_bytes(manifest_file)))
     except ValueError as error:
         raise SetupError(EXIT_PACKAGE, "manifest", "plugin.json is not valid JSON: %s" % error)
     if not isinstance(manifest, dict):
@@ -241,27 +259,15 @@ def validate_package(root):
     if manifest.get("name") != PLUGIN_NAME:
         raise SetupError(EXIT_PACKAGE, "manifest",
                          "plugin.json name is %r, expected %r" % (manifest.get("name"), PLUGIN_NAME))
-    if manifest.get("version") != PLUGIN_VERSION:
-        raise SetupError(EXIT_PACKAGE, "manifest",
-                         "plugin.json version is %r, expected %r"
-                         % (manifest.get("version"), PLUGIN_VERSION))
-    extensions = manifest.get("extensions")
-    client = extensions.get("com.openai") if isinstance(extensions, dict) else None
-    onboarding = client.get("onboardingSkill") if isinstance(client, dict) else None
-    if not isinstance(onboarding, str) or not onboarding:
-        raise SetupError(EXIT_PACKAGE, "manifest",
-                         "extensions.com.openai.onboardingSkill is missing from plugin.json")
-    if os.path.isabs(onboarding):
-        raise SetupError(EXIT_PACKAGE, "manifest", "onboardingSkill must be package-relative")
-    onboarding_path = Path(absolute(str(root), *onboarding.split("/")))
-    if not inside_root(onboarding_path, root):
-        raise SetupError(EXIT_PACKAGE, "manifest",
-                         "onboardingSkill resolves outside the package: " + onboarding)
-    if not onboarding_path.is_file():
-        raise SetupError(EXIT_PACKAGE, "manifest",
-                         "onboarding skill is missing: " + str(onboarding_path))
+    if not isinstance(manifest.get("version"), str) or not manifest.get("version"):
+        raise SetupError(EXIT_PACKAGE, "manifest", "plugin.json version is missing")
+    skills = manifest.get("skills")
+    if skills != "./skills/":
+        raise SetupError(EXIT_PACKAGE, "manifest", "skills must be ./skills/")
+    onboarding_path = root / "skills" / "setup" / "SKILL.md"
 
-    files = {"canonical_policy": Path(link_destination(root, POLICY_RELATIVE)),
+    files = {"manifest": manifest_file,
+             "canonical_policy": Path(link_destination(root, POLICY_RELATIVE)),
              "launcher_skill": Path(link_destination(root, SKILL_RELATIVE)),
              "setup_script": Path(link_destination(root, SETUP_RELATIVE)),
              "launcher": Path(link_destination(root, PREFLIGHT_COMMAND)),
@@ -276,13 +282,8 @@ def validate_package(root):
     if not policy_raw.strip():
         raise SetupError(EXIT_PACKAGE, "policy",
                          "canonical policy is empty: " + str(files["canonical_policy"]))
-    try:
-        policy_text = policy_raw.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise SetupError(EXIT_PACKAGE, "policy", "canonical policy is not UTF-8: %s" % error)
-    if PLUGIN_NAME not in policy_text:
-        raise SetupError(EXIT_PACKAGE, "policy",
-                         "canonical policy does not name " + PLUGIN_NAME)
+    if PLUGIN_NAME.encode("utf-8") not in policy_raw:
+        raise SetupError(EXIT_PACKAGE, "policy", "canonical policy does not name " + PLUGIN_NAME)
     return {"manifest": manifest, "onboarding_skill": str(onboarding_path),
             "files": {name: str(path) for name, path in files.items()}}
 
@@ -713,7 +714,7 @@ def run(args):
     package = validate_package(root)
     manifest = package["manifest"]
     report["plugin"]["version"] = manifest.get("version")
-    report["plugin"]["manifest"] = str(root / "plugin.json")
+    report["plugin"]["manifest"] = str(manifest_path(root))
     report["plugin"]["onboarding_skill"] = package["onboarding_skill"]
     report["plugin"]["description"] = manifest.get("description")
     report["package"] = {name: presence(Path(path))

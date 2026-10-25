@@ -31,7 +31,7 @@ LAUNCHER_FILES = ["bin/local-worker", "src/local_worker.py", "src/run_policy.py"
                   "src/apple_verification.py", "examples/task.json"]
 SKILL_NAMES = {"local-worker", "setup", "doctor"}
 PERSONAL = re.compile(r"oleksii|/Users/", re.IGNORECASE)
-ACTIVE_INSTRUCTIONS = ["plugin.json", ".agents/plugins/marketplace.json", "README.md",
+ACTIVE_INSTRUCTIONS = [".codex-plugin/plugin.json", ".agents/plugins/marketplace.json", "README.md",
                        "skills/local-worker/SKILL.md",
                        "skills/local-worker/references/global-policy.md",
                        "skills/setup/SKILL.md", "skills/doctor/SKILL.md"]
@@ -111,7 +111,7 @@ class PackageBase(unittest.TestCase):
                         "path resolves outside the package: " + str(path))
 
     def manifest(self):
-        return load_json(Path(self.root) / "plugin.json")
+        return load_json(Path(self.root) / ".codex-plugin" / "plugin.json")
 
 
 class CopiedPackageTest(PackageBase):
@@ -134,7 +134,8 @@ class CopiedPackageTest(PackageBase):
     def test_copied_package_is_relocated_and_holds_spaces(self):
         self.assertNotEqual(Path(self.root).resolve(), Path(ROOT).resolve())
         self.assertIn(" ", str(self.root))
-        self.assertTrue((Path(self.root) / "plugin.json").is_file())
+        self.assertTrue((Path(self.root) / ".codex-plugin" / "plugin.json").is_file())
+        self.assertFalse((Path(self.root) / "plugin.json").exists())
         self.assertFalse((Path(self.root) / ".git").exists(), "a copy must not carry VCS state")
         for path in Path(self.root).rglob("*"):
             if path.is_symlink():
@@ -142,7 +143,6 @@ class CopiedPackageTest(PackageBase):
 
     def test_manifest_matches_closed_portable_schema(self):
         manifest = self.manifest()
-        self.assertEqual(manifest.get("$schema"), SCHEMA_ID)
         self.assertEqual(manifest.get("name"), PLUGIN_NAME)
         self.assertTrue(NAME_PATTERN.match(manifest["name"]), "plugin name is not a valid token")
         self.assertEqual(manifest.get("version"), PLUGIN_VERSION)
@@ -150,33 +150,18 @@ class CopiedPackageTest(PackageBase):
         self.assertIsInstance(manifest["description"], str)
         self.assertIsInstance(manifest.get("keywords"), list)
         self.assertTrue(all(isinstance(word, str) and word for word in manifest["keywords"]))
-        self.assertIsInstance(manifest.get("extensions"), dict)
-        self.assertTrue(all(isinstance(value, dict)
-                            for value in manifest["extensions"].values()),
-                        "every extension namespace must be an object")
-        self.assertEqual(set(manifest) - MANIFEST_FIELDS, set(),
-                         "unknown top-level manifest field (the portable schema is closed)")
-        for invented in ("author", "homepage", "repository", "license"):
-            self.assertNotIn(invented, manifest, "must not invent " + invented)
+        self.assertEqual(manifest.get("skills"), "./skills/")
+        self.assertIsInstance(manifest.get("interface"), dict)
+        self.assertEqual(set(manifest), {"name", "version", "description", "author", "homepage",
+                                        "repository", "license", "keywords", "skills", "interface"})
 
     def test_ui_identity_and_onboarding_skill(self):
         manifest = self.manifest()
-        # Official nesting: the client namespace holds `onboardingSkill`, and `interface` holds
-        # only the UI fields. `com.openai.interface` is not a namespace and must not appear.
-        self.assertNotIn("com.openai.interface", manifest["extensions"],
-                         "the client namespace is com.openai, not com.openai.interface")
-        client = manifest["extensions"].get("com.openai")
-        self.assertIsInstance(client, dict, "extensions.com.openai must be an object")
-        self.assertEqual(set(client), {"onboardingSkill", "interface"},
-                         "onboardingSkill sits beside interface, never inside it")
-        self.assertEqual(client.get("onboardingSkill"), ONBOARDING)
-        onboarding = self.resolve(client["onboardingSkill"])
-        self.assertTrue(onboarding.is_file(), "onboarding skill is missing: " + str(onboarding))
-        self.assertEqual(onboarding.name, "SKILL.md")
-        self.assertIn("name: setup", onboarding.read_text(encoding="utf-8"))
-        interface = client.get("interface")
-        self.assertIsInstance(interface, dict)
-        self.assertEqual(set(interface), {"displayName", "shortDescription"})
+        self.assertEqual(manifest["skills"], "./skills/")
+        interface = manifest["interface"]
+        self.assertEqual(interface.get("displayName"), "Local Worker")
+        self.assertGreaterEqual(len(interface.get("longDescription", "")), 40)
+        self.assertTrue(interface.get("defaultPrompt"))
         self.assertEqual(interface.get("displayName"), "Local Worker")
         short = interface.get("shortDescription")
         self.assertTrue(short and len(short) <= 80 and short != interface["displayName"])
@@ -195,7 +180,7 @@ class CopiedPackageTest(PackageBase):
         source = self.resolve(entry["source"]["path"])
         self.assertEqual(source, Path(self.root).resolve(),
                          "the repository root itself is the package source")
-        self.assertEqual(load_json(source / "plugin.json")["name"], PLUGIN_NAME)
+        self.assertEqual(load_json(source / ".codex-plugin" / "plugin.json")["name"], PLUGIN_NAME)
         self.assertEqual(entry["policy"], {"installation": "AVAILABLE",
                                           "authentication": "ON_INSTALL"})
         self.assertEqual(entry.get("category"), "Productivity")
@@ -392,15 +377,32 @@ class ManifestParityTest(PackageBase):
     def test_source_package_matches_installed_shape(self):
         manifest = self.manifest()
         self.assertEqual(manifest["name"], PLUGIN_NAME)
-        self.assertEqual(manifest["extensions"]["com.openai"]["onboardingSkill"], ONBOARDING)
-        self.assertEqual(manifest["extensions"]["com.openai"]["interface"]["displayName"],
-                         "Local Worker")
-        self.assertNotIn("com.openai.interface", manifest["extensions"])
+        self.assertEqual(manifest["skills"], "./skills/")
+        self.assertEqual(manifest["interface"]["displayName"], "Local Worker")
         marketplace = load_json(ROOT / ".agents" / "plugins" / "marketplace.json")
         entry = marketplace["plugins"][0]
         self.assertEqual(self.resolve(entry["source"]["path"]), Path(ROOT).resolve())
         self.assertEqual(sorted(child.name for child in (ROOT / "skills").iterdir()
                                 if child.is_dir()), sorted(SKILL_NAMES))
+
+    def test_manifest_uses_the_first_party_layout_and_branding(self):
+        manifest_path = ROOT / ".codex-plugin" / "plugin.json"
+        manifest = load_json(manifest_path)
+        self.assertFalse((ROOT / "plugin.json").exists())
+        self.assertEqual(manifest.get("skills"), "./skills/")
+        for key in ("displayName", "shortDescription", "longDescription", "developerName",
+                    "category", "capabilities", "brandColor", "brandColorDark", "logo",
+                    "logoDark", "composerIcon", "screenshots", "defaultPrompt"):
+            self.assertIn(key, manifest["interface"])
+        for key in ("logo", "logoDark", "composerIcon"):
+            self.assertTrue((ROOT / manifest["interface"][key]).is_file())
+        self.assertTrue(manifest["interface"]["screenshots"])
+
+    def test_version_has_one_source(self):
+        from src import plugin_setup
+        self.assertEqual(plugin_setup.plugin_version(ROOT),
+                         load_json(ROOT / ".codex-plugin" / "plugin.json")["version"])
+        self.assertNotIn("PLUGIN_VERSION =", (ROOT / "src" / "plugin_setup.py").read_text())
 
 
 if __name__ == "__main__":
