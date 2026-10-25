@@ -54,6 +54,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import apple_verification as apple
 import codex_catalog
 import omlx_discovery
+import permissions
 import worker_pool as pool
 import native_readiness as native
 import worker_observability as observation
@@ -3109,6 +3110,22 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--codex-bin", help=f"Codex CLI path (default PATH or {CODEX_BIN_ENV}, "
                                            f"legacy {LEGACY_CODEX_BIN_ENV})")
     add_selection_arguments(check)
+
+    perms = sub.add_parser("permissions", help="show or change the user-owned permissions list "
+                                               "that decides what workers may read")
+    perms_sub = perms.add_subparsers(dest="permissions_command", required=True)
+    for name, help_text in (
+            ("show", "print the effective permissions list and whether the Seatbelt wrapper can "
+                     "run (creates the default file when there is none)"),
+            ("deny-read", "hide PATH from workers: add it to the deny_read list"),
+            ("allow-read", "stop hiding PATH from workers: remove it from the deny_read list "
+                           "(default entries too, the file is yours)")):
+        item = perms_sub.add_parser(name, help=help_text)
+        if name != "show":
+            item.add_argument("path", metavar="PATH")
+        item.add_argument("--state-dir",
+                          help="state root holding permissions.json (env %s, legacy %s; "
+                               "default %s)" % (STATE_ENV, LEGACY_STATE_ENV, DEFAULT_STATE_DIR))
     return parser
 
 
@@ -3207,6 +3224,19 @@ def refusal_payload(error: LauncherError) -> Dict[str, Any]:
     return payload
 
 
+def run_permissions_command(args: argparse.Namespace) -> int:
+    """``permissions show|deny-read|allow-read``: print the effective list after any change."""
+    state = resolve_state_dir(args.state_dir)
+    if args.permissions_command == "deny-read":
+        current = permissions.add_deny_read(state, args.path)
+    elif args.permissions_command == "allow-read":
+        current = permissions.remove_deny_read(state, args.path)
+    else:
+        current = permissions.load_permissions(state)
+    print(json.dumps(permissions.describe(current), indent=2))
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None, *,
          omlx_fetch: omlx_discovery.HttpFetch = omlx_discovery.http_fetch,
          codex_run: Callable[..., Any] = subprocess.run) -> int:
@@ -3226,6 +3256,8 @@ def main(argv: Optional[Sequence[str]] = None, *,
                 result.append(status_snapshot(item))
             print(json.dumps(result, indent=2))
             return 0
+        if args.command == "permissions":
+            return run_permissions_command(args)
         requested_model, context_cap = selection_from_args(args)
         if args.command == "preflight":
             compat = require_codex_compat(resolve_codex_bin(args.codex_bin), run=codex_run)
@@ -3269,6 +3301,9 @@ def main(argv: Optional[Sequence[str]] = None, *,
     except LauncherError as error:
         print(json.dumps(refusal_payload(error), indent=2))
         return EXIT_CODES.get(error.status, 4)
+    except permissions.PermissionsError as error:
+        print(json.dumps({"status": "preflight_failed", "failure_reason": str(error)}, indent=2))
+        return EXIT_CODES["preflight_failed"]
     except (OSError, json.JSONDecodeError) as error:
         print(json.dumps({"status": "contract_invalid",
                           "failure_reason": f"cannot read task contract: {error}"}, indent=2))
