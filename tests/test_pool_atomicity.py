@@ -13,6 +13,7 @@ import fcntl
 import json
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -44,7 +45,9 @@ job_deadline = (time.monotonic() + float(args["job_seconds"])) if args.get("job_
 
 
 def report(payload, target=outcome):
-    target.write_text(json.dumps(payload), encoding="utf-8")
+    temporary = target.with_name(target.name + ".tmp")
+    temporary.write_text(json.dumps(payload), encoding="utf-8")
+    temporary.replace(target)
 
 
 def wait_for(path, stop_after):
@@ -553,6 +556,36 @@ class SimulatorResourceLocks(PoolAtomicityCase):
                                  "resource locks must be acquired in sorted order")
                 self.assertTrue(resource_indices)
                 self.assertGreater(min(resource_indices), legacy_index)
+
+
+class OutcomePublication(unittest.TestCase):
+    def test_child_never_exposes_partial_json_to_the_parent(self):
+        with tempfile.TemporaryDirectory(prefix="pool-outcome-") as directory:
+            root = Path(directory)
+            target = root / "outcome.json"
+            arguments = root / "args.json"
+            arguments.write_text(json.dumps({
+                "state": str(root / "state"), "outcome": str(target),
+                "release": str(root / "release"),
+            }))
+            namespace = {}
+            prefix = CHILD.split('\nif args.get("gate_ready"):', 1)[0]
+            with mock.patch.object(sys, "argv", ["child.py", SRC, str(arguments)]):
+                exec(compile(prefix, "pool-child-report", "exec"), namespace)
+            write = Path.write_text
+
+            def before_write(path, data, *args, **kwargs):
+                # Model the interval after open/truncate but before payload bytes are written.
+                write(path, "", *args, **kwargs)
+                self.assertFalse(target.exists(), "public outcome appeared before JSON publication")
+                return write(path, data, *args, **kwargs)
+
+            with mock.patch.object(Path, "write_text", autospec=True, side_effect=before_write):
+                namespace["report"]({"admitted": False, "error": "PoolUnavailableError"})
+            self.assertEqual(json.loads(target.read_text()), {
+                "admitted": False, "error": "PoolUnavailableError",
+            })
+            self.assertEqual(list(root.glob("*.tmp")), [])
 
 
 if __name__ == "__main__":

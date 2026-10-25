@@ -42,6 +42,14 @@ args = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
 state = Path(args["state"])
 ready = Path(args["ready"])
 release = Path(args["release"])
+
+
+def report(payload):
+    temporary = ready.with_name(ready.name + ".tmp")
+    temporary.write_text(json.dumps(payload), encoding="utf-8")
+    temporary.replace(ready)
+
+
 try:
     with contextlib.ExitStack() as stack:
         held = None
@@ -55,13 +63,12 @@ try:
                          allowed_paths=list(args["allowed_paths"]),
                          job_id=args.get("job_id"), lock_timeout=float(args["hold"]),
                          simulator_udid=args.get("udid")))
-        ready.write_text(json.dumps({"slot": getattr(held, "slot", None)}), encoding="utf-8")
+        report({"slot": getattr(held, "slot", None)})
         stop = time.monotonic() + float(args["hold"])
         while not release.exists() and time.monotonic() < stop:
             time.sleep(0.02)
 except Exception as error:  # noqa: BLE001 - reported through the ready file
-    ready.write_text(json.dumps({"error": f"{type(error).__name__}: {error}"}),
-                     encoding="utf-8")
+    report({"error": f"{type(error).__name__}: {error}"})
     raise SystemExit(1)
 '''
 
@@ -420,6 +427,35 @@ class JobWiring(PoolCase):
         self.assertEqual(lw.build_parser().parse_args(
             argv + ["--max-workers", "4"]).max_workers, "4")
         self.assertEqual(lw.build_parser().parse_args(argv).max_workers, "1")
+
+
+class OutcomePublication(unittest.TestCase):
+    def test_holder_never_exposes_partial_json_to_the_parent(self):
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="pool-ready-") as directory:
+            root = Path(directory)
+            target = root / "ready.json"
+            release = root / "release"
+            release.touch()
+            arguments = root / "args.json"
+            arguments.write_text(json.dumps({
+                "state": str(root / "state"), "ready": str(target), "release": str(release),
+                "capacity": 2, "task_id": "publication", "repo": str(root),
+                "allowed_paths": [], "hold": 1,
+            }))
+            write = Path.write_text
+
+            def before_write(path, data, *args, **kwargs):
+                write(path, "", *args, **kwargs)
+                self.assertFalse(target.exists(), "public readiness appeared before JSON publication")
+                return write(path, data, *args, **kwargs)
+
+            with mock.patch.object(sys, "argv", ["holder.py", SRC, str(arguments)]), \
+                    mock.patch.object(wp, "lease", return_value=contextlib.nullcontext(mock.Mock(slot=1))), \
+                    mock.patch.object(Path, "write_text", autospec=True, side_effect=before_write):
+                exec(compile(HOLDER, "pool-holder-report", "exec"), {})
+            self.assertEqual(json.loads(target.read_text()), {"slot": 1})
+            self.assertEqual(list(root.glob("*.tmp")), [])
 
 
 if __name__ == "__main__":
