@@ -19,7 +19,7 @@ qualification, until the identified issues are addressed.
 5. Keep idle-state archive sequencing, whitespace normalization, and planner edit disclosure in
    the workflow. Test the final installed flow with isolated state/home and retained receipts.
 6. For every behavior change, first add and run a failing regression test, then implement and
-   run focused tests. Review changes independently with Luna agents, run the full offline suite,
+   run focused tests. Review changes independently, run the full offline suite,
    then run isolated live/CLI qualification. Record each failed and successful attempt. Fix
    reproducible product issues, rerun affected tests, and state any remaining reliability limits.
 7. Commit small reviewed Conventional Commits without attribution; preserve all user evidence.

@@ -11,6 +11,9 @@ findings): [2026-10-25 e2e CLI](2026-10-25-e2e-cli.md).
 Fixes and the single approved re-run: [2026-10-25 e2e CLI re-run](2026-10-25-e2e-cli-rerun.md),
 including the rejected read result, successful implementation jobs, archive state and final token totals.
 
+Further user-authorized fixes and qualification: [2026-10-25 e2e follow-ups](2026-10-25-e2e-followups.md),
+including retained negative pilots, citation references, test-review advisories and planner usage completeness.
+
 `test_live_qualification.py` is the opt-in, end-to-end suite for the installed launcher. It uses
 `bin/local-worker` for every local inference job and records one dated host report from actual
 launcher output. Offline unit tests remain under `tests/` and use `python3 -m unittest`.

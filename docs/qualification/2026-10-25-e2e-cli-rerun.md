@@ -29,7 +29,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
 
 Result: **1,034 total, 1,026 executed successfully, 8 live-only skips, OK, 342.051 seconds**,
 exit 0, no warnings in the log. Evidence: `offline-suite.log` under the evidence root below.
-Two Luna reviewers independently inspected code and documentation; no code correctness issues
+Two independent reviews inspected code and documentation; no code correctness issues
 were found. The documentation review's no-worktree archiving ambiguity was corrected.
 
 ## Setup and command
