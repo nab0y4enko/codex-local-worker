@@ -1,8 +1,10 @@
 # Task 27 dashboard MCP Apps spike
 
-**Status: prepared / desktop not run.** No GO or NO-GO decision is assigned. The actual desktop
-rendering gate remains open pending explicit approval to add the temporary local marketplace and
-reload the installed app if needed.
+**Status: temporary install tested and rolled back; desktop UI gate blocked.** No GO or NO-GO
+decision is assigned. The approved temporary marketplace/plugin installation succeeded and was
+removed. The actual desktop rendering gate remains open because the app could not be safely
+controlled under the available desktop automation policy; this is a blocked observation, not a
+failed host capability.
 
 ## What is prepared
 
@@ -36,11 +38,20 @@ reload the installed app if needed.
 |---|---|
 | Protocol and fixture-boundary tests | `python3 -m unittest tests.test_dashboard_spike` — 7 tests passed. |
 | Python syntax | `python3 -m py_compile spikes/dashboard/server.py tests/test_dashboard_spike.py` — passed. |
-| App package | `/Applications/ChatGPT.app` version `26.1021.31345`; prior local readiness inspection identifies it as the Codex variant. No app UI was opened, installed, reloaded, or restarted for this spike. |
-| CLI package | `codex-cli 0.164.0-alpha.11.1`. Isolated `codex plugin marketplace add`, `codex plugin add`, `codex plugin list`, and `codex mcp list` succeeded with `HOME=CODEX_HOME=/tmp/dashboard-spike-cli-home-r1-20261025`. The CLI listed `dashboard_spike` as an enabled stdio MCP server with no environment overrides. |
+| App package | `/Applications/ChatGPT.app` version `26.1021.31345`; prior local readiness inspection identifies it as the Codex variant. No app UI was opened or reloaded. |
+| CLI package | `codex-cli 0.164.0-alpha.11.1`. Isolated qualification listed `dashboard_spike` as an enabled stdio MCP server. In the real Codex CLI environment, the temporary `dashboard_spike` entry appeared as enabled with `python3 server.py`, the expected temporary package directory, and auth status `Unsupported`. |
 | Actual Codex MCP handshake | In the same isolated home, `/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex app-server --listen stdio://` accepted a no-inference JSON-RPC `initialize` handshake advertising `io.modelcontextprotocol/ui`; `mcpServerStatus/list` started the plugin server and returned `toolsError: null` with `open_dashboard`. The status response did not expose `_meta` fields. This verifies MCP server startup and tool listing in the CLI app-server, not desktop rendering or UI capability support. No prompt, model inference, login, or real user config access was performed. |
-| Desktop rendering / advertised host modes / PiP | Not observed; requires the approved desktop install/reload step. |
+| Temporary marketplace/plugin install | Added `dashboard-spike-20261025` from `/tmp/codex-dashboard-mcpapps-spike-20261025`, then installed `dashboard-mcpapps-spike-20261025@dashboard-spike-20261025` version `0.1.2`. The prepared server, widget, and fixture matched the repository files byte-for-byte. |
+| Rollback | Removed the plugin and marketplace with the inverse CLI commands. Post-rollback `codex plugin marketplace list` and `codex plugin list --json` match the pre-install captures exactly; `codex mcp list` has no `dashboard_spike` entry, and the installed plugin cache path is absent. Temporary source and isolated CLI test-home directories were removed after verified external archives were made. |
+| Actual desktop rendering / advertised host modes / PiP | Not observed. Native computer-use access was rejected by the client with an explicit safety denial for `com.openai.codex`; AppleScript reported `SystemEvents` UI elements disabled. No permissions were changed, no alternate UI-control route was used, and no app reload/restart occurred. This is a blocked observation, not a no-go result. |
+| Runtime tool exposure | This task runtime's `ALL_TOOLS` did not contain `dashboard_spike` or `open_dashboard`; `codex mcp list` did show the installed server while the temporary plugin was present. Static registry/API inspection does not establish that the desktop would expose or render it. |
 | A→B mounted refresh / unsolicited updates | Not observed in the host. The fixture and refresh round trip are prepared; the server has no push mechanism. |
+
+Read-only inspection of the bundled app found a parser for `codex://plugins/{pluginId}/app/{toolName}`
+and `codex://settings/{pluginId}/{toolName}` deep links. The temporary plugin's candidate global
+entrypoint would be `codex://plugins/dashboard-mcpapps-spike-20261025%40dashboard-spike-20261025/app/open_dashboard`.
+This candidate was not invoked and is not desktop-rendering evidence. A future manually controlled
+test could use the product's normal navigation surface if separately approved and available.
 
 The host gate must record what the desktop itself sends in `hostContext.availableDisplayModes`,
 the initial `displayMode`, and the actual mode returned after any permitted PiP request. The UI's
@@ -49,7 +60,8 @@ evidence of server push.
 
 ## Temporary marketplace package
 
-Prepared outside the installed package cache and outside the repository:
+Originally prepared outside the installed package cache and outside the repository. After the
+desktop attempt, the exact source package was archived and verified externally, then removed:
 
 ```text
 /tmp/codex-dashboard-mcpapps-spike-20261025/
@@ -62,45 +74,41 @@ Prepared outside the installed package cache and outside the repository:
 ```
 
 The plugin identity is `dashboard-mcpapps-spike-20261025`, distinct from `codex-local-worker`.
-The CLI qualification changed only the disposable test home at
-`/tmp/dashboard-spike-cli-home-r1-20261025`; the real `~/.codex` and desktop settings were not
-read or changed. The marketplace package version is `0.1.2` and the MCP manifest contains no
-external fixture path or environment override.
+The marketplace package version is `0.1.2` and the MCP manifest contains no external fixture path
+or environment override. Before the real CLI installation, only the marketplace list and plugin
+registry were recorded. No user config, session, message, credential, or authentication data was
+read or copied.
 
-After the parent reviews this prepared result and obtains approval for the desktop action, the
-CLI-managed marketplace command is:
+The approved installation used the CLI-managed marketplace command:
 
 ```sh
 codex plugin marketplace add /tmp/codex-dashboard-mcpapps-spike-20261025
 ```
 
-Then install the uniquely named plugin in the Plugins Directory, or use:
+Then the uniquely named plugin was installed with:
 
 ```sh
 codex plugin add dashboard-mcpapps-spike-20261025@dashboard-spike-20261025
 ```
 
-The setting to record is only the `dashboard-spike-20261025` marketplace source plus the
-`dashboard-mcpapps-spike-20261025` plugin install/enable choice. Before making those changes,
-record `codex plugin marketplace list` and `codex plugin list --json` so rollback can restore the
-prior state. Rollback uses the inverse commands:
+The only persistent choices were the `dashboard-spike-20261025` marketplace source and the
+`dashboard-mcpapps-spike-20261025` plugin install/enable state. Before installation, the exact
+marketplace and plugin registries were captured. Rollback used the inverse commands:
 
 ```sh
 codex plugin remove dashboard-mcpapps-spike-20261025@dashboard-spike-20261025
 codex plugin marketplace remove dashboard-spike-20261025
 ```
 
-If app reload is requested by the desktop, do it only as part of the approved gate and record
-that action; after rollback, reload again only if needed to make the removal effective. The
-temporary marketplace can then be removed with `rm -rf /tmp/codex-dashboard-mcpapps-spike-20261025`.
-The disposable CLI qualification home can then be removed with
-`rm -rf /tmp/dashboard-spike-cli-home-r1-20261025`.
-The installed app remains untouched until that approval. Do not copy or inspect session,
-message, credential, or authentication data for this gate.
+The registry rollback was verified by exact pre/post comparison. The disposable CLI qualification
+home also contained SQLite state and a config file, so only the synthetic plugin cache was included
+in the verified archive; no such database or config file was read or copied. Both exact temporary
+directories were then removed. The app itself was not restarted or reloaded.
 
 ## Decision
 
-**Undecided.** Protocol and isolated CLI preparation pass. Desktop support, widget rendering,
-host-advertised modes, PiP, and mounted refresh are unknown because the app was not modified or
-reloaded. Do not start Task 28 from these results. Complete the desktop observations first; a
-missing observation is not a failed host capability.
+**Undecided.** Protocol and isolated CLI preparation pass. The temporary real-environment install
+and exact rollback pass. Desktop support, widget rendering, host-advertised modes, PiP, and mounted
+refresh remain unknown because desktop UI access was blocked by the computer-use policy and
+Accessibility was unavailable. Do not start Task 28 from these results. A missing observation is
+not a failed host capability.
