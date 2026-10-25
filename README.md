@@ -104,6 +104,11 @@ state.
 Known limit: the wrapper write-protects the job worktree directory itself so it cannot be
 renamed or replaced, so `touch .` (or `tar -C .` setting times) at the worktree root fails with
 "Operation not permitted" inside a job. Files and subdirectories below the root are unaffected.
+Re-allowing only `file-write-times` on the root literal was tried on 2026-10-25 and does not work:
+with `(deny file-write* (literal <root>))` in place, no allow of any named `file-write-*` operation
+(times, data, create, unlink, mode, owner, flags, xattr, setugid, acl), alone or together,
+makes `touch <root>` succeed on this macOS; only a full `(allow file-write* ...)` does, which
+would also re-open rename protection. Seatbelt does not offer the split, so this stays a known limit.
 
 ## Troubleshooting by classification code
 
