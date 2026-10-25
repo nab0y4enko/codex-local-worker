@@ -282,11 +282,26 @@ class Compatibility(IsolationCase):
                          json.dumps(":read-only"))
         filesystem = config["permissions.%s.filesystem" % lw.READ_PERMISSION_PROFILE]
         for path, action in ((state.resolve(), "deny"), (denied.resolve(), "deny")):
-            self.assertIn(json.dumps(str(path)) + " = " + json.dumps(action), filesystem)
+            self.assertIn(json.dumps(str(path)) + ' = { "." = ' + json.dumps(action) + " }",
+                          filesystem)
         self.assertNotIn(json.dumps(str(worktree.resolve())) + " = \"read\"", filesystem)
         self.assertIn('":workspace_roots" = { "." = "read" }', filesystem)
         self.assertEqual(config["permissions.%s.workspace_roots" % lw.READ_PERMISSION_PROFILE],
                          "{ " + json.dumps(str(worktree.resolve())) + " = true }")
+
+    def test_bracketed_denials_use_nested_exact_path_rules(self):
+        state = self.root / "state [literal]"
+        worktree = state / "worktrees" / "job"
+        worktree.mkdir(parents=True)
+        denied = self.root / "private" / "secret [literal] file.txt"
+        denied.parent.mkdir()
+        config = dict(lw.native_read_profile_overrides(
+            lw.permissions.default_permissions(), state, worktree, extra_deny_read=[denied]))
+        filesystem = config["permissions.%s.filesystem" % lw.READ_PERMISSION_PROFILE]
+        for path in (state.resolve(), denied.resolve()):
+            self.assertIn(json.dumps(str(path)) + ' = { "." = "deny" }', filesystem)
+        self.assertNotIn(json.dumps(str(state.resolve())) + ' = "deny"', filesystem)
+        self.assertNotIn(json.dumps(str(denied.resolve())) + ' = "deny"', filesystem)
 
     def test_an_unreadable_version_or_a_missing_binary_is_not_compatible(self):
         compat = lw.codex_compat("codex", run=sp.fake_help(version="codex-cli dev"))

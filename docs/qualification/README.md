@@ -23,8 +23,9 @@ does not qualify as evidence of file inspection. On macOS the model tools use th
 with `--strict-config` and a filesystem deny map; read argv omits `sandbox_mode` so the CLI does
 not nest Seatbelt sandboxes. The selected worktree is reopened under Codex's `:workspace_roots`
 scope beneath the denied launcher-state root, so absolute paths containing glob characters remain
-exact workspace roots instead of invalid read globs. Reports distinguish the native profile from
-the outer deny wrapper.
+exact workspace roots instead of invalid read globs. State and configured secret denials use
+nested exact-path `"." = "deny"` rules, so bracket characters cannot turn those protections into
+nonmatching globs. Reports distinguish the native profile from the outer deny wrapper.
 Configured stdio MCP servers and their metadata probe run under a read-only Seatbelt profile;
 remote HTTP MCP servers are explicitly trusted through the task manifest. Before releasing an
 answer, the launcher audits the worktree and withholds the answer if any path changed.

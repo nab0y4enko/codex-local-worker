@@ -123,3 +123,23 @@ Focused offline validation after both fixes: 70 tests across worker isolation, r
 readiness, and the native fixture contract passed in 5.473s. The full 8-case live suite was not
 repeated; the targeted hardened native case and no-inference profile checks provide the added
 evidence.
+
+## Review follow-up 2: literal brackets in denied paths
+
+The first workspace-root fix still emitted launcher-state and configured secret denials as direct
+filesystem entries. The reviewer reproduced that Codex interpreted brackets in those paths as
+glob syntax and allowed reads. The profile now represents every denied absolute path as a nested
+exact-root rule (`"<absolute path>" = { "." = "deny" }`), while keeping the read-only
+`:workspace_roots` exception for the selected worktree.
+
+An actual no-inference CLI regression used launcher-generated `-c` overrides and isolated
+`HOME`/`CODEX_HOME`. The synthetic state directory was `state [literal]`, the denied file was
+`secret [literal] file.txt`, and the worktree/source also had literal brackets. Codex allowed
+reading the selected worktree source, returned `Operation not permitted` for both denied reads,
+returned `Operation not permitted` for a worktree write, and the source stayed unchanged. Exact
+argv, outputs and timings are retained at
+`/Users/oleksii.naboichenko/.local/share/codex-local-worker/task26-live-2026-10-25/bracket-deny-cli-regression/actual-cli-regression.json`.
+
+Offline RED/GREEN checks covered both ordinary and bracketed denial serialization. Focused
+validation after this correction ran `python3 -m unittest tests.test_worker_isolation
+tests.test_read_jobs -v`: 33 tests passed in 5.336s. No live inference or native build was rerun.
