@@ -13,6 +13,11 @@ try:
 except ModuleNotFoundError:
     nr = None
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import support as sp
+import apple_verification as apple
+import local_worker as lw
+
 UDID = '12345678-1234-1234-1234-123456789ABC'
 OTHER = '87654321-4321-4321-4321-CBA987654321'
 BUNDLE = 'org.example.NativeProbe'
@@ -71,22 +76,43 @@ class NativeReadinessTests(unittest.TestCase):
 
     def runner(self, argv):
         self.calls.append(argv)
-        stage = ['build', 'install', 'launch', 'test', 'summary'][len(self.calls)-1]
+        if argv[0].endswith('xcodebuild') and argv[-1] == 'build':
+            stage = 'build'
+        elif argv[1:3] == ['simctl', 'install']:
+            stage = 'install'
+        elif argv[1:3] == ['simctl', 'launch'] or argv[0].endswith('/open'):
+            stage = 'launch'
+        elif argv == ['/bin/ps', '-axo', 'pid=,command=']:
+            stage = 'launch_process'
+        elif argv[1:2] == ['xcresulttool']:
+            stage = 'summary'
+        else:
+            stage = 'test'
         if self.fail_stage == stage:
             return {'returncode': 65, 'stdout': '', 'stderr': 'native stage failure'}
         if stage == 'build' and self.make_app:
-            self.app.mkdir(parents=True)
-            (self.app / 'Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier': self.actual_bundle}))
+            if self.plan.get('destination') == {'macos': True}:
+                (self.app / 'Contents' / 'MacOS').mkdir(parents=True)
+                (self.app / 'Contents' / 'Info.plist').write_bytes(plistlib.dumps(
+                    {'CFBundleIdentifier': self.actual_bundle, 'CFBundleExecutable': 'Probe'}))
+                (self.app / 'Contents' / 'MacOS' / 'Probe').write_text('binary')
+            else:
+                self.app.mkdir(parents=True)
+                (self.app / 'Info.plist').write_bytes(plistlib.dumps(
+                    {'CFBundleIdentifier': self.actual_bundle}))
         if stage == 'test':
             self.result.mkdir()
         output = self.launch_output if stage == 'launch' else ''
+        if stage == 'launch_process':
+            output = f'432 {self.app}/Contents/MacOS/Probe\n'
         if stage == 'summary':
             output = json.dumps(self.summary)
         return {'returncode': 0, 'stdout': output.encode(), 'stderr': b'', 'timed_out': False}
 
     def qualify(self, runner=None):
         self.plan_file.write_text(json.dumps(self.plan))
-        return nr.qualify(self.plan_file, self.work, self.report, UDID,
+        destination = self.plan.get('destination', {'simulator': UDID})
+        return nr.qualify(self.plan_file, self.work, self.report, destination,
                           runner or self.runner, self.budget)
 
     def rejected(self, pattern, runner=None):
@@ -278,6 +304,63 @@ class NativeReadinessTests(unittest.TestCase):
         self.plan['sandbox'] = 'unconfined'
         self.rejected('fields')
         self.assertEqual(self.calls, [])
+
+    def test_any_simulator_platform_is_accepted(self):
+        for runtime in ("com.apple.CoreSimulator.SimRuntime.iOS-27-0",
+                        "com.apple.CoreSimulator.SimRuntime.tvOS-27-0",
+                        "com.apple.CoreSimulator.SimRuntime.watchOS-12-0",
+                        "com.apple.CoreSimulator.SimRuntime.xrOS-3-0"):
+            with self.subTest(runtime=runtime):
+                devices = sp.simctl_devices({runtime: [{"udid": sp.APPLE_UDID,
+                                                        "isAvailable": True}]})
+                self.assertTrue(nr.platform_for_udid(sp.APPLE_UDID, devices))
+
+    def test_v1_plan_upgrades_to_a_simulator_destination(self):
+        self.plan_file.write_text(json.dumps(self.plan))
+        plan = nr._load(self.plan_file, self.work, self.report, {'simulator': UDID})
+        self.assertEqual(plan["destination"], {"simulator": UDID})
+        self.assertEqual(plan["version"], 2)
+
+    def test_macos_destination_skips_install(self):
+        self.plan = {
+            "version": 2, "destination": {"macos": True}, "bundle_id": BUNDLE,
+            "app_bundle": "build/Probe.app", "result_bundle": "results.xcresult",
+            "build": ["xcodebuild", "-project", "{worktree}/Probe.xcodeproj",
+                      "-scheme", "Probe", "-destination", "platform=macOS", "build"],
+            "launch": ["open", "-a", "{app_bundle}"],
+            "test": ["xcodebuild", "-project", "{worktree}/Probe.xcodeproj",
+                     "-scheme", "Probe", "-destination", "platform=macOS",
+                     "-resultBundlePath", "{result_bundle}", "test"],
+        }
+        evidence = self.qualify()
+        self.assertEqual([c["name"] for c in evidence["checks"]],
+                         ["build", "launch", "launch_process", "test", "summary"])
+        self.assertEqual(evidence["launch_pid"], 432)
+        self.assertEqual(evidence["launch_executable"],
+                         str(self.app / "Contents" / "MacOS" / "Probe"))
+
+    def test_macos_open_success_without_matching_running_process_fails(self):
+        self.plan = {
+            "version": 2, "destination": {"macos": True}, "bundle_id": BUNDLE,
+            "app_bundle": "build/Probe.app", "result_bundle": "results.xcresult",
+            "build": ["xcodebuild", "-project", "{worktree}/Probe.xcodeproj",
+                      "-scheme", "Probe", "-destination", "platform=macOS", "build"],
+            "launch": ["open", "-a", "{app_bundle}"],
+            "test": ["xcodebuild", "-project", "{worktree}/Probe.xcodeproj",
+                     "-scheme", "Probe", "-destination", "platform=macOS",
+                     "-resultBundlePath", "{result_bundle}", "test"],
+        }
+        def no_process(argv):
+            result = self.runner(argv)
+            if argv == ["/bin/ps", "-axo", "pid=,command="]:
+                result["stdout"] = b"432 /Applications/Other.app/Contents/MacOS/Other\n"
+            return result
+        self.rejected("no positive PID", no_process)
+
+    def test_legacy_confinement_is_gone(self):
+        self.assertFalse(hasattr(lw, "sandbox_argv"))
+        self.assertFalse(hasattr(lw, "_probe_codex_sandbox"))
+        self.assertFalse(hasattr(apple, "build_profile"))
 
     def test_documented_single_device_object_is_accepted(self):
         self.summary['devicesAndConfigurations'] = self.summary['devicesAndConfigurations'][0]

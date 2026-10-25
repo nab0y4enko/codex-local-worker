@@ -5,8 +5,7 @@ MUST use the same profile, environment, cwd and shared deadline as later native
 verification. The caller owns that confinement; a successful gate proves only
 this plan, artifact and selected simulator, not physical-device qualification.
 
-Version 1 plans contain exactly: version, build, install, launch, test,
-app_bundle, result_bundle, bundle_id. Commands are argv lists, with optional
+Version 1 plans are upgraded to version 2 on load. Commands are argv lists, with optional
 {worktree}, {report_dir}, {simulator_udid}, {app_bundle}, {result_bundle}, and
 {bundle_id} substitutions. Relative paths are worktree-relative. Artifacts may
 live only in that worktree or report_dir/apple-scratch and must be fresh.
@@ -18,7 +17,7 @@ import plistlib
 import re
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 
 class NativeReadinessError(RuntimeError):
@@ -27,8 +26,11 @@ class NativeReadinessError(RuntimeError):
         self.evidence = evidence
 
 
-_KEYS = {'version', 'build', 'install', 'launch', 'test',
-         'app_bundle', 'result_bundle', 'bundle_id'}
+_KEYS_V1 = {'version', 'build', 'install', 'launch', 'test',
+            'app_bundle', 'result_bundle', 'bundle_id'}
+_KEYS_V2 = {'version', 'destination', 'build', 'launch', 'test',
+            'app_bundle', 'result_bundle', 'bundle_id'}
+_OPTIONAL_KEYS_V2 = {'install', 'screenshots', 'capture_sources', 'capture_overlay_paths'}
 _UDID = re.compile(r'[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}')
 _PATH_FLAGS = {'-project', '-workspace', '-derivedDataPath', '-clonedSourcePackagesDirPath',
                '-testProductsPath', '-xctestrun', '-resultBundlePath', '-resultStreamPath',
@@ -38,6 +40,25 @@ _PATH_SETTINGS = {'SYMROOT', 'OBJROOT', 'DSTROOT', 'CONFIGURATION_BUILD_DIR',
                   'SHARED_PRECOMPS_DIR', 'CLANG_MODULE_CACHE_PATH', 'SWIFT_MODULE_CACHE_PATH'}
 _ACTIONS = {'build', 'build-for-testing', 'test', 'test-without-building', 'clean',
             'archive', 'analyze', 'install', 'installsrc', 'installhdrs', 'exportArchive'}
+
+
+def platform_for_udid(udid: str, devices: dict) -> str:
+    """Resolve an available simulator's Apple platform from its runtime identifier."""
+    entry = devices.get(udid) if isinstance(devices, dict) else None
+    runtime = entry.get('runtime') if isinstance(entry, dict) else None
+    prefix = 'com.apple.CoreSimulator.SimRuntime.'
+    if not isinstance(runtime, str) or not runtime.startswith(prefix):
+        raise ValueError(f'simulator {udid} has no recognized runtime')
+    runtime_name = runtime[len(prefix):]
+    if runtime_name.startswith('iOS-'):
+        return 'iOS'
+    if runtime_name.startswith('tvOS-'):
+        return 'tvOS'
+    if runtime_name.startswith('watchOS-'):
+        return 'watchOS'
+    if runtime_name.startswith(('xrOS-', 'visionOS-')):
+        return 'visionOS'
+    raise ValueError(f'simulator {udid} has unsupported runtime {runtime_name}')
 
 
 def _path(value: str, worktree: Path, roots: tuple[Path, ...], label: str) -> Path:
@@ -78,7 +99,7 @@ def _option(argv: list[str], flag: str, stage: str) -> str:
     return argv[index + 1]
 
 
-def _xcode(argv: list[str], stage: str, udid: str, worktree: Path,
+def _xcode(argv: list[str], stage: str, destination: dict, worktree: Path,
            roots: tuple[Path, ...], result: Path) -> None:
     if argv[0] not in ('xcodebuild', '/usr/bin/xcodebuild'):
         raise ValueError(f'{stage}: direct xcodebuild command required')
@@ -114,35 +135,74 @@ def _xcode(argv: list[str], stage: str, udid: str, worktree: Path,
         index += 1
     if len(action_tokens) != 1 or action_tokens[0] not in allowed:
         raise ValueError(f'{stage}: exactly one native {stage} action is required')
-    destination = _option(argv, '-destination', stage)
-    fields = destination.split(',')
-    ids = [field.split('=', 1)[1] for field in fields if field.startswith('id=')]
-    if len(ids) != 1 or ids[0].upper() != udid.upper():
-        raise ValueError(f'{stage}: destination must bind the selected simulator UDID')
-    if any(field.startswith(('name=', 'platform=macOS')) for field in fields):
-        raise ValueError(f'{stage}: conflicting destination selector')
+    selector = _option(argv, '-destination', stage)
+    fields = selector.split(',')
+    if 'simulator' in destination:
+        udid = destination['simulator']
+        ids = [field.split('=', 1)[1] for field in fields if field.startswith('id=')]
+        if len(ids) != 1 or ids[0].upper() != udid.upper():
+            raise ValueError(f'{stage}: destination must bind the selected simulator UDID')
+        if any(field.startswith(('name=', 'platform=macOS')) for field in fields):
+            raise ValueError(f'{stage}: conflicting destination selector')
+    elif fields != ['platform=macOS']:
+        raise ValueError(f'{stage}: macOS destination must be platform=macOS')
     if stage == 'test' and _option(argv, '-resultBundlePath', stage) != str(result):
         raise ValueError('test: resultBundlePath must match the fresh result bundle')
     if stage == 'build' and '-resultBundlePath' in argv:
         raise ValueError('build: resultBundlePath is reserved for the test stage')
 
 
-def _load(plan_path: Any, worktree: Path, report_dir: Path, udid: str) -> dict:
+def _validate_destination(destination: Any) -> dict:
+    if not isinstance(destination, dict):
+        raise ValueError('destination must be an object')
+    if set(destination) == {'simulator'}:
+        udid = destination['simulator']
+        if not isinstance(udid, str) or not _UDID.fullmatch(udid):
+            raise ValueError('selected simulator UDID must be a bare UUID')
+        return {'simulator': udid}
+    if destination == {'macos': True}:
+        return {'macos': True}
+    raise ValueError('destination must be a simulator UDID or macos')
+
+
+def _load(plan_path: Any, worktree: Path, report_dir: Path, destination: Any) -> dict:
     if plan_path is None:
         raise ValueError('native readiness plan is required')
     plan = json.loads(Path(plan_path).read_text())
-    if not isinstance(plan, dict) or set(plan) != _KEYS:
-        raise ValueError('native readiness plan must contain exactly the version 1 fields')
-    if type(plan['version']) is not int or plan['version'] != 1:
+    if not isinstance(plan, dict) or type(plan.get('version')) is not int:
+        raise ValueError('native readiness plan must be an object with an integer version')
+    if plan['version'] == 1:
+        if set(plan) != _KEYS_V1:
+            raise ValueError('native readiness plan must contain exactly the version 1 fields')
+        if isinstance(destination, str):
+            destination = {'simulator': destination}
+        destination = _validate_destination(destination)
+        if set(destination) != {'simulator'}:
+            raise ValueError('version 1 plan requires a simulator destination')
+        plan['version'] = 2
+        plan['destination'] = destination
+    elif plan['version'] == 2:
+        if set(plan) - (_KEYS_V2 | _OPTIONAL_KEYS_V2) or not _KEYS_V2 <= set(plan):
+            raise ValueError('native readiness plan must contain the version 2 fields')
+        plan_destination = _validate_destination(plan['destination'])
+        requested_destination = (None if destination is None else
+                                 _validate_destination({'simulator': destination}
+                                                       if isinstance(destination, str)
+                                                       else destination))
+        if requested_destination is not None and plan_destination != requested_destination:
+            raise ValueError('native plan destination does not match the selected destination')
+        destination = plan_destination
+    else:
         raise ValueError('unsupported native readiness plan version')
-    if not _UDID.fullmatch(udid):
-        raise ValueError('selected simulator UDID must be a bare UUID')
+    destination = _validate_destination(plan['destination'])
+    plan['destination'] = destination
+    udid = destination.get('simulator')
     bundle = plan['bundle_id']
     if not isinstance(bundle, str) or not re.fullmatch(r'[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+', bundle):
         raise ValueError('bundle_id must be an explicit bundle identifier')
     roots = (worktree, report_dir / 'apple-scratch')
     values = {'worktree': str(worktree), 'report_dir': str(report_dir),
-              'simulator_udid': udid, 'bundle_id': bundle}
+              'simulator_udid': udid or '', 'bundle_id': bundle}
     for key, suffix in (('app_bundle', '.app'), ('result_bundle', '.xcresult')):
         raw = plan[key]
         if not isinstance(raw, str):
@@ -157,21 +217,35 @@ def _load(plan_path: Any, worktree: Path, report_dir: Path, udid: str) -> dict:
     if (plan['app_bundle'] in plan['result_bundle'].parents or
             plan['result_bundle'] in plan['app_bundle'].parents):
         raise ValueError('artifact paths must not overlap')
-    for stage in ('build', 'install', 'launch', 'test'):
+    stages = ('build', 'launch', 'test')
+    if 'install' in plan:
+        if udid is None:
+            raise ValueError('macOS plans must not include an install stage')
+        stages = ('build', 'install', 'launch', 'test')
+    elif udid is not None:
+        raise ValueError('simulator plans require an install stage')
+    for stage in stages:
         argv = plan[stage]
         if not isinstance(argv, list) or not argv or any(
                 not isinstance(arg, str) or not arg.strip() or '\x00' in arg for arg in argv):
             raise ValueError(f'{stage}: nonempty argv strings required')
         plan[stage] = [_substitute(arg, values) for arg in argv]
     for stage in ('build', 'test'):
-        _xcode(plan[stage], stage, udid, worktree, roots, plan['result_bundle'])
-    for stage, target in (('install', str(plan['app_bundle'])), ('launch', bundle)):
-        argv = plan[stage]
-        if argv[0] not in ('xcrun', '/usr/bin/xcrun'):
-            raise ValueError(f'{stage}: direct xcrun simctl command required')
-        argv[0] = '/usr/bin/xcrun'
-        if len(argv) != 5 or argv[1:3] != ['simctl', stage] or argv[3].upper() != udid.upper() or argv[4] != target:
-            raise ValueError(f'{stage}: command must bind selected simulator and expected artifact or bundle identifier')
+        _xcode(plan[stage], stage, destination, worktree, roots, plan['result_bundle'])
+    if udid is not None:
+        for stage, target in (('install', str(plan['app_bundle'])), ('launch', bundle)):
+            argv = plan[stage]
+            if argv[0] not in ('xcrun', '/usr/bin/xcrun'):
+                raise ValueError(f'{stage}: direct xcrun simctl command required')
+            argv[0] = '/usr/bin/xcrun'
+            if (len(argv) != 5 or argv[1:3] != ['simctl', stage] or
+                    argv[3].upper() != udid.upper() or argv[4] != target):
+                raise ValueError(f'{stage}: command must bind selected simulator and expected artifact or bundle identifier')
+    else:
+        argv = plan['launch']
+        if argv[0] not in ('open', '/usr/bin/open') or argv[1:] != ['-a', str(plan['app_bundle'])]:
+            raise ValueError('launch: macOS command must open the selected app bundle')
+        argv[0] = '/usr/bin/open'
     return plan
 
 
@@ -182,7 +256,7 @@ def _counts(data: dict, label: str) -> tuple[int, int, int]:
     return tuple(counts)
 
 
-def _summary(raw: str, udid: str) -> dict:
+def _summary(raw: str, udid: Optional[str]) -> dict:
     summary = json.loads(raw)
     if not isinstance(summary, dict):
         raise ValueError('XCTest summary must be an object')
@@ -206,7 +280,7 @@ def _summary(raw: str, udid: str) -> dict:
         if not isinstance(entry, dict) or not isinstance(entry.get('device'), dict):
             raise ValueError('XCTest summary contains unknown device evidence')
         device = entry['device'].get('deviceId')
-        if not isinstance(device, str) or device.upper() != udid.upper():
+        if udid is not None and (not isinstance(device, str) or device.upper() != udid.upper()):
             raise ValueError('XCTest summary belongs to another device')
         p, f, _ = _counts(entry, 'XCTest device')
         if f:
@@ -218,7 +292,7 @@ def _summary(raw: str, udid: str) -> dict:
             'total': total, 'device_id': udid, 'result': 'Passed'}
 
 
-def qualify(plan_path: Any, worktree: Path, report_dir: Path, simulator_udid: str,
+def qualify(plan_path: Any, worktree: Path, report_dir: Path, destination: dict,
             run: Callable[[list[str]], Any], deadline: Any) -> dict:
     """Return persisted evidence or raise NativeReadinessError with .evidence.
 
@@ -228,9 +302,18 @@ def qualify(plan_path: Any, worktree: Path, report_dir: Path, simulator_udid: st
     """
     worktree, report_dir = Path(worktree).resolve(), Path(report_dir).resolve()
     report_dir.mkdir(parents=True, exist_ok=True)
-    evidence = {'schema_version': 1, 'qualified': False, 'status': 'blocked',
-                'simulator_udid': simulator_udid, 'checks': [],
-                'scope': 'selected simulator only; no physical-device qualification'}
+    if isinstance(destination, str):
+        destination = {'simulator': destination}
+    try:
+        destination = _validate_destination(destination)
+    except ValueError:
+        destination = {}
+    evidence = {'schema_version': 2, 'qualified': False, 'status': 'blocked',
+                'destination': destination, 'checks': [],
+                'scope': ('selected simulator only; no physical-device qualification'
+                          if 'simulator' in destination else 'selected macOS host')}
+    if 'simulator' in destination:
+        evidence['simulator_udid'] = destination['simulator']
     active = 'plan'
 
     def persist():
@@ -280,7 +363,9 @@ def qualify(plan_path: Any, worktree: Path, report_dir: Path, simulator_udid: st
 
     try:
         budget()
-        plan = _load(plan_path, worktree, report_dir, simulator_udid)
+        if not destination:
+            raise ValueError('destination must be an object')
+        plan = _load(plan_path, worktree, report_dir, destination)
         evidence.update(bundle_id=plan['bundle_id'], app_bundle=str(plan['app_bundle']),
                         result_bundle=str(plan['result_bundle']))
         execute('build', plan['build'])
@@ -288,17 +373,39 @@ def qualify(plan_path: Any, worktree: Path, report_dir: Path, simulator_udid: st
                     (worktree, report_dir / 'apple-scratch'), 'built app bundle')
         if not app.is_dir():
             raise ValueError('build: expected fresh app bundle was not produced')
-        info = app / 'Info.plist'
+        info = app / ('Info.plist' if 'simulator' in destination else 'Contents/Info.plist')
         if info.is_symlink() or not info.is_file():
             raise ValueError('build: app bundle Info.plist is missing or symlinked')
         if plistlib.loads(info.read_bytes()).get('CFBundleIdentifier') != plan['bundle_id']:
             raise ValueError('build: app bundle identifier does not match the plan')
-        execute('install', plan['install'])
+        if 'install' in plan:
+            execute('install', plan['install'])
         output = execute('launch', plan['launch'])
-        match = re.fullmatch(re.escape(plan['bundle_id']) + r':\s*([1-9][0-9]*)\s*', output.strip())
-        if not match:
-            raise ValueError('launch: expected bundle and positive PID evidence is missing')
-        evidence['launch_pid'] = int(match.group(1))
+        if 'simulator' in destination:
+            match = re.fullmatch(re.escape(plan['bundle_id']) + r':\s*([1-9][0-9]*)\s*', output.strip())
+            if not match:
+                raise ValueError('launch: expected bundle and positive PID evidence is missing')
+            evidence['launch_pid'] = int(match.group(1))
+        else:
+            executable_name = plistlib.loads(info.read_bytes()).get('CFBundleExecutable')
+            if not isinstance(executable_name, str) or not executable_name or '/' in executable_name:
+                raise ValueError('launch: app bundle has no safe CFBundleExecutable')
+            executable = app / 'Contents' / 'MacOS' / executable_name
+            if executable.is_symlink() or not executable.is_file():
+                raise ValueError('launch: built app executable is missing or symlinked')
+            ps_output = execute('launch_process', ['/bin/ps', '-axo', 'pid=,command='])
+            launched_pid = None
+            for line in ps_output.splitlines():
+                match = re.match(r'\s*([1-9][0-9]*)\s+(.*)$', line)
+                if match:
+                    command = match.group(2).strip()
+                    if command == str(executable) or command.startswith(str(executable) + ' '):
+                        launched_pid = int(match.group(1))
+                        break
+            if launched_pid is None:
+                raise ValueError('launch: no positive PID for the built app executable')
+            evidence['launch_pid'] = launched_pid
+            evidence['launch_executable'] = str(executable)
         active = 'test'
         if plan['result_bundle'].exists() or plan['result_bundle'].is_symlink():
             raise ValueError('test: result artifact already exists before XCTest')
@@ -309,7 +416,7 @@ def qualify(plan_path: Any, worktree: Path, report_dir: Path, simulator_udid: st
             raise ValueError('test: fresh XCTest result bundle was not produced')
         output = execute('summary', ['/usr/bin/xcrun', 'xcresulttool', 'get', 'test-results',
                                      'summary', '--path', str(result), '--compact'])
-        evidence['xctest'] = _summary(output, simulator_udid)
+        evidence['xctest'] = _summary(output, destination.get('simulator'))
         budget()
         evidence.update(qualified=True, status='passed')
         persist()

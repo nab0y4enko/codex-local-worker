@@ -89,7 +89,7 @@ class EnvironmentAndArgv(unittest.TestCase):
         self.assertNotIn("sk-cloud", json.dumps(env))
         self.assertEqual(lw.redact("key=sk-cloud tail", ["sk-cloud"]), "key=[REDACTED] tail")
 
-    def test_worker_and_sandbox_argv_are_pinned_and_self_checked(self):
+    def test_worker_argv_is_pinned_and_legacy_sandbox_is_gone(self):
         self.assertEqual(lw.missing_config_pins(self.argv, self.profile, self.window), [])
         lw._policy_check(self.argv, self.profile, self.window)
         self.assertIn("--ignore-user-config", self.argv)
@@ -101,12 +101,8 @@ class EnvironmentAndArgv(unittest.TestCase):
         self.assertEqual(self.argv[-2:], ["--", "-"])
         self.assertIn(lw.API_KEY_ENV, json.dumps(self.argv))       # key by env name only
         self.assertNotIn(sp.SECRET, json.dumps(self.argv))
-        wrapped = lw.sandbox_argv("codex", Path("/wt"), ["python3", "-m", "unittest", "-v"])
-        self.assertEqual(wrapped[:2], ["codex", "sandbox"])
-        self.assertEqual(wrapped[wrapped.index("-P") + 1], lw.SANDBOX_PROFILE)
-        self.assertIn(f"permissions.{lw.SANDBOX_PROFILE}.network.enabled=false", wrapped)
-        self.assertEqual(wrapped[wrapped.index("--") + 1:], ["python3", "-m", "unittest", "-v"])
-        self.assertNotIn("/bin/sh", wrapped)
+        self.assertFalse(hasattr(lw, "sandbox_argv"))
+        self.assertFalse(hasattr(lw, "sandbox_argv_template"))
 
     def test_any_policy_drift_is_a_refusal(self):
         endpoint = lw.profile_endpoint(self.profile)
@@ -141,17 +137,6 @@ class EnvironmentAndArgv(unittest.TestCase):
                     self.assertEqual(run.call_args.kwargs["env"]["IBToolNeverDeque"], "1")
                 else:
                     self.assertIn("full-host", tests[0]["reason"])
-        # legacy confinement stays available for a caller that explicitly selects it
-        with mock.patch.object(lw, "run_bounded",
-                               return_value=sp.result(["x"], 0, lw.PROBE_MARKER)) as run:
-            probe = lw.probe_sandbox("codex", Path("/wt"), {},
-                                     backend=lw.WORKSPACE_SANDBOX_BACKEND)
-            self.assertEqual(probe["backend"], lw.WORKSPACE_SANDBOX_BACKEND)
-            tests = lw.run_verification(self.task, Path("/wt"), {}, "codex", probe, [],
-                                        lw.Deadline(120.0))
-        self.assertEqual(tests[0]["status"], "passed")
-        self.assertTrue(tests[0]["sandboxed"])
-        self.assertEqual(run.call_args[0][0][:2], ["codex", "sandbox"])
         with mock.patch.object(lw, "run_bounded",
                                return_value=sp.result(["x"], 0, lw.PROBE_MARKER)) as run:
             tests = lw.run_verification(self.task, Path("/wt"), {}, "codex", {"available": True},

@@ -140,13 +140,8 @@ WRAPPER_NOT_APPLIED_EXIT = 71
 # native steps' scratch (derived data, result bundles) and screenshot captures.
 NATIVE_SCRATCH_NAME = "apple-scratch"
 SCREENSHOTS_DIR_NAME = "screenshots"
-# Legacy Codex workspace-write backend: kept usable for a caller that explicitly asks for
-# it. The installed codex sandbox refuses to start without ``-P <profile>``, so the profile
-# and its exact overrides stay pinned here.
-SANDBOX_PROFILE = "local-worker-verify"
 PROBE_TIMEOUT_SECONDS = 60.0
 # Reported with every job so a reviewer always knows what confined the verification run.
-WORKSPACE_SANDBOX_BACKEND = "codex-workspace-write"
 # ``--context-cap`` only ever lowers the server's window; these bound what a caller may ask for.
 MIN_CONTEXT_CAP = 4096
 MAX_CONTEXT_CAP = 1048576
@@ -2117,52 +2112,12 @@ def model_routing(evidence: Dict[str, Any], alias: str) -> str:
 
 
 # --------------------------------------------------------------------------------------
-# Independent verification inside the Codex sandbox
+# Independent verification inside the permissions deny wrapper
 # --------------------------------------------------------------------------------------
-# The installed Codex CLI will not build a sandbox policy without a *named* profile, so the
-# profile and its exact overrides are pinned to the command that was verified to run on this
-# machine. There is deliberately no unsandboxed fallback: when the probe fails, every
-# verification command is reported blocked instead of being run with full user privileges.
-SANDBOX_CONFIG_ARGS = (
-    "-c", f'permissions.{SANDBOX_PROFILE}.extends=":workspace"',
-    "-c", f"permissions.{SANDBOX_PROFILE}.network.enabled=false",
-)
-
-
-def sandbox_argv(codex_bin: str, worktree: Path, argv: Sequence[str]) -> List[str]:
-    """Wrap an untrusted command in the named workspace-write, network-disabled sandbox."""
-    return [codex_bin, "sandbox", "-P", SANDBOX_PROFILE, "-C", str(worktree),
-            *SANDBOX_CONFIG_ARGS, "--", *argv]
-
-
-def sandbox_argv_template(codex_bin: str) -> List[str]:
-    return [codex_bin, "sandbox", "-P", SANDBOX_PROFILE, "-C", "<worktree>",
-            *SANDBOX_CONFIG_ARGS, "--", "<command>"]
-
-
 def verification_argv(sandbox: Dict[str, Any], codex_bin: str, worktree: Path,
                       argv: Sequence[str]) -> List[str]:
-    """Return the command exactly as this backend runs it.
-
-    The default full-host backend runs the contract argv itself, so the returned argv is the
-    plain command; the job's deny wrapper (``DenyWrapper.wrap``) is added around whatever this
-    returns, by the caller, only when it is applied. The legacy backends stay reachable through
-    an explicit backend: an Apple job wraps the command in the Seatbelt profile that was probed
-    for it, and the legacy Codex workspace-write backend wraps it in ``codex sandbox``.
-    """
-    backend = sandbox.get("backend")
-    if backend == FULL_HOST_BACKEND:
-        return list(argv)
-    if backend != apple.BACKEND:
-        return sandbox_argv(codex_bin, worktree, argv)
-    profile = str(sandbox.get("apple_profile") or "")
-    if not profile:
-        raise BlockedError("the Apple Seatbelt profile is missing from this job, so the "
-                           "verification command is blocked rather than run unconfined")
-    try:
-        return apple.sandbox_argv(Path(profile), argv)
-    except apple.ApplePolicyError as error:
-        raise BlockedError(f"Apple Seatbelt refused the verification command: {error}") from error
+    """Return the command run inside the launcher's allow-default deny wrapper."""
+    return list(argv)
 
 
 def full_host_env(env: Dict[str, str]) -> Dict[str, str]:
@@ -2181,50 +2136,10 @@ def full_host_env(env: Dict[str, str]) -> Dict[str, str]:
     return bounded
 
 
-def _probe_codex_sandbox(codex_bin: str, worktree: Path, env: Dict[str, str],
-                         secrets: Sequence[str],
-                         deadline: Optional[Deadline] = None) -> Dict[str, Any]:
-    """Legacy backend: the Codex workspace-write sandbox must run a trivial command."""
-    template = sandbox_argv_template(codex_bin)
-    timeout = deadline.cap(PROBE_TIMEOUT_SECONDS) if deadline is not None else PROBE_TIMEOUT_SECONDS
-    if timeout < MIN_ATTEMPT_BUDGET_SECONDS:
-        return {"available": False, "profile": SANDBOX_PROFILE, "network": "disabled",
-                "backend": WORKSPACE_SANDBOX_BACKEND, "extra_writable_roots": [],
-                "detail": f"the total job budget has only {timeout:.1f}s left, so the sandbox "
-                          "probe was not run and no verification command will be",
-                "argv_template": template}
-    argv = sandbox_argv(codex_bin, worktree, ["/bin/echo", PROBE_MARKER])
-    try:
-        result = run_bounded(argv, cwd=worktree, env=env, timeout=timeout)
-    except OSError as error:
-        return {"available": False, "profile": SANDBOX_PROFILE, "network": "disabled",
-                "backend": WORKSPACE_SANDBOX_BACKEND, "extra_writable_roots": [],
-                "detail": f"cannot invoke {codex_bin} sandbox: {error}", "argv_template": template}
-    stdout = result["stdout"].decode("utf-8", "replace")
-    available = result["returncode"] == 0 and PROBE_MARKER in stdout and not result["timed_out"]
-    detail = (stdout + result["stderr"].decode("utf-8", "replace")).strip()
-    if result["timed_out"]:
-        detail = f"sandbox probe timed out after {timeout:.1f}s: {detail}"
-    return {"available": available, "profile": SANDBOX_PROFILE, "network": "disabled",
-            "backend": WORKSPACE_SANDBOX_BACKEND, "extra_writable_roots": [],
-            "detail": redact(detail[-500:], secrets) or ("probe ok" if available else "probe failed"),
-            "probe_returncode": result["returncode"], "probe_timed_out": result["timed_out"],
-            "argv_template": template}
-
-
 def probe_sandbox(codex_bin: str, worktree: Path, env: Dict[str, str],
                   secrets: Sequence[str] = (),
-                  deadline: Optional[Deadline] = None,
-                  backend: str = FULL_HOST_BACKEND) -> Dict[str, Any]:
-    """Prove a trivial command can actually run before any test command is trusted.
-
-    The default backend is full-host: the trivial command is executed directly, with no Codex
-    sandbox and no Seatbelt profile, so the metadata describes what really happened -- the
-    command is available, the network is enabled and nothing confined it. Passing
-    ``WORKSPACE_SANDBOX_BACKEND`` explicitly keeps the legacy confined probe available.
-    """
-    if backend == WORKSPACE_SANDBOX_BACKEND:
-        return _probe_codex_sandbox(codex_bin, worktree, env, secrets, deadline)
+                  deadline: Optional[Deadline] = None) -> Dict[str, Any]:
+    """Prove the plain full-host runner can execute before verification is trusted."""
     timeout = deadline.cap(PROBE_TIMEOUT_SECONDS) if deadline is not None else PROBE_TIMEOUT_SECONDS
     if timeout < MIN_ATTEMPT_BUDGET_SECONDS:
         return {"available": False, "profile": FULL_HOST_PROFILE, "network": "enabled",
@@ -2598,11 +2513,9 @@ def run_verification(task: Task, worktree: Path, env: Dict[str, str], codex_bin:
     backend ran it, whether anything confined it and ``deny_list_applied``.
     """
     results: List[Dict[str, Any]] = []
-    backend = str(sandbox.get("backend") or FULL_HOST_BACKEND)
-    full_host = backend == FULL_HOST_BACKEND
+    backend = FULL_HOST_BACKEND
+    full_host = True
     denied = wrapper is not None and wrapper.applied
-    apple_mode = backend == apple.BACKEND
-    apple_scratch = str(sandbox.get("apple_scratch") or "") if apple_mode else ""
     for index, argv in enumerate(task.test_commands, start=1):
         left = deadline.remaining()
         if left < MIN_ATTEMPT_BUDGET_SECONDS:
@@ -2613,18 +2526,7 @@ def run_verification(task: Task, worktree: Path, env: Dict[str, str], codex_bin:
                           f"budget has only {left:.1f}s left",
             })
             continue
-        if apple_mode:
-            if not sandbox.get("apple_available") or not apple_scratch:
-                detail = str(sandbox.get("apple_detail")
-                             or "the Apple readiness probe did not run")
-                results.append({
-                    "command": argv, "sandboxed": False, "status": "blocked", "returncode": None,
-                    "backend": backend,
-                    "reason": f"apple seatbelt verification is unavailable: {detail}; untrusted "
-                              "commands are never run without the sandbox",
-                })
-                continue
-        elif full_host:
+        if full_host:
             if not sandbox.get("available"):
                 detail = str(sandbox.get("detail")
                              or "the full-host readiness command did not run")
@@ -2634,22 +2536,13 @@ def run_verification(task: Task, worktree: Path, env: Dict[str, str], codex_bin:
                     "reason": f"full-host execution is unavailable: {detail}",
                 })
                 continue
-        elif not sandbox.get("available"):
-            results.append({
-                "command": argv, "sandboxed": False, "status": "blocked", "returncode": None,
-                "backend": backend,
-                "reason": "codex sandbox is unavailable; untrusted commands are never run "
-                          "without the sandbox",
-            })
-            continue
         timeout = deadline.cap(float(task.timeout_seconds))
         try:
             wrapped = verification_argv(sandbox, codex_bin, worktree, argv)
             if wrapper is not None:
                 wrapped = wrapper.wrap(wrapped)
-            command_env = (apple.verification_env(env, Path(apple_scratch)) if apple_mode
-                           else full_host_env(env) if full_host else env)
-        except (BlockedError, apple.ApplePolicyError) as error:
+            command_env = full_host_env(env)
+        except BlockedError as error:
             results.append({
                 "command": argv, "sandboxed": False, "status": "blocked", "returncode": None,
                 "backend": backend, "reason": redact(str(error), secrets),
@@ -3077,6 +2970,28 @@ def progress(report: Dict[str, Any], phase: str) -> None:
     observation._atomic_json(path, previous)
 
 
+def native_destination(plan_path: Optional[Path], simulator_udid: Optional[str]) -> Dict[str, Any]:
+    """Read the plan's v2 destination, retaining the CLI's simulator selection check."""
+    if plan_path is None:
+        raise BlockedError("native readiness plan is required")
+    try:
+        plan = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise BlockedError(f"cannot read native readiness plan: {error}") from error
+    if isinstance(plan, dict) and plan.get("version") == 1:
+        if simulator_udid is None:
+            raise BlockedError("version 1 native plans require a simulator UUID")
+        return {"simulator": simulator_udid}
+    destination = plan.get("destination") if isinstance(plan, dict) else None
+    if isinstance(destination, dict) and set(destination) == {"simulator"} and simulator_udid is None:
+        raise BlockedError("simulator native plans require --simulator-udid so the device lease is held")
+    if simulator_udid is not None and destination != {"simulator": simulator_udid}:
+        raise BlockedError("native plan destination does not match --simulator-udid")
+    if not isinstance(destination, dict):
+        raise BlockedError("native plan must declare a destination")
+    return destination
+
+
 def native_gate(options, report, worktree, sandbox, verify_env, secrets, deadline, wrapper=None):
     directory = Path(report["report_dir"])
     progress(report, "native_preflight")
@@ -3089,11 +3004,7 @@ def native_gate(options, report, worktree, sandbox, verify_env, secrets, deadlin
         # Native steps build, install and run what the model wrote: same deny wrapper.
         if wrapper is not None:
             wrapped = wrapper.wrap(wrapped)
-        # Full-host native qualification runs the real toolchain with the plain verification
-        # environment; the legacy confined backend keeps its Foundation-home sandbox.
-        env = (full_host_env(verify_env)
-               if str(sandbox.get("backend")) == FULL_HOST_BACKEND
-               else apple.verification_env(verify_env, Path(sandbox["apple_scratch"])))
+        env = full_host_env(verify_env)
         result = run_bounded(wrapped, cwd=worktree, env=env,
                              timeout=deadline.require("native preflight command"))
         output = redact((result["stdout"] + b"\n" + result["stderr"]).decode("utf-8", "replace"), secrets)
@@ -3106,8 +3017,10 @@ def native_gate(options, report, worktree, sandbox, verify_env, secrets, deadlin
         return dict(result, stdout=redact(result["stdout"].decode("utf-8", "replace"), secrets),
                     stderr=redact(result["stderr"].decode("utf-8", "replace"), secrets))
     try:
+        destination = native_destination(options.native_preflight_plan,
+                                         options.apple_simulator_udid)
         evidence = native.qualify(options.native_preflight_plan, worktree, directory,
-                                  options.apple_simulator_udid, confined, deadline)
+                                  destination, confined, deadline)
     except native.NativeReadinessError as error:
         report["native_preflight"] = error.evidence
         raise BlockedError("end-to-end native preflight failed: " + str(error)) from error
@@ -3198,13 +3111,14 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     if api_key and api_key not in secrets:
         secrets.append(api_key)
 
-    if options.native_preflight_plan is not None and options.apple_simulator_udid is None:
-        raise BlockedError("native preflight plan requires --apple-simulator-udid; plan cannot be ignored")
-    if options.preflight_only and options.apple_simulator_udid is None:
-        raise BlockedError("native --preflight-only requires --apple-simulator-udid and a native plan")
-    if options.apple_simulator_udid is not None:
-        if not options.verify or options.native_preflight_plan is None:
-            raise BlockedError("native jobs require --native-preflight-plan and verification; metadata probes and --no-verify cannot bypass native qualification")
+    if options.apple_simulator_udid is not None and options.native_preflight_plan is None:
+        raise BlockedError("--simulator-udid requires --native-preflight-plan")
+    if options.preflight_only and options.native_preflight_plan is None:
+        raise BlockedError("native --preflight-only requires a native plan")
+    if options.native_preflight_plan is not None:
+        native_destination(options.native_preflight_plan, options.apple_simulator_udid)
+        if not options.verify:
+            raise BlockedError("native jobs require verification; --no-verify cannot bypass native qualification")
     base_commit = resolve_commit(task.repo_path, task.base_ref)
     report["base_commit"] = base_commit
     report["dirty_primary_files"] = dirty_primary_files(task.repo_path)
@@ -3272,7 +3186,7 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     else:
         env, stripped_proxies, cloud_names = worker_env(
             api_key, codex_home, task.environment_pass)
-    if options.apple_simulator_udid is not None:
+    if options.native_preflight_plan is not None:
         # Native toolchain pin for the worker itself: ibtool/actool run in-process. HOME stays
         # exactly as the job had it, so the real simctl/Xcode state is used; CODEX_HOME is the
         # job's own home like for every other job.
@@ -3301,10 +3215,11 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         "shell_env_excludes": list(SHELL_ENV_EXCLUDES),
         "codex_home": env["CODEX_HOME"],
     }
-    if options.apple_simulator_udid is not None:
+    if options.native_preflight_plan is not None:
         report["environment"]["native_env"] = {
             "IBToolNeverDeque": env.get("IBToolNeverDeque"),
-            "apple_simulator_udid": str(options.apple_simulator_udid),
+            "destination": native_destination(options.native_preflight_plan,
+                                               options.apple_simulator_udid),
         }
 
     credentials = set(selected) | set(loaded["environment"])
@@ -3364,7 +3279,7 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         sandbox = dict(sandbox)
         sandbox["verification"] = "skipped by flag"
     report["sandbox"] = sandbox
-    if options.apple_simulator_udid is not None:
+    if options.native_preflight_plan is not None:
         sandbox = _apple_opt_in(options, report, report_dir, worktree, sandbox, verify_env,
                                 secrets, deadline)
     sandbox = dict(sandbox, deny_list_applied=wrapper.applied)
@@ -3373,7 +3288,7 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     report["sandbox"] = sandbox
 
     if task.kind == "read":
-        if options.apple_simulator_udid is not None or options.native_preflight_plan is not None:
+        if options.native_preflight_plan is not None:
             raise BlockedError("read jobs cannot opt into native build or simulator execution")
         sandbox["verification"] = "not run for read jobs"
         report["sandbox"] = sandbox
@@ -3382,7 +3297,7 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
                           report.get("_policy"))
         return
 
-    if options.apple_simulator_udid is not None:
+    if options.native_preflight_plan is not None:
         native_gate(options, report, worktree, sandbox, verify_env, secrets, deadline, wrapper)
         if options.preflight_only:
             report["status"] = "ready"
@@ -4093,10 +4008,10 @@ def build_parser() -> argparse.ArgumentParser:
                           "most 4 slot leases in the same state directory")
     run.add_argument("--no-verify", action="store_true",
                      help="do not run verification commands at all")
-    run.add_argument("--apple-simulator-udid", metavar="UUID", default=None,
-                     help="opt in: native Apple jobs stay on the full-host backend and are "
-                          "scoped to this tvOS simulator UUID; the native gate proves "
-                          "build/install/launch/test, and the model pins are unchanged")
+    run.add_argument("--simulator-udid", "--apple-simulator-udid", dest="apple_simulator_udid",
+                     metavar="UUID", default=None,
+                     help="select a simulator for a native plan (the old --apple-simulator-udid "
+                          "name remains an alias)")
     run.add_argument("--native-preflight-plan", type=Path)
     run.add_argument("--preflight-only", action="store_true", help="qualify native baseline without starting a worker")
     run.add_argument("--workstream", default=None, help="stable scope name shared across retries and repair jobs (default: task_id)")
@@ -4190,11 +4105,6 @@ def summary_lines(report: Dict[str, Any]) -> List[str]:
     if sandbox.get("backend") == FULL_HOST_BACKEND:
         lines.append(f"backend: {FULL_HOST_BACKEND} confined=no network=enabled "
                      f"simulator {sandbox.get('apple_simulator_udid') or 'not selected'}")
-    elif sandbox.get("backend") == apple.BACKEND:
-        lines.append(f"apple backend: {apple.SANDBOX_EXEC} profile sha256 "
-                     f"{str(sandbox.get('apple_profile_sha256'))[:12]} simulator "
-                     f"{sandbox.get('apple_simulator_udid')} "
-                     f"{'ready' if sandbox.get('apple_available') else 'NOT READY'}")
     lease = report.get("lease") or {}
     if lease.get("capacity", 1) > 1:
         resource = f", resource {lease['resource']}" if lease.get("resource") else ""

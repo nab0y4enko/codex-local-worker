@@ -44,7 +44,7 @@ class VerifierWrites(sp.FakeRun):
     def __call__(self, argv, **kwargs):
         argv = [str(item) for item in argv]
         inner, _ = sp.deny_wrapped(argv)  # classified by what runs inside the deny wrapper
-        verification = not (inner[0] == lw.apple.SANDBOX_EXEC or inner == sp.WRAPPER_PROBE
+        verification = not (inner == sp.WRAPPER_PROBE
                             or inner == list(lw.FULL_HOST_PROBE_ARGV)
                             or inner[1:2] in (["exec"], ["sandbox"]))
         if verification:
@@ -67,7 +67,7 @@ class VerifierActs(sp.FakeRun):
     def __call__(self, argv, **kwargs):
         argv = [str(item) for item in argv]
         inner, _ = sp.deny_wrapped(argv)  # classified by what runs inside the deny wrapper
-        verification = not (inner[0] == lw.apple.SANDBOX_EXEC or inner == sp.WRAPPER_PROBE
+        verification = not (inner == sp.WRAPPER_PROBE
                             or inner == list(lw.FULL_HOST_PROBE_ARGV)
                             or inner[1:2] in (["exec"], ["sandbox"]))
         if not verification:

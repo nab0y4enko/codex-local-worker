@@ -2,9 +2,8 @@
 
 These tests pin the *default* routing introduced for full-host execution: the worker runs
 ``danger-full-access`` with approvals off, verification commands run directly (plain argv,
-``sandboxed: false``) with their real output retained, and a native Apple opt-in records the
-selected simulator without running any confinement probe. The legacy confined backends stay
-reachable when a job explicitly selects them.
+``sandboxed: false``) with their real output retained, and native plans use the same deny
+wrapper.
 """
 import os
 import sys
@@ -16,7 +15,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import support as sp  # noqa: E402
 
 lw = sp.lw
-APPLE = lw.apple
 UDID = sp.APPLE_UDID
 PY = sys.executable
 
@@ -105,19 +103,7 @@ class VerificationArgv(unittest.TestCase):
         self.assertEqual(argv, self.command)
         self.assertNotIn("codex", argv)
         self.assertNotIn("sandbox", argv)
-        self.assertNotIn(lw.apple.SANDBOX_EXEC, argv)
-
-    def test_legacy_codex_workspace_write_backend_still_wraps(self):
-        argv = lw.verification_argv({"backend": lw.WORKSPACE_SANDBOX_BACKEND, "available": True},
-                                    "codex", self.root, self.command)
-        self.assertEqual(argv[:2], ["codex", "sandbox"])
-        self.assertEqual(argv[argv.index("-P") + 1], lw.SANDBOX_PROFILE)
-        self.assertIn("--", argv)
-        self.assertEqual(argv[argv.index("--") + 1:], self.command)
-
-    def test_legacy_apple_backend_still_requires_its_profile(self):
-        with self.assertRaises(lw.BlockedError):
-            lw.verification_argv({"backend": APPLE.BACKEND}, "codex", self.root, self.command)
+        self.assertFalse(hasattr(lw, "sandbox_argv"))
 
 
 class Probe(unittest.TestCase):
@@ -145,15 +131,6 @@ class Probe(unittest.TestCase):
         self.assertIn("full host", info["confinement"])
         self.assertTrue(info["available"], info["detail"])
         self.assertEqual(info["probe_returncode"], 0)
-
-    def test_probe_keeps_the_legacy_confined_backend_available(self):
-        with mock.patch.object(lw, "run_bounded",
-                               return_value=sandbox_result(stdout=b"__LOCAL_WORKER_SANDBOX_OK__\n")) as run:
-            info = lw.probe_sandbox("codex", self.root, self.env, (), lw.Deadline(120),
-                                    backend=lw.WORKSPACE_SANDBOX_BACKEND)
-        self.assertEqual(run.call_args.args[0][:2], ["codex", "sandbox"])
-        self.assertEqual(info["backend"], lw.WORKSPACE_SANDBOX_BACKEND)
-        self.assertEqual(info["network"], "disabled")
 
     def test_probe_reports_unavailable_without_claiming_confinement(self):
         with mock.patch.object(lw, "run_bounded", return_value=sandbox_result(returncode=127)):
@@ -217,7 +194,7 @@ class DirectVerification(unittest.TestCase):
         self.assertEqual(env["IBToolNeverDeque"], "1")
         self.assertEqual(env["HOME"], "/home/tester")
         self.assertEqual(env["CODEX_HOME"], "/codex/tester")
-        self.assertIsNone(env.get(APPLE.FOUNDATION_HOME_ENV))
+        self.assertIsNone(env.get("CFFIXED_USER_HOME"))
         self.assertEqual(env["PATH"], "/usr/bin")
 
     def test_executed_full_host_results_keep_their_log_files(self):
@@ -261,17 +238,15 @@ class NativeScope(unittest.TestCase):
         self.report_dir.mkdir()
         self.opts = options(self.root, apple_simulator_udid=UDID,
                             native_preflight_plan=self.root / "plan.json")
+        self.opts.native_preflight_plan.write_text('{"version": 2, "destination": '
+                                                   '{"simulator": "' + UDID + '"}}')
         self.report = lw.new_report(self.opts)
         self.report["report_dir"] = str(self.report_dir)
         self.probed = lw.probe_sandbox("codex", self.root, {}, (), lw.Deadline(120))
 
     def opt_in(self):
-        with mock.patch.object(APPLE, "probe_apple") as probe, \
-                mock.patch.object(APPLE, "sandbox_argv") as wrap:
-            sandbox = lw._apple_opt_in(self.opts, self.report, self.report_dir, self.root,
-                                       dict(self.probed), {}, [], lw.Deadline(120))
-        self.assertFalse(probe.called, "native setup must not run a confinement probe")
-        self.assertFalse(wrap.called, "native setup must not build a sandbox profile")
+        sandbox = lw._apple_opt_in(self.opts, self.report, self.report_dir, self.root,
+                                   dict(self.probed), {}, [], lw.Deadline(120))
         return sandbox
 
     def test_native_opt_in_selects_full_host_without_a_profile(self):
@@ -299,7 +274,7 @@ class NativeScope(unittest.TestCase):
         self.assertEqual(env["HOME"], "/home/tester")
         self.assertEqual(env["CODEX_HOME"], "/codex/tester")
         self.assertEqual(env["TMPDIR"], "/tmp/job")
-        self.assertIsNone(env.get(APPLE.FOUNDATION_HOME_ENV))
+        self.assertIsNone(env.get("CFFIXED_USER_HOME"))
         self.assertIsNone(env.get("CLANG_MODULE_CACHE_PATH"))
 
     def test_native_gate_uses_the_plain_verification_environment(self):
@@ -307,9 +282,9 @@ class NativeScope(unittest.TestCase):
         verify_env = {"HOME": "/home/tester", "CODEX_HOME": "/codex/tester"}
         captured = {}
 
-        def qualify(plan, worktree, report_dir, udid, confined, deadline):
+        def qualify(plan, worktree, report_dir, destination, confined, deadline):
             confined(["xcrun", "simctl", "list", "devices"])
-            return {"udid": udid}
+            return {"destination": destination}
 
         with mock.patch.object(lw.native, "qualify", side_effect=qualify), \
                 mock.patch.object(lw, "run_bounded", return_value=sandbox_result()) as run:
@@ -319,8 +294,9 @@ class NativeScope(unittest.TestCase):
         env = run.call_args.kwargs["env"]
         self.assertEqual(env["IBToolNeverDeque"], "1")
         self.assertEqual(env["HOME"], "/home/tester")
-        self.assertIsNone(env.get(APPLE.FOUNDATION_HOME_ENV))
-        self.assertEqual(self.report["native_preflight"], {"udid": UDID})
+        self.assertIsNone(env.get("CFFIXED_USER_HOME"))
+        self.assertEqual(self.report["native_preflight"],
+                         {"destination": {"simulator": UDID}})
 
     def test_worker_environment_gets_the_native_toolchain_pin(self):
         self.assertEqual(lw.full_host_env({}).get("IBToolNeverDeque"), "1")

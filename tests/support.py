@@ -10,7 +10,7 @@ import sys
 import tempfile
 import urllib.parse
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -249,10 +249,17 @@ def simctl_json(devices=None, runtime=APPLE_RUNTIME):
     return json.dumps({"devices": {runtime: devices}, "runtimes": [], "bundles": []})
 
 
+def simctl_devices(runtimes: Dict[str, List[Dict]]) -> Dict[str, Dict]:
+    """Flatten simctl's runtime-keyed devices while retaining each runtime identifier."""
+    return {device["udid"]: dict(device, runtime=runtime)
+            for runtime, devices in runtimes.items() for device in devices
+            if isinstance(device, dict) and isinstance(device.get("udid"), str)}
+
+
 def apple_home(parent, udid=APPLE_UDID, name="home"):
     """Fake HOME holding exactly one CoreSimulator device directory."""
     home = Path(parent) / name
-    (home / lw.apple.DEVICES_RELATIVE / udid).mkdir(parents=True, exist_ok=True)
+    (home / "Library/Developer/CoreSimulator/Devices" / udid).mkdir(parents=True, exist_ok=True)
     return home
 
 
@@ -386,7 +393,7 @@ WRAPPER_PROBE = ["/usr/bin/true"]
 
 def deny_wrapped(argv):
     """``(inner argv, True)`` when ``argv`` is a command run under the job's deny profile, else
-    ``(argv, False)``. The legacy Apple backend's own ``sandbox-exec`` profile is not stripped."""
+    ``(argv, False)``."""
     if (len(argv) > 3 and argv[0] == lw.permissions.SANDBOX_EXEC and argv[1] == "-f"
             and Path(argv[2]).name == DENY_PROFILE_NAME):
         return argv[3:], True
@@ -416,8 +423,6 @@ class FakeRun:
         self.attempt_streams = list(attempt_streams or [])
         self.auth_refresh = auth_refresh
         self.wrapper_rc, self.wrapper_stderr = wrapper_rc, wrapper_stderr
-        # Knobs for the mocked /usr/bin/sandbox-exec backend: devices, verdicts, failures.
-        self.apple = dict(apple or {})
         self.calls, self.exec_calls = [], 0
 
     def calls_of(self, kind):
@@ -428,68 +433,6 @@ class FakeRun:
         contract's verification commands (and native steps, which take the same path here)."""
         return [call for call in self.calls if call.get("kind") == "verification"]
 
-    def apple_calls(self):
-        return [call for call in self.calls if call["argv"][0] == lw.apple.SANDBOX_EXEC]
-
-    @staticmethod
-    def _seatbelt_roots(text):
-        """Read the generated profile's own allow/deny file-write* subpaths."""
-        allowed, denied = [], []
-        for action, entries in write_statements(text):
-            paths = [path for kind, path in entries if kind == "subpath"]
-            (allowed if action == "allow" else denied).extend(paths)
-        return allowed, denied
-
-    def _apple_write_allowed(self, text, target):
-        """Seatbelt keeps the last match, so a deny entry always beats an earlier allow."""
-        if self.apple.get("writes") == "allow_all":
-            return True
-        if self.apple.get("writes") == "deny_all":
-            return False
-        return seatbelt_write_allowed(text, target)
-
-    def _sandbox_exec(self, argv):
-        """Mock /usr/bin/sandbox-exec: honour the profile it was handed, never run bare."""
-        if self.apple.get("no_backend"):
-            return result(argv, 1, "", "sandbox-exec: No such file or directory")
-        if argv[1:2] != ["-f"]:
-            return result(argv, 1, "", "sandbox-exec: expected -f <profile>")
-        try:
-            text = Path(argv[2]).read_text(encoding="utf-8")
-        except OSError as error:
-            return result(argv, 1, "", f"sandbox-exec: cannot read profile: {error}")
-        inner = argv[3:]
-        command = Path(inner[0]).name if inner else ""
-        if self.apple.get("deny_everything"):
-            return result(argv, 1, "", "sandbox-exec: operation not permitted")
-        if command == "xcodebuild":
-            if self.apple.get("xcode_fail"):
-                return result(argv, 1, "", "xcode-select: error: no developer directory")
-            return result(argv, 0, "Xcode 16.0\nBuild version 16A242d\n")
-        if command == "xcrun":
-            if "simctl" not in inner:
-                return result(argv, 1, "", "sandbox-exec: not mocked: " + " ".join(inner))
-            if self.apple.get("simctl_fail"):
-                return result(argv, 1, "", "xcrun: error: unable to find utility simctl")
-            # JSON belongs on stdout and diagnostics on stderr, exactly like the real simctl,
-            # so a test can prove the backend parses stdout alone.
-            return result(argv, 0, self.apple.get("simctl")
-                          or simctl_json(self.apple.get("devices")),
-                          self.apple.get("simctl_stderr", ""))
-        if command == "touch":
-            if self._apple_write_allowed(text, inner[1]):
-                Path(inner[1]).parent.mkdir(parents=True, exist_ok=True)
-                Path(inner[1]).write_text("bounded\n", encoding="utf-8")
-                return result(argv, 0, "")
-            return result(argv, 1, "", f"touch: {inner[1]}: Operation not permitted")
-        if command.startswith("python") and "-c" in inner:
-            verdict = self.apple.get("connect")
-            if verdict is None:
-                verdict = "DENIED" if "(deny network" in text else "CONNECTED"
-            return result(argv, 0, verdict + "\n")
-        # Anything else is a contract verification command wrapped in the profile: the same
-        # verdict the mocked codex sandbox gives, so pass/fail knobs stay comparable.
-        return result(argv, self.test_rc, "Ran 1 test OK\n")
 
     def worker_jsonl(self, argv, cwd, attempt):
         """The worker's JSONL stdout for one attempt (a subclass can add events)."""
@@ -517,9 +460,6 @@ class FakeRun:
         if wrapped and argv == WRAPPER_PROBE:
             call["kind"] = "wrapper_probe"
             return result(raw, self.wrapper_rc, "", self.wrapper_stderr)
-        if argv[0] == lw.apple.SANDBOX_EXEC:
-            call["kind"] = "apple"
-            return self._sandbox_exec(argv)
         if argv == list(lw.FULL_HOST_PROBE_ARGV):
             # The default readiness probe is one trivial command on the host: answer it the way
             # the host would, so ``probe_ok`` still decides whether execution is available.
