@@ -181,7 +181,9 @@ def http_fetch(settings: ServerSettings, path: str, auth: bool,
     """One request to the oMLX server: ``(status, parsed JSON body)``.
 
     GET, except the one blocking model-load endpoint, which is a POST. No proxies, no
-    redirects, 15 s timeout. The bearer key is attached only when ``auth`` is true. Connection
+    redirects. The timeout is 15 s (``HTTP_TIMEOUT_SECONDS``), except 900 s for the load POST
+    (``LOAD_TIMEOUT_SECONDS``), and an explicit ``timeout`` replaces either (a job passes what is
+    left of its deadline). The bearer key is attached only when ``auth`` is true. Connection
     failures and redirects raise ``server_unreachable``; 401 and 403 raise ``auth_failed``;
     every other status is returned with its body (``None`` when it is not JSON) so callers can
     read, for example, the 503 ``loading`` health answer.
