@@ -3477,8 +3477,8 @@ def _read_prompt(task: Task, worktree: Path) -> str:
             "Then use the numbered source helper to obtain blank-line-aware line numbers and ready "
             "citation entries. Repeat --scope for every contract scope, and replace the example path "
             "with a file inside one of those scopes:",
-            "python3 %s --repo %s %s --path %s --start 1 --count 40" % (
-                shlex.quote(str(helper)), shlex.quote(str(worktree)), scope_args,
+            "%s %s --repo %s %s --path %s --start 1 --count 40" % (
+                shlex.quote(sys.executable), shlex.quote(str(helper)), shlex.quote(str(worktree)), scope_args,
                 shlex.quote(example_path)),
         ]
     else:
@@ -3496,22 +3496,31 @@ def _read_prompt(task: Task, worktree: Path) -> str:
         source_read_instructions = [
             "No source files are declared as readable. Cite only lines read from the current worktree.",
         ]
+    citation_instruction = (
+        "Copy only the source_id from a source_refs entry returned by the helper into each "
+        "citation object. Do not transcribe paths, line numbers or quotes, or invent source IDs. "
+        "The launcher resolves observed IDs and independently verifies the source lines."
+        if task.tier.kind != "cloud" else
+        "Copy a ready citation entry exactly, without changing its path, line numbers or quote. "
+        "The launcher still independently verifies every citation against the worktree.")
+    prompt_schema = (read_answers.reference_envelope_schema(task.answer_schema or {})
+                     if task.tier.kind != "cloud" else
+                     read_answers.envelope_schema(task.answer_schema or {}))
     return "\n".join([
         f"Read task {task.task_id} (base commit {task.base_ref}).",
         "Answer the question using only the current worktree. Do not modify any files.",
         *source_read_instructions,
         *citation_instructions,
-        "Copy a ready citation entry exactly, without changing its path, line numbers or quote. "
-        "The launcher still independently verifies every citation against the worktree.",
+        citation_instruction,
         "Separate explicit source facts from inferences. If a requested command is absent "
         "from the scoped sources, report it as not specified. Do not present inferred commands "
         "as verified: label suggestions unverified unless you executed them successfully in "
         "this worktree without violating the read-only scope. A valid citation alone does not "
         "prove an inferred command is installed or runnable.",
-        "Return JSON matching this schema. Include at least one citation and quote the cited "
-        "source lines exactly apart from whitespace normalization. Your final message must be "
+        "Return JSON matching this schema. Include at least one citation in the schema's format. "
+        "Your final message must be "
         "only the JSON object, with no other text.",
-        json.dumps(read_answers.envelope_schema(task.answer_schema or {}), sort_keys=True),
+        json.dumps(prompt_schema, sort_keys=True),
         "Question:", task.question or "",
         "Scope paths:", *["- " + path for path in task.scope_paths],
         "Worktree:", str(worktree),
@@ -3679,6 +3688,9 @@ def _execute_read_job(options: JobOptions, report: Dict[str, Any], deadline: Dea
             envelope = None
             errors.append("the worker output is not valid JSON")
         if envelope is not None:
+            envelope, reference_errors = read_answers.resolve_citation_references(
+                envelope, worker_command_outputs(stdout_text), worktree, task.scope_paths)
+            errors.extend(reference_errors)
             schema_errors = read_answers.validate(envelope, schema)
             errors.extend(schema_errors)
             citations = envelope.get("citations") if isinstance(envelope, dict) else None

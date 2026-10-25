@@ -47,6 +47,12 @@ class SourceCitationCLITests(unittest.TestCase):
             {"path": "pkg/sample.py", "line_start": 4, "line_end": 4,
              "quote": "third = 3"},
         ])
+        self.assertEqual(file_result["source_refs"], [
+            {"source_id": "source:pkg/sample.py:3-3",
+             "citation": file_result["citations"][0]},
+            {"source_id": "source:pkg/sample.py:4-4",
+             "citation": file_result["citations"][1]},
+        ])
         self.assertEqual(read_answers.verify_citations(self.root, file_result["citations"]),
                          {"total": 2, "verified": 2, "failures": []})
 

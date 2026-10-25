@@ -8,6 +8,8 @@ import sys
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Sequence, Tuple
 
+import read_answers
+
 
 DEFAULT_COUNT = 40
 MAX_COUNT = 80
@@ -92,8 +94,12 @@ def _file_result(root: Path, scopes: Sequence[Path], value: str,
          "quote": item["text"]}
         for item in display if item["text"].strip()
     ]
+    source_refs = [
+        {"source_id": read_answers.citation_id(citation), "citation": citation}
+        for citation in citations
+    ]
     return {"path": canonical, "line_start": start, "line_end": end,
-            "lines": display, "citations": citations}
+            "lines": display, "citations": citations, "source_refs": source_refs}
 
 
 def build_payload(repo: str, scopes: Sequence[str], paths: Sequence[str],
@@ -118,7 +124,7 @@ def build_payload(repo: str, scopes: Sequence[str], paths: Sequence[str],
     if not root.is_dir():
         raise ValueError("repository root must be a directory")
     resolved_scopes = _scopes(root, scopes)
-    payload = {"files": []}
+    payload = {"source_citations_version": 1, "files": []}
     for path in paths:
         payload["files"].append(_file_result(root, resolved_scopes, path, start, count))
         encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"

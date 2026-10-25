@@ -1,6 +1,8 @@
 """Read jobs run read-only and only release answers with verified citations."""
 import json
 import os
+import shlex
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -13,15 +15,19 @@ import local_worker as lw
 
 
 class AnswerRun(sp.FakeRun):
-    def __init__(self, last_message, **kwargs):
+    def __init__(self, last_message, command_outputs=(), **kwargs):
         super().__init__(worker_edit=None, **kwargs)
         self.last_message = last_message
+        self.command_outputs = command_outputs
 
     def __call__(self, argv, **kwargs):
         result = super().__call__(argv, **kwargs)
         argv, _ = sp.deny_wrapped([str(value) for value in argv])
         if argv[1:2] == ["exec"] and "-o" in argv:
             Path(argv[argv.index("-o") + 1]).write_text(self.last_message, encoding="utf-8")
+            result["stdout"] += "".join(json.dumps({"type": "item.completed", "item": {
+                "type": "command_execution", "aggregated_output": output, "exit_code": 0
+            }}) + "\n" for output in self.command_outputs).encode("utf-8")
         return result
 
 
@@ -43,14 +49,15 @@ class ReadJobTests(unittest.TestCase):
                 "max_answer_bytes": 4096}
 
     def run_read_job(self, bad_citation=False, max_bytes=4096, worker_rc=0,
-                     secret_output=None, raw_message=None):
+                     secret_output=None, raw_message=None, command_outputs=()):
         citation = {"path": "add.py", "line_start": 1 if not bad_citation else 9,
                     "line_end": 1 if not bad_citation else 9,
                     "quote": "def add" if not bad_citation else "missing"}
         summary = secret_output or "add currently subtracts"
         message = json.dumps({"answer": {"summary": summary},
                               "citations": [citation]})
-        fake = AnswerRun(message if raw_message is None else raw_message, worker_rc=worker_rc)
+        fake = AnswerRun(message if raw_message is None else raw_message, worker_rc=worker_rc,
+                         command_outputs=command_outputs)
         payload = self.payload()
         if secret_output:
             payload["environment"] = {"pass": ["JAVA_HOME"]}
@@ -68,6 +75,25 @@ class ReadJobTests(unittest.TestCase):
             else:
                 report = lw.run_job(options)
         return report, fake
+
+    def test_observed_source_reference_is_resolved_before_validation(self):
+        import source_citations
+        output = source_citations.build_payload(str(self.repo), ["add.py"], ["add.py"], 1, 1)
+        reference = output["files"][0]["source_refs"][0]
+        message = json.dumps({"answer": {"summary": "source fact"},
+                              "citations": [{"source_id": reference["source_id"]}]})
+        report, _ = self.run_read_job(raw_message=message,
+                                      command_outputs=[json.dumps(output)])
+        self.assertEqual(report["status"], "ok", report.get("failure_reason"))
+        self.assertEqual(report["citations"], [reference["citation"]])
+        self.assertEqual(report["citation_verification"]["verified"], 1)
+
+    def test_unobserved_source_reference_withholds_answer(self):
+        message = json.dumps({"answer": {"summary": "source fact"},
+                              "citations": [{"source_id": "source:add.py:1-1"}]})
+        report, _ = self.run_read_job(raw_message=message)
+        self.assertEqual(report["status"], "answer_invalid")
+        self.assertNotIn("answer", report)
 
     def test_read_job_returns_only_a_verified_answer(self):
         report, run = self.run_read_job(bad_citation=True)
@@ -101,9 +127,10 @@ class ReadJobTests(unittest.TestCase):
         self.assertIn("cat the selected files as text", prompt)
         self.assertIn("Cite only lines read from the current worktree", prompt)
         self.assertIn("source_citations.py", prompt)
+        self.assertIn(shlex.quote(sys.executable) + " ", prompt)
         self.assertIn("--scope add.py", prompt)
         self.assertIn("--path add.py --start 1 --count 40", prompt)
-        self.assertIn("Copy a ready citation entry", prompt)
+        self.assertIn("Copy only the source_id", prompt)
         self.assertIn('"citations"', prompt)
         self.assertIn('"answer"', prompt)
 
@@ -142,6 +169,14 @@ class ReadJobTests(unittest.TestCase):
         self.assertIn("Separate explicit source facts from inferences", prompt)
         self.assertIn("Do not present inferred commands as verified", prompt)
         self.assertIn("not specified", prompt)
+
+    def test_cloud_prompt_retains_full_citation_schema(self):
+        payload = self.payload()
+        payload["tier"] = {"cloud": "gpt-6-luna"}
+        prompt = lw._read_prompt(contract.Contract.from_payload(payload), self.repo)
+        self.assertIn('"line_start"', prompt)
+        self.assertNotIn('"source_id"', prompt)
+        self.assertIn("Copy a ready citation entry", prompt)
 
     def test_only_cloud_reads_use_the_native_output_schema(self):
         schema = Path("/tmp/answer.schema.json")

@@ -2,8 +2,8 @@
 
 import json
 import re
-from pathlib import Path
-from typing import Any, Dict, List
+from pathlib import Path, PurePosixPath
+from typing import Any, Dict, List, Sequence, Tuple
 
 SUPPORTED_SCHEMA_KEYWORDS = frozenset({
     "type", "properties", "required", "additionalProperties", "items", "enum",
@@ -12,6 +12,10 @@ SUPPORTED_SCHEMA_KEYWORDS = frozenset({
 
 
 _FENCE = re.compile(r"```[ \t]*(?:json|JSON)?[ \t]*\r?\n(.*?)\r?\n?```", re.DOTALL)
+MAX_REFERENCE_OUTPUT_BYTES = 64 * 1024 + 1  # helper's 64 KiB JSON cap plus its newline
+MAX_REFERENCE_OUTPUTS = 32
+MAX_REFERENCE_TOTAL_BYTES = 2 * 1024 * 1024
+MAX_REFERENCE_FILE_BYTES = 2 * 1024 * 1024  # same source-read ceiling as source_citations.py
 
 
 def extract_json_text(message: str) -> str:
@@ -60,6 +64,201 @@ def envelope_schema(answer_schema: Dict[str, Any]) -> Dict[str, Any]:
             "citations": {"type": "array", "minItems": 1, "items": citation},
         },
     }
+
+
+def reference_envelope_schema(answer_schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Wrap an answer schema whose citations refer to observed helper source entries."""
+    reference = {
+        "type": "object",
+        "required": ["source_id"],
+        "additionalProperties": False,
+        "properties": {"source_id": {"type": "string"}},
+    }
+    return {
+        "type": "object",
+        "required": ["answer", "citations"],
+        "additionalProperties": False,
+        "properties": {
+            "answer": answer_schema,
+            "citations": {"type": "array", "minItems": 1, "items": reference},
+        },
+    }
+
+
+def citation_id(citation: Dict[str, Any]) -> str:
+    """Stable, readable reference for an exact relative path and line range."""
+    path = citation.get("path")
+    start = citation.get("line_start")
+    end = citation.get("line_end")
+    if (not isinstance(path, str) or not path or "\n" in path or "\r" in path
+            or isinstance(start, bool) or not isinstance(start, int) or start < 1
+            or isinstance(end, bool) or not isinstance(end, int) or end < start):
+        raise ValueError("citation cannot be represented as a source reference")
+    return "source:%s:%d-%d" % (path, start, end)
+
+
+def resolve_citation_references(envelope: Any, command_outputs: Sequence[str],
+                                worktree: Path, scope_paths: Sequence[str]
+                                ) -> Tuple[Any, List[str]]:
+    """Resolve exact source IDs from bounded helper output into verified citations.
+
+    Full legacy citations pass through unchanged for backwards compatibility. Reference objects
+    are replaced only when the ID maps to one unique citation in parsed helper output and that
+    citation still verifies against both the worktree and the declared read scopes.
+    """
+    import copy
+
+    normalized = copy.deepcopy(envelope)
+    errors: List[str] = []
+    if not isinstance(normalized, dict) or not isinstance(normalized.get("citations"), list):
+        return normalized, errors
+    references = []
+    for index, item in enumerate(normalized["citations"]):
+        if isinstance(item, dict) and "source_id" in item:
+            if set(item) != {"source_id"} or not isinstance(item.get("source_id"), str) or not item["source_id"]:
+                errors.append("citation %d has a malformed source reference" % index)
+            else:
+                references.append((index, item["source_id"]))
+    if not references:
+        return normalized, errors
+
+    source_map: Dict[str, Dict[str, Any]] = {}
+    ambiguous = set()
+    if not isinstance(command_outputs, (list, tuple)):
+        errors.append("helper outputs are not a bounded list")
+        command_outputs = []
+    elif len(command_outputs) > MAX_REFERENCE_OUTPUTS:
+        errors.append("helper output count exceeds the limit")
+        command_outputs = []
+    total_bytes = 0
+    try:
+        root = Path(worktree).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        root = None
+        errors.append("worktree root cannot be resolved for source references")
+
+    resolved_scopes = []
+    if root is not None:
+        if not scope_paths or len(scope_paths) > 32:
+            errors.append("declared source scopes are missing or exceed the limit")
+        else:
+            for raw_scope in scope_paths:
+                if (not isinstance(raw_scope, str) or not raw_scope or raw_scope.startswith(("/", "~", "\\"))
+                        or "\\" in raw_scope):
+                    errors.append("declared source scope is not a safe relative path")
+                    continue
+                relative_scope = PurePosixPath(raw_scope)
+                if relative_scope.is_absolute() or ".." in relative_scope.parts or relative_scope.as_posix() == ".":
+                    errors.append("declared source scope is not a safe relative path")
+                    continue
+                try:
+                    target_scope = (root / Path(*relative_scope.parts)).resolve(strict=True)
+                    target_scope.relative_to(root)
+                    if not target_scope.is_file() and not target_scope.is_dir():
+                        raise ValueError("scope is not a file or directory")
+                except (OSError, RuntimeError, ValueError):
+                    errors.append("declared source scope cannot be resolved safely")
+                    continue
+                resolved_scopes.append(target_scope)
+
+    for output_index, output in enumerate(command_outputs):
+        if not isinstance(output, str):
+            errors.append("helper output %d is not text" % output_index)
+            continue
+        if len(output) > MAX_REFERENCE_OUTPUT_BYTES:
+            errors.append("helper output %d exceeds the output limit" % output_index)
+            continue
+        try:
+            output_bytes = output.encode("utf-8")
+        except UnicodeError:
+            errors.append("helper output %d is not valid UTF-8 text" % output_index)
+            continue
+        if len(output_bytes) > MAX_REFERENCE_OUTPUT_BYTES:
+            errors.append("helper output %d exceeds the output limit" % output_index)
+            continue
+        total_bytes += len(output_bytes)
+        if total_bytes > MAX_REFERENCE_TOTAL_BYTES:
+            errors.append("combined helper outputs exceed the output limit")
+            break
+        try:
+            payload = json.loads(output)
+        except (ValueError, TypeError, RecursionError):
+            continue
+        if (not isinstance(payload, dict)
+                or type(payload.get("source_citations_version")) is not int
+                or payload.get("source_citations_version") != 1):
+            # Command output collection includes ordinary shell output too. Only a JSON object
+            # with the source helper's version marker is relevant; an absent ID is rejected below.
+            continue
+        files = payload.get("files")
+        if not isinstance(files, list):
+            errors.append("helper output %d has malformed source file entries" % output_index)
+            continue
+        for file_entry in files:
+            if not isinstance(file_entry, dict) or not isinstance(file_entry.get("source_refs"), list):
+                errors.append("helper output %d has malformed source references" % output_index)
+                continue
+            for source_ref in file_entry["source_refs"]:
+                if (not isinstance(source_ref, dict) or set(source_ref) != {"source_id", "citation"}
+                        or not isinstance(source_ref.get("source_id"), str)
+                        or not isinstance(source_ref.get("citation"), dict)):
+                    errors.append("helper output %d has a malformed source reference" % output_index)
+                    continue
+                citation = source_ref["citation"]
+                try:
+                    expected_id = citation_id(citation)
+                except ValueError:
+                    errors.append("helper output %d has an invalid citation reference" % output_index)
+                    continue
+                if source_ref["source_id"] != expected_id:
+                    errors.append("helper output %d has a mismatched citation reference" % output_index)
+                    continue
+                if (root is None or not resolved_scopes
+                        or _citation_failure(root, citation) is not None
+                        or not _citation_within_scopes(root, citation, resolved_scopes)):
+                    errors.append("helper output %d contains an unverified or out-of-scope citation" % output_index)
+                    continue
+                source_id = source_ref["source_id"]
+                if source_id in ambiguous:
+                    continue
+                if source_id in source_map:
+                    if source_map[source_id] != citation:
+                        source_map.pop(source_id, None)
+                        ambiguous.add(source_id)
+                        errors.append("helper outputs contain an ambiguous source ID")
+                    continue
+                source_map[source_id] = citation
+
+    for index, source_id in references:
+        if source_id in ambiguous:
+            errors.append("citation %d refers to an ambiguous source ID" % index)
+        elif source_id not in source_map:
+            errors.append("citation %d refers to an unknown source ID" % index)
+        else:
+            normalized["citations"][index] = dict(source_map[source_id])
+    return normalized, errors
+
+
+def _citation_within_scopes(root: Path, citation: Dict[str, Any], scopes: Sequence[Path]) -> bool:
+    path = citation.get("path")
+    if not isinstance(path, str):
+        return False
+    try:
+        target = (root / path).resolve(strict=True)
+        if not target.is_file() or target.stat().st_size > MAX_REFERENCE_FILE_BYTES:
+            return False
+    except (OSError, RuntimeError, ValueError):
+        return False
+    for scope in scopes:
+        if scope.is_file() and target == scope:
+            return True
+        if scope.is_dir():
+            try:
+                target.relative_to(scope)
+                return True
+            except ValueError:
+                pass
+    return False
 
 
 def validate(instance: Any, schema: Dict[str, Any]) -> List[str]:
