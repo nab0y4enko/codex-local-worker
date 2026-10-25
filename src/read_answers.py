@@ -214,8 +214,8 @@ def resolve_citation_references(envelope: Any, command_outputs: Sequence[str],
                     errors.append("helper output %d has a mismatched citation reference" % output_index)
                     continue
                 if (root is None or not resolved_scopes
-                        or _citation_failure(root, citation) is not None
-                        or not _citation_within_scopes(root, citation, resolved_scopes)):
+                        or not _citation_within_scopes(root, citation, resolved_scopes)
+                        or _citation_failure(root, citation) is not None):
                     errors.append("helper output %d contains an unverified or out-of-scope citation" % output_index)
                     continue
                 source_id = source_ref["source_id"]

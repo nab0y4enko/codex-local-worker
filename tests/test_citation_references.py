@@ -147,6 +147,15 @@ class CitationReferenceTests(unittest.TestCase):
         self.assertNotIn("private source contents", " ".join(errors))
         self.assertEqual(normalized["citations"], [{"source_id": "source:pkg/sample.py:3-3"}])
 
+    def test_oversized_source_is_rejected_before_quote_read(self):
+        payload = self.helper_payload(start=3, count=1)
+        source_id = payload["files"][0]["source_refs"][0]["source_id"]
+        self.source.write_bytes(b"x" * (read_answers.MAX_REFERENCE_FILE_BYTES + 1))
+        with mock.patch.object(Path, "read_text", side_effect=AssertionError("unbounded read")):
+            _, errors = self.resolve(self.envelope([{"source_id": source_id}]),
+                                     [json.dumps(payload)])
+        self.assertTrue(errors)
+
     def test_unrelated_json_files_key_does_not_poison_helper_references(self):
         payload = self.helper_payload(start=3, count=1)
         source_id = payload["files"][0]["source_refs"][0]["source_id"]
