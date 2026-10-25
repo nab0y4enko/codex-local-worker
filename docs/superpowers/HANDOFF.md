@@ -1,4 +1,4 @@
-# Handoff: universal local worker (2026-10-25, live qualification in progress)
+# Handoff: universal local worker (2026-10-25, core qualified; desktop gate pending)
 
 ## Objective and instructions
 
@@ -10,59 +10,85 @@ Commit reviewed changes and push this task branch under the current user complet
 ## Recovery map
 
 - Spec: `docs/superpowers/specs/2026-10-24-universal-local-worker-design.md`.
-- Plan: `docs/superpowers/plans/2026-10-24-universal-local-worker.md`.
-- Current ignored ledger: `.superpowers/sdd/2026-10-24-universal-local-worker/progress.md`.
-- Briefs, reports, reviews and logs live beside the ledger. Do not force-add this temporary workspace to Git.
-- Original ignored ledger/reviews R1–R25 were missing at resume. Their wording cannot be recovered or invented.
-  The current ledger reconstructs completed work from the earlier handoff and commits, then records this continuation.
-- Tasks **1–25 complete and reviewed**. Do not redispatch them. Reviewed product code through `b9484c4`;
-  `3830bd7` removes accidentally tracked temporary evidence while keeping local copies. Those changes are pushed.
-- Package version **0.3.0**; first-party manifest `.codex-plugin/plugin.json`.
-- Latest full offline run: **960 tests, OK, 135.916s**. Later focused checks 85/21 and archive-install check passed.
-  The install check verifies exact archived manifest version plus all three skills using disposable HOME/CODEX_HOME.
+- Plan: `docs/superpowers/plans/2026-10-24-universal-local-worker.md` (28 tasks).
+- Current ignored ledger and all temporary briefs/reviews/logs: `.superpowers/sdd/2026-10-24-universal-local-worker/`.
+  Never force-add this workspace. Durable evidence is under `docs/qualification/`.
+- Original ignored R1–R25 ledger was absent at resume; do not invent its wording.
+  Recovered continuation rulings are preserved in `docs/qualification/2026-10-25-decisions.md`.
+- Tasks **1–26 complete and reviewed** through `0777c63`, including two Task26 fix/re-review rounds.
+  Package version **0.3.0**, sole manifest `.codex-plugin/plugin.json`.
+- Reviewed core/source evidence through `eb77c06` and the prepared dashboard spike pushed to `origin/universal-local-worker`.
+  No published history rewrite, main merge, or force-push.
 
-## Current work: Task 26
+## Actual local qualification and completed cleanup
 
-Luna implementer `task26_live` is building/running live qualification and fixing observed failures.
-Its report and compact jobs manifest will be in the ignored plan workspace; read them before further work.
-Supporting native plan: `native-live-pilot-plan.md`. Read-only dashboard investigation: `dashboard-readiness.md`.
+- Discovered/loaded oMLX model: `Qwen3.8-Flash-Next-UD-Q4_K_XL`, alias
+  `qwen-3.8-nf-splash`, context262144, fallbackfalse. Rediscover live; never hardcode it.
+- Task26 real launcher suite **8/8 in241.783s**; offline977total/8live-only skips, OK138.237s.
+  Actual write and independently cited read pilots passed. Earlier read1/2citations was correctly
+  withheld and retained; model reliability is not perfect. Genuine context overflow was typed
+ 893955tokens>262144, not inferred from model narration or metadata cap.
+- Actual Xcode27.1/iOS27 UIKit native pilot built/installed/launched/tested and captured six
+  nonuniform images. The separate strict `testAppShowsAfter` passed1/1; baseline readiness alone
+  cannot qualify a no-op as success. Parent inspected images and queried copied XCResult.
+- Read jobs use one strict Codex native named profile extending `:read-only`; trusted parent
+  has no outer wrapper, stdio MCP does. Explicit state/secret denials use nested exact-root
+  dot rules, not glob keys. Actual bracket/unicode path, secret/state/read/write probes passed.
+- External evidence: `~/.local/share/codex-local-worker/task26-live-2026-10-25`.
+  ALL39owned jobs archived via launcher and independently verified; source linked worktrees
+  removed,952799349ignoredbytes preserved,0blocked/skipped.29fixture primary repos retained.
+  Durable cleanup record `docs/qualification/2026-10-25-cleanup.md`.
+- Own old simulator24033911-49F7-4D8F-ADDD-233ECB533393 shut down/deleted.
+  Preserve the two unrelated booted tvOS devices. New qualification needs a new owned simulator.
 
-- oMLX app was started; actual model discovered/loaded: `Qwen3.8-Flash-Next-UD-Q4_K_XL`,
-  alias `qwen-3.8-nf-splash`, context 262144, fallback disabled. Rediscover live; do not hardcode this into product code.
-- Own qualification root: `~/.local/share/codex-local-worker/task26-live-2026-10-25`.
-- Own iOS simulator: `24033911-49F7-4D8F-ADDD-233ECB533393`. Two unrelated booted tvOS devices must remain untouched.
-- First native plan had an invalid result-bundle path; corrected to report-owned `apple-scratch`.
-- Native fixture built/installed/launched with positive PID, but XCTest failed because SDK27.1 requires UIScene lifecycle.
-  Fixture generator was corrected with SceneDelegate. Keep failed jobs/results; never claim this was a pass.
-- Actual impossible-test local job classified `tests_failed -> escalate_cloud` correctly:
-  24565 input / 19200 cached / 2598 output, 27.64 worker seconds. Reasoning count not reported.
-- A 4096 metadata-cap case did not force server overflow: server still has its discovered larger context.
-  Genuine overflow test must exceed discovered server window, or explicitly report the plan assumption mismatch;
-  never classify model narration as a typed environment error.
-- An async request for **one minimal real cloud smoke call is unanswered**. No cloud inference is authorized yet.
-  Local inference is explicitly authorized. Synthetic cloud authentication tests already passed; real refresh remains unverified.
+## Completed core readiness fix wave
 
-## Remaining sequence
+Broad frozen-core audits A/B/C found6Important+1Minor; consolidated fix wave was completed by Luna
+`core_fixwave`. Read `core-findings.md`, `core-fixwave-report.md`, and scoped `core-rereview-*.md`
+in the ignored ledger folder before continuing. Root must not stage agent source concurrently.
 
-1. Finish Task26: real read/write/environment/capability/summary cases; real native build, test and images where feasible;
-   analyse/fix failures; review actual images; full offline suite and scoped review. Commit durable qualification record.
-2. Archive/remove ONLY owned completed live-job worktrees after review and task-branch push; keep verified bundles,
-   receipts, reports and required artifacts outside removed worktrees. Manifest must include failed/superseded jobs.
-3. Tasks27–28: desktop MCP Apps spike first. Rendering/modes/pip/update behavior remain unproven.
-   Do not mark GO from static code or standard protocol support. Task28 is conditional on an observed GO.
-   The old approval gate before installing into the real desktop remains relevant; prepare a concrete reversible spike first.
-4. Final whole-branch review and fixes, final checks/install qualification, commit/push, archive/cleanup, final report.
-   No history squash: T2 commits were already published before this continuation; do not force-rewrite them.
+- A1: per-job private object store with primary readonly alternate, isolated hash/collision
+  validation before parent reads, validated promotion during archive. No shared object writes.
+- A2: gitlinks remain untraversed, now always explicitly unaudited+violating, never silently clean.
+- B1: durable-before-release supervisor keeper with OS birth identity/SID/PGID and all-stage
+  tracker; uncertain ownership preserved; signal escalation revalidates identity.
+- B2: one absolute deadline through compatibility, discovery, rechecks and diagnostic probes.
+- C1/C2/minor: first-try metric requires one clean attempt; typed sandbox_denied with safe
+  remediation, no raw-stderr classification; permission history correctly labelled global.
+- Final code `7465273`; evidence `eb77c06`. All consolidated core findings and scoped
+  follow-ups addressed; A/C re-reviews clean, B final scoped re-review clean39focusedtests.
+- Final offline **1013total,1005executed successfully,8live-only skips,OK214.097s**.
+  Final real local **8/8 PASS165.160s** on `7465273`, including strictAfterXCTest and captures.
+  Exact-HEAD isolated package install/three-skill discovery passed; source remains unchanged.
+- All10NEWjobs archived via committedCLI and independently verified, linked worktrees removed,
+ 274492701ignoredbytes preserved. Across allphases49jobs/1227292050ignoredbytes retained.
+ 8newfixtureprimaryrepos retained as recovery bases. Old39archives untouched.
+- New owned iPhone simulator4D3B2328-F90D-4703-9D83-956C7AFE5083 shutdown/deleted;
+  both unrelated tvOS devices remain booted. Immutable review snapshot archived/hashverified
+  and removed from/tmp. No owned job worktrees remain.
+- New evidence/manifest: `~/.local/share/codex-local-worker/core-fixwave-2026-10-25/`.
+  See `docs/qualification/2026-10-25-core-fixes.md`, `2026-10-25-cleanup.md`,
+  `2026-10-25-readiness.md`, `2026-10-25-usage.md` and recovered decisions.
+- Source/evidence through `eb77c06` pushed; final readiness/cleanup/usage/decision records live on this task branch.
 
-## Final-review carry items
+## Dashboard gate and remaining sequence
 
-- Historical Task9: root timestamp handling, writable Git objects, gitlink reporting, packed-refs.lock noise.
-- Check orphan process-group tracking/reaping for native/capture phases before the worker starts, especially SIGKILL.
-- Cloud authentication uses Codex-managed actual cloud CODEX_HOME, no plugin copy/writeback; profile grants only
-  home metadata, literal auth.json, and observed tmp/arg0-macos helper subtree. Local jobs retain isolated homes.
-- Capture checkout commands are wrapped and deadline-bound; all source simulator locks are sorted and acquired
-  after global worker lock; overlay ancestors are strict; artifact roots are preopened under apple-scratch.
-- Preserve all new `Ruling:` lines from the ledger in final reporting; do not invent missing original rulings.
+- Task27 prepared/reviewed v0.1.2 spike,7protocoltests plus actual isolated CLI app-server
+  startup/tool-list, no inference. Package `/tmp/codex-dashboard-mcpapps-spike-20261025`;
+  plugin `dashboard-mcpapps-spike-20261025@dashboard-spike-20261025`, distinct from real plugin.
+  Synthetic fixed fixture only, no environment override/symlink escapes. Scope re-review clean.
+- Real desktop **NOT installed/tested**; GO/NO-GO undecided, Task28 not started.
+  Explicit async question allowing temporary desktop installation/test/removal is UNANSWERED.
+  Do not infer a failed capability from missing authorization. Do not restart app or mutate
+  real home without authorization. See `docs/qualification/2026-10-25-dashboard-spike.md`.
+- Separate one-minimal-cloud-smoke async request also UNANSWERED. No launcher cloud inference.
+  Cloud authentication/catalog tested synthetically; actual refresh remains unverified.
+- Core review, final offline/live/install checks, push and owned-worktree cleanup are complete.
+- If desktop test approved, observe rendering/hostmodes/PiP/mountedrefresh and decide GO/NO-GO;
+  Task28 only after observedGO (or explicit user choice to keep CLI-only). Never fabricate GO.
+- Durable readiness/usage/decisions records distinguish actual/synthetic/skipped/unapproved checks.
+  The whole28-task plan remains incomplete only at the approval-gated desktop27/conditional28 scope.
+  If no approval arrives, report this gate candidly; do not claim the dashboard is qualified.
 
 ## Standing boundaries
 

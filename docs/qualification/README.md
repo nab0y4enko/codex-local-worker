@@ -1,5 +1,8 @@
 # Local Worker qualification records
 
+Current status: [2026-10-25 readiness](2026-10-25-readiness.md), including the actual local-model
+results, reviewed fixes, recovery cleanup, and the pending desktop approval gate.
+
 `test_live_qualification.py` is the opt-in, end-to-end suite for the installed launcher. It uses
 `bin/local-worker` for every local inference job and records one dated host report from actual
 launcher output. Offline unit tests remain under `tests/` and use `python3 -m unittest`.
