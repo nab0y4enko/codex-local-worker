@@ -64,7 +64,9 @@ regardless of whether integration is committed or pushed, with
 `<root>/bin/local-worker-archive archive --repo <repo> --state-dir <state> --job-id <id>`. Confirm
 the `archived` receipt, recovery ref, and verified bundle/archive copy before cleanup. Preserve
 needed logs, screenshots, result bundles, ignored artifacts, and unfinished drafts. Do not delete
-unrelated active worktrees.
+unrelated active worktrees. Archiving requires an idle shared worker state; finish the job
+queue first, or archive before starting the next job. A busy archive refusal preserves the
+worktree and must be retried after active jobs finish.
 
 Run `<root>/bin/local-worker summary` after the session's last job. It writes Markdown and JSON
 summaries, sends a best-effort notification, and reports job results, measured totals, screenshots,

@@ -87,7 +87,8 @@ See [the setup skill](skills/setup/SKILL.md) for override handling and the migra
    This applies even when integration is uncommitted; no commit or push is required. Verify
    the archived receipt, recovery ref, and bundle before moving on. Preserve unfinished jobs
    and their evidence, and report any worktree that could not be archived. Never-started jobs
-   without a worktree need no archive; retain their reports.
+   without a worktree need no archive; retain their reports. Archive only when no jobs are
+   active in the shared state: finish the queue first, or archive before starting the next job.
 
    **Summarize.** Run `<root>/bin/local-worker summary` when the session's jobs are complete. It
    writes Markdown and JSON summaries, sends a best-effort notification, and includes measured
