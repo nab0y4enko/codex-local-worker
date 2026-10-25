@@ -35,7 +35,8 @@ Follow these steps for each repository request:
 2. **Read job.** Create a `kind: "read"` contract with a question, `scope_paths`, an
    `answer_schema`, and an answer-size limit. The launcher validates the JSON answer and checks
    its citations against the worktree. Review the answer and the cited files before planning
-   edits.
+   edits. Start from [`examples/read-task.json`](../../examples/read-task.json); read contracts require `goal` and
+   do not accept `max_attempts`. Adjust the repository, existing scope paths, question and schema.
 3. **Plan, then write job.** Use a `kind: "write"` contract with a concrete goal,
    `acceptance_criteria`, `allowed_paths`, argv-array `test_commands`, and one total
    `timeout_seconds` budget. The nine-field [`examples/task.json`](../../examples/task.json)
@@ -119,3 +120,36 @@ After reviewing a worker patch, use `git apply --check --whitespace=fix <patch>`
 planner edits to worker results, including whitespace normalization, in the final report.
 Summary token totals exclude jobs with zero worker attempts; usage missing from a job that ran
 remains unavailable, never zero. Individual job rows retain never-started outcomes.
+
+### Review evidence and final usage
+
+Inspect `review_findings` in each job's JSON/report before accepting its patch. The launcher
+performs an advisory static review of changed Python test files for missing direct assertions.
+The worker receives the same self-check command. Inspect every finding: helper-based tests may
+be valid, and an empty diagnostic list does not prove correctness. For every language, verify
+that tests assert observable behavior or expected exceptions and that they would catch a broken
+implementation. Repair missing checks and rerun relevant tests; disclose planner edits.
+
+Read workers are given `src/source_citations.py` to obtain numbered source and ready-to-copy
+citation entries within the declared scope. Copy entries exactly rather than inventing line
+numbers or retyping quotes. This helper improves evidence capture; final path, range and quote
+validation remains mandatory, and an invalid read answer stays withheld. A read `ok` means
+those structural checks passed. Its `answer_evidence` explicitly requires semantic review and
+does not claim independent command verification. Check the claims against sources and verify
+any command before relying on it; absent source commands must be reported as not specified,
+and inferred suggestions must be labeled unverified.
+
+A summary generated inside an active planner turn is an explicitly labeled **snapshot**. Its
+planner usage and any linked child usage can still grow; local share remains unavailable until
+completion is evidenced. To refresh final usage without another model call, preserve the
+in-turn summary as evidence and run the same summary command from a shell after Codex exits:
+
+```sh
+CODEX_HOME=<planner-home> LOCAL_WORKER_STATE_DIR=<state> \
+  <root>/bin/local-worker summary --session <planner-thread-id>
+```
+
+The refreshed summary rereads cumulative rollout counts and labels them final only when the
+latest matching task-completion markers and usage are present for the planner and linked
+children. Missing measurements remain unavailable. Do not call an in-turn summary final or
+silently replace retained evidence.

@@ -55,7 +55,9 @@ See [the setup skill](skills/setup/SKILL.md) for override handling and the migra
 
 1. **Inspect.** Run doctor/preflight and use a read job when repository behavior needs evidence.
    Read jobs specify a question, allowed `scope_paths`, a JSON `answer_schema`, and a size limit;
-   the launcher validates the answer and citations.
+   the launcher validates the answer and citations. Start from [`examples/read-task.json`](examples/read-task.json);
+   set the repository, existing scope paths, question and answer schema. Read contracts require
+   `goal` and do not accept `max_attempts`.
 2. **Plan.** Split the request into small jobs with explicit acceptance criteria. Keep write-job
    `allowed_paths` narrow and non-overlapping. A job contract is JSON, and verification commands
    are argv arrays, never shell strings. The legacy nine-field write contract in
@@ -166,3 +168,36 @@ python3 -m unittest discover -s tests -v
 ```
 
 The suite uses local fixtures and fake model/tool responses; it does not require model inference.
+
+### Review evidence and final usage
+
+Inspect `review_findings` in each job's JSON/report before accepting its patch. The launcher
+performs an advisory static review of changed Python test files for missing direct assertions.
+The worker receives the same self-check command. Inspect every finding: helper-based tests may
+be valid, and an empty diagnostic list does not prove correctness. For every language, verify
+that tests assert observable behavior or expected exceptions and that they would catch a broken
+implementation. Repair missing checks and rerun relevant tests; disclose planner edits.
+
+Read workers are given `src/source_citations.py` to obtain numbered source and ready-to-copy
+citation entries within the declared scope. Copy entries exactly rather than inventing line
+numbers or retyping quotes. This helper improves evidence capture; final path, range and quote
+validation remains mandatory, and an invalid read answer stays withheld. A read `ok` means
+those structural checks passed. Its `answer_evidence` explicitly requires semantic review and
+does not claim independent command verification. Check the claims against sources and verify
+any command before relying on it; absent source commands must be reported as not specified,
+and inferred suggestions must be labeled unverified.
+
+A summary generated inside an active planner turn is an explicitly labeled **snapshot**. Its
+planner usage and any linked child usage can still grow; local share remains unavailable until
+completion is evidenced. To refresh final usage without another model call, preserve the
+in-turn summary as evidence and run the same summary command from a shell after Codex exits:
+
+```sh
+CODEX_HOME=<planner-home> LOCAL_WORKER_STATE_DIR=<state> \
+  <root>/bin/local-worker summary --session <planner-thread-id>
+```
+
+The refreshed summary rereads cumulative rollout counts and labels them final only when the
+latest matching task-completion markers and usage are present for the planner and linked
+children. Missing measurements remain unavailable. Do not call an in-turn summary final or
+silently replace retained evidence.
