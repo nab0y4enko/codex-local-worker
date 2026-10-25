@@ -5,6 +5,9 @@ results, reviewed fixes, recovery cleanup, and the deferred dashboard desktop ga
 
 Second model (`Qwen3.5-9B-OptiQ-4bit`) live results: [2026-10-25 second model](2026-10-25-second-model.md).
 
+End-to-end Codex CLI run (cloud planner delegating two jobs to local workers, with token totals and
+findings): [2026-10-25 e2e CLI](2026-10-25-e2e-cli.md).
+
 `test_live_qualification.py` is the opt-in, end-to-end suite for the installed launcher. It uses
 `bin/local-worker` for every local inference job and records one dated host report from actual
 launcher output. Offline unit tests remain under `tests/` and use `python3 -m unittest`.
