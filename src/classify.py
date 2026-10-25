@@ -93,8 +93,6 @@ def _pick(report: Dict[str, Any]) -> tuple:
         total, verified = citations.get("total"), citations.get("verified")
         if citations.get("failures") or (isinstance(total, int) and isinstance(verified, int) and verified < total):
             return "unverified_answer", ["citation verification failed (%s/%s verified)" % (verified, total)]
-    if status == "answer_invalid":
-        return "invalid_answer", ["launcher status=answer_invalid"]
     if isinstance(citations, dict) and citations.get("failures"):
         return "unverified_answer", ["launcher recorded failed citation verification"]
 
@@ -125,11 +123,12 @@ def _pick(report: Dict[str, Any]) -> tuple:
         return "verification_blocked", ["launcher status=verification_blocked"]
 
     attempts = [item for item in report.get("attempts", []) or [] if isinstance(item, dict)]
-    if any(item.get("interrupted") for item in attempts):
+    latest = attempts[-1] if attempts else {}
+    if latest.get("interrupted"):
         return "interrupted", ["attempt record marks interruption"]
-    if any(item.get("timed_out") for item in attempts):
+    if latest.get("timed_out"):
         return "budget_exhausted", ["attempt record marks timeout"]
-    if any(item.get("stalled") for item in attempts):
+    if latest.get("stalled"):
         return "stall", ["attempt record marks stalled"]
     texts = _texts(report)
     combined = " ".join(texts)
@@ -141,6 +140,8 @@ def _pick(report: Dict[str, Any]) -> tuple:
         return "server_unreachable", ["launcher error evidence reports connection refusal"]
     if "unsupported call" in combined:
         return "tool_unavailable", ["launcher error evidence reports unsupported call"]
+    if status == "answer_invalid":
+        return "invalid_answer", ["launcher status=answer_invalid"]
     if (status == "worker_failed" and attempts
             and isinstance(attempts[-1].get("returncode"), int)
             and attempts[-1]["returncode"] != 0):

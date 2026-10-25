@@ -229,6 +229,23 @@ class CaptureTests(unittest.TestCase):
         self.assertFalse(result[0]["uniform"])
         self.assertTrue(Path(result[0]["path"]).is_file())
         self.assertTrue(any("CONFIGURATION_BUILD_DIR=" in arg for call in calls for arg in call))
+        builds = [call for call in calls if "build" in call and "test" not in call]
+        tests = [call for call in calls if call[-1] == "test"]
+        self.assertTrue(builds and tests)
+        build_derived = Path(builds[0][builds[0].index("-derivedDataPath") + 1])
+        test_derived = Path(tests[0][tests[0].index("-derivedDataPath") + 1])
+        fresh_result = Path(tests[0][tests[0].index("-resultBundlePath") + 1])
+        self.assertEqual(test_derived, build_derived)
+        self.assertEqual(fresh_result, self.out.parent / "apple-scratch" / "capture-native" /
+                         "after" / "apple-scratch" / "Tests.xcresult")
+        installs = [call for call in calls if call[1:3] == ["simctl", "install"]]
+        launches = [call for call in calls if call[1:3] == ["simctl", "launch"]]
+        self.assertEqual(len(installs), 1)
+        self.assertEqual(installs[0][3], self.udid)
+        self.assertEqual(Path(installs[0][4]).parent,
+                         Path(next(arg.split("=", 1)[1] for arg in builds[0]
+                                   if arg.startswith("CONFIGURATION_BUILD_DIR="))))
+        self.assertEqual(launches[0][3:], [self.udid, "org.example.App"])
 
     def test_capture_source_reports_malformed_png_as_an_error(self):
         original_uniform = screenshots.png_is_uniform

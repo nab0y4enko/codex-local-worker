@@ -196,6 +196,7 @@ EXEC_HELP_FLAGS = ("-c, --config <key=value>", "--enable <FEATURE>", "--disable 
                    "-m, --model <MODEL>", "-s, --sandbox <SANDBOX_MODE>", "-C, --cd <DIR>",
                    "--skip-git-repo-check", "--ephemeral", "--ignore-user-config",
                    "--ignore-rules", "--output-schema <FILE>", "--color <COLOR>", "--json",
+                   "--strict-config",
                    "-o, --output-last-message <FILE>", "-h, --help", "-V, --version")
 CODEX_VERSION = "codex-cli 0.164.0"
 

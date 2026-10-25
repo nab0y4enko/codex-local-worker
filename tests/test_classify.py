@@ -18,6 +18,9 @@ CASES = [
     ({"status": "ok"}, ("ok", "done")),
     ({"status": "worker_failed", "attempts": [{"error_text": terminal_error("error", "unsupported call: apply_patch"), "returncode": 1}]}, ("tool_unavailable", "retry_local")),
     ({"status": "worker_failed", "attempts": [{"terminal_failures": ["turn.failed"], "error_text": terminal_error("turn.failed", "context length exceeded")}]}, ("context_overflow", "retry_local")),
+    ({"status": "answer_invalid", "kind": "read", "attempts": [{"returncode": 1,
+      "error_text": terminal_error("error", "Prompt is too long: 893958 tokens > maximum context length")} ]},
+     ("context_overflow", "retry_local")),
     ({"status": "worker_failed", "attempts": [{"stalled": True}]}, ("stall", "retry_local")),
     ({"status": "tests_failed", "attempts": [{}, {}], "max_attempts": 2}, ("tests_failed", "escalate_cloud")),
     ({"status": "audit_violation", "violations": [{"path": "x", "reason": "outside allowed_paths"}]}, ("out_of_scope", "escalate_cloud")),
@@ -38,6 +41,23 @@ class ClassifyTests(unittest.TestCase):
             with self.subTest(expected=expected):
                 result = classify.classify(report)
                 self.assertEqual((result.code, result.next_action), expected)
+
+    def test_recovered_historical_stall_does_not_override_success(self):
+        report = {"status": "ok", "budget": {"exceeded": False}, "attempts": [
+            {"stalled": True, "returncode": 1},
+            {"stalled": False, "timed_out": False, "returncode": 0},
+        ]}
+        result = classify.classify(report)
+        self.assertEqual((result.cls, result.code, result.next_action), ("none", "ok", "done"))
+
+    def test_historical_stall_does_not_mask_latest_capability_failure(self):
+        report = {"status": "tests_failed", "budget": {"exceeded": False}, "attempts": [
+            {"stalled": True, "returncode": 1},
+            {"stalled": False, "timed_out": False, "returncode": 0},
+        ], "tests": [{"status": "failed", "returncode": 1}]}
+        result = classify.classify(report)
+        self.assertEqual((result.cls, result.code, result.next_action),
+                         ("capability", "tests_failed", "escalate_cloud"))
 
     def test_server_crash_mid_attempt_is_environment(self):
         error = terminal_error("error", "error sending request: Connection refused (os error 61)")

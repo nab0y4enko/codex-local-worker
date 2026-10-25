@@ -17,6 +17,7 @@ import re
 import shutil
 from pathlib import Path
 from urllib.parse import urlsplit
+import permissions
 
 SCHEMA_VERSION = 1
 MAX_STARTUP_TIMEOUT_SEC = 120
@@ -334,6 +335,48 @@ def _overrides(parts):
     pairs.append(('%s.startup_timeout_sec' % key, parts['startup']))
     pairs.append(('%s.tool_timeout_sec' % key, parts['tool_timeout']))
     return [(item[0], toml_value(item[1])) for item in pairs]
+
+
+def wrap_stdio_commands(loaded, profile_path):
+    """Return a loaded tools config whose stdio servers run in a read-only Seatbelt profile."""
+    if not isinstance(loaded, dict):
+        raise ToolConfigError('loaded tools configuration must be a map')
+    copied = dict(loaded)
+    pairs = []
+    raw = list(loaded.get('overrides') or [])
+    index = 0
+    while index < len(raw):
+        if raw[index] == '-c' and index + 1 < len(raw) and '=' in str(raw[index + 1]):
+            key, _, value = str(raw[index + 1]).partition('=')
+            pairs.append((key, value))
+            index += 2
+        else:
+            index += 1
+    evidence = json.loads(json.dumps(loaded.get('evidence') or {}))
+    servers = evidence.get('servers') if isinstance(evidence, dict) else None
+    rewritten = dict(pairs)
+    for name, meta in (servers or {}).items():
+        if not isinstance(meta, dict) or meta.get('transport') != 'stdio':
+            if isinstance(meta, dict) and meta.get('transport') == 'http':
+                meta['process_wrapper'] = 'not applicable; remote HTTP transport is explicitly trusted by the task manifest'
+            continue
+        prefix = 'mcp_servers.%s' % toml_key(name)
+        command_key, args_key = prefix + '.command', prefix + '.args'
+        try:
+            command = json.loads(rewritten[command_key])
+            args = json.loads(rewritten.get(args_key, '[]'))
+        except (KeyError, ValueError, TypeError):
+            raise ToolConfigError("stdio server '%s' could not be safely wrapped" % name) from None
+        if not isinstance(command, str) or not command or not isinstance(args, list) \
+                or any(not isinstance(item, str) for item in args):
+            raise ToolConfigError("stdio server '%s' has an invalid command for wrapping" % name)
+        rewritten[command_key] = toml_value(permissions.SANDBOX_EXEC)
+        rewritten[args_key] = toml_value(['-f', str(profile_path), command, *args])
+        meta['process_wrapper'] = 'macOS Seatbelt read-only MCP profile'
+    copied['overrides'] = [item for key, value in rewritten.items()
+                           for item in ('-c', key + '=' + value)]
+    copied['evidence'] = evidence
+    return copied
 
 
 def _meta(parts):

@@ -73,18 +73,33 @@ class ReadJobTests(unittest.TestCase):
         self.assertEqual(report["status"], "answer_invalid")
         self.assertNotIn("answer", report)
         worker = run.calls_of("exec")[0]["argv"]
-        self.assertEqual(worker[worker.index("-s") + 1], "read-only")
-        self.assertIn('sandbox_mode="read-only"', worker)
+        self.assertNotIn("-s", worker)
+        self.assertIn("--strict-config", worker)
+        overrides = lw.config_overrides_map(worker)
+        self.assertEqual(overrides["default_permissions"], json.dumps(lw.READ_PERMISSION_PROFILE))
+        self.assertNotIn("sandbox_mode", overrides)
         self.assertIn("--output-schema", worker)
         schema_path = Path(worker[worker.index("--output-schema") + 1])
         self.assertTrue(schema_path.is_file())
         self.assertEqual(run.verification_calls(), [])
+
+    def test_read_prompt_requests_textual_file_access_before_answering(self):
+        task = contract.Contract.from_payload(self.payload())
+        prompt = lw._read_prompt(task, self.repo)
+        self.assertIn("Start with cat on the listed paths", prompt)
+        self.assertIn("Cite only lines read from the current worktree", prompt)
+        self.assertIn('"citations"', prompt)
+        self.assertIn('"answer"', prompt)
 
     def test_valid_read_job_returns_answer_without_a_patch(self):
         report, run = self.run_read_job()
         self.assertEqual(report["status"], "ok")
         self.assertEqual(report["answer"], {"summary": "add currently subtracts"})
         self.assertFalse(report["worker_patch_present"])
+        argv = run.calls_of("exec")[0]["argv"]
+        self.assertNotIn("-s", argv)
+        self.assertIn("--strict-config", argv)
+        self.assertIn("--output-schema", argv)
         self.assertEqual(run.verification_calls(), [])
 
     def test_oversized_answer_is_not_released(self):

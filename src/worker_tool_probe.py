@@ -18,6 +18,7 @@ from pathlib import Path
 
 import worker_observability as observability
 import worker_tools as tools
+import permissions
 
 __all__ = ["ToolProbeError", "probe_tools"]
 
@@ -43,7 +44,8 @@ class ToolProbeError(ValueError):
     """
 
 
-def probe_tools(loaded, *, codex_bin, env, overrides, deadline, codex_home):
+def probe_tools(loaded, *, codex_bin, env, overrides, deadline, codex_home,
+                process_profile_path=None):
     """Return a copy of ``loaded['evidence']`` with every selected server marked probed.
 
     ``overrides`` is the launcher's own ``config_overrides(profile, context_window, catalog)``
@@ -66,7 +68,7 @@ def probe_tools(loaded, *, codex_bin, env, overrides, deadline, codex_home):
     home = Path(codex_home)
     if not home.is_dir():
         raise ToolProbeError("the job Codex home for the tool probe does not exist")
-    process = _spawn(codex_bin, overrides, loaded, env, str(home))
+    process = _spawn(codex_bin, overrides, loaded, env, str(home), process_profile_path)
     try:
         discovered = _Session(process, budget).exchange(names)
     finally:
@@ -125,7 +127,7 @@ def _budget(deadline, servers, names):
     return budget
 
 
-def _spawn(codex_bin, overrides, loaded, env, home):
+def _spawn(codex_bin, overrides, loaded, env, home, process_profile_path=None):
     """Start the app-server in its own process group, with the job's CODEX_HOME as home and cwd.
 
     The user's Codex home is never used: ``home`` is the job's own, the same one the worker runs
@@ -135,6 +137,8 @@ def _spawn(codex_bin, overrides, loaded, env, home):
     argv.extend(str(item) for item in (overrides or []))
     argv.extend(["-c", "mcp_servers={}"])
     argv.extend(str(item) for item in (loaded.get("overrides") or []))
+    if process_profile_path is not None:
+        argv = permissions.wrap_argv(argv, Path(process_profile_path))
     probe_env = dict(env) if isinstance(env, dict) else dict(os.environ)
     probe_env.pop(MODEL_KEY_ENV, None)
     probe_env["CODEX_HOME"] = home

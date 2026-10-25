@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -135,6 +136,18 @@ class FakeAppServer(unittest.TestCase):
                 return json.loads(self.log.read_text(encoding="utf-8"))
             time.sleep(0.02)
         self.fail("the fake app-server never recorded a request")
+
+    def test_read_profile_wraps_app_server_process(self):
+        profile = self.report / "mcp.sb"
+        profile.write_text("(version 1)\n(allow default)\n(deny file-write*)\n",
+                           encoding="utf-8")
+        fake_process = mock.Mock()
+        with mock.patch.object(probe.subprocess, "Popen", return_value=fake_process) as popen:
+            probe._spawn("/usr/bin/codex", [], {"overrides": []},
+                         {"CODEX_HOME": str(self.home)}, str(self.home), profile)
+        command = popen.call_args.args[0]
+        self.assertEqual(command[:3], ["/usr/bin/sandbox-exec", "-f", str(profile)])
+        self.assertEqual(command[3:6], ["/usr/bin/codex", "app-server", "--listen"])
 
     def assert_probe_group_gone(self):
         """The whole probe session, group included, must not survive a refusal."""

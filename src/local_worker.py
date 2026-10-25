@@ -232,7 +232,7 @@ REQUIRED_WORKER_FLAGS = ("--ignore-user-config", "--ignore-rules", "--json", "--
 # relies on; ``codex_compat`` checks both before any job (or preflight) proceeds.
 MIN_CODEX_VERSION = (0, 164, 0)
 CODEX_REQUIRED_FLAGS = ("--ephemeral", "--output-schema", "--ignore-user-config",
-                        "--ignore-rules", "--json")
+                        "--ignore-rules", "--json", "--strict-config")
 CODEX_COMPAT_TIMEOUT_SECONDS = 30.0
 # Each job's Codex home is this directory inside its report directory. It is the worker's own
 # writable home, so the generated model catalog (``-c model_catalog_json``) is kept beside it in
@@ -243,6 +243,7 @@ CATALOG_PIN_KEY = "model_catalog_json"
 SANDBOX_FLAGS = ("-s", "--sandbox")
 MODEL_FLAGS = ("-m", "--model")
 REQUIRED_SANDBOX_MODE = "danger-full-access"
+READ_PERMISSION_PROFILE = "local_worker_readonly"
 # Never let the local key, or any credential that leaked into the worker env, reach a
 # model-generated shell command.
 SHELL_ENV_EXCLUDES = (
@@ -1590,7 +1591,7 @@ def catalog_pin(catalog_path: Path) -> str:
 
 def config_overrides(profile: omlx_discovery.ServerProfile, context_window: int,
                      catalog_path: Optional[Path] = None,
-                     sandbox_mode: str = REQUIRED_SANDBOX_MODE) -> List[str]:
+                     sandbox_mode: Optional[str] = REQUIRED_SANDBOX_MODE) -> List[str]:
     """Explicit local provider/model overrides for the job's discovered model; the user's
     config is never loaded. ``catalog_path`` is the job's generated model catalog: when given,
     ``model_catalog_json`` points Codex at it, so the model runs on its own metadata instead of
@@ -1610,13 +1611,14 @@ def config_overrides(profile: omlx_discovery.ServerProfile, context_window: int,
         (f"{provider}.request_max_retries", "0"),
         (f"{provider}.stream_max_retries", "0"),
         # Unattended and local only: no approvals, no web search, bounded context, and the
-        # full-host access that -s selects (pinned so config drift cannot silently change it).
+        # selected permission mode pinned so config drift cannot silently change it.
         ("approval_policy", '"never"'),
         ("web_search", '"disabled"'),
-        ("sandbox_mode", json.dumps(sandbox_mode)),
         ("model_context_window", pins["model_context_window"]),
         ("model_auto_compact_token_limit", pins["model_auto_compact_token_limit"]),
     ]
+    if sandbox_mode is not None:
+        settings.append(("sandbox_mode", json.dumps(sandbox_mode)))
     if catalog_path is not None:
         settings.append((CATALOG_PIN_KEY, catalog_pin(catalog_path)))
     for key, value in sorted(FEATURE_FLAGS.items()):
@@ -1686,6 +1688,62 @@ def config_overrides_map(argv: Sequence[str]) -> Dict[str, str]:
     return dict(config_override_pairs(argv))
 
 
+def _toml_inline_table(values: Dict[str, str]) -> str:
+    """Serialize a flat TOML table whose keys and values are strings."""
+    members = [json.dumps(key, ensure_ascii=False) + " = " +
+               json.dumps(value, ensure_ascii=False)
+               for key, value in sorted(values.items())]
+    return "{ " + ", ".join(members) + " }"
+
+
+def native_read_profile_overrides(perms: permissions.Permissions, state_dir: Path,
+                                  worktree: Path,
+                                  extra_deny_read: Sequence[Path] = ()) -> List[Tuple[str, str]]:
+    """Codex-native read-only profile plus the job's read denials.
+
+    Codex cannot initialize a second macOS Seatbelt sandbox inside Local Worker's outer
+    ``sandbox-exec`` process. Read jobs therefore use one Codex-native ``:read-only`` profile:
+    the complete launcher state is unreadable to model tools except the current task worktree,
+    and user-configured secret paths stay denied. The outer deny profile remains available for
+    separately spawned MCP helpers.
+    """
+    def real(path: Path) -> str:
+        return str(Path(path).expanduser().resolve())
+
+    state = real(Path(state_dir))
+    tree = real(Path(worktree))
+    filesystem: Dict[str, str] = {state: "deny"}
+    for raw in [*perms.deny_read, *extra_deny_read]:
+        path = real(Path(os.path.expanduser(str(raw))))
+        if path == tree or tree.startswith(path.rstrip(os.sep) + os.sep):
+            raise BlockedError("read permission profile cannot deny a path containing its task worktree")
+        filesystem[path] = "deny"
+    filesystem[tree] = "read"
+    prefix = "permissions." + READ_PERMISSION_PROFILE
+    return [
+        ("default_permissions", json.dumps(READ_PERMISSION_PROFILE)),
+        (prefix + ".extends", json.dumps(":read-only")),
+        (prefix + ".filesystem", _toml_inline_table(filesystem)),
+    ]
+
+
+def read_stdio_profile(report_dir: Path, wrapper: DenyWrapper,
+                       cloud_home: Optional[Path] = None) -> Optional[Path]:
+    """Create an outer profile for MCP helpers; Codex's native profile protects model tools."""
+    if not wrapper.applied or wrapper.profile is None:
+        return None
+    text = wrapper.profile.read_text(encoding="utf-8")
+    # Stdio MCP processes are not governed by Codex's native permission profile. Reapply the
+    # launcher's deny profile to them, then make the helper tier strictly read-only. In cloud
+    # mode the parent Codex process may read auth for native authentication; helpers may not.
+    if cloud_home is not None:
+        text += "(deny file-read* (subpath " + json.dumps(str(cloud_home.resolve())) + "))\n"
+    text += "(deny file-write*)\n"
+    path = report_dir / "mcp-stdio-readonly.sb"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
 def flag_values(argv: Sequence[str], flag: str) -> List[str]:
     """Every value given for *flag* (``-s X`` or ``-s=X``), in argv order."""
     values: List[str] = []
@@ -1733,17 +1791,21 @@ def shell_env_excludes(value: Optional[str]) -> List[str]:
 
 def expected_config_pins(profile: omlx_discovery.ServerProfile,
                          context_window: int,
-                         sandbox_mode: str = REQUIRED_SANDBOX_MODE) -> Dict[str, str]:
+                         sandbox_mode: Optional[str] = REQUIRED_SANDBOX_MODE,
+                         permission_config: Sequence[Tuple[str, str]] = ()) -> Dict[str, str]:
     """The full pinned ``-c`` policy, derived from the single place that builds it."""
-    return config_overrides_map(config_overrides(profile, context_window,
-                                                 sandbox_mode=sandbox_mode))
+    return {**config_overrides_map(config_overrides(profile, context_window,
+                                                    sandbox_mode=sandbox_mode)),
+            **{key: value for key, value in permission_config}}
 
 
 def missing_config_pins(argv: Sequence[str], profile: omlx_discovery.ServerProfile,
                         context_window: int,
                         catalog: Optional[Tuple[Path, str]] = None,
-                        sandbox_mode: str = REQUIRED_SANDBOX_MODE,
-                        output_schema: Optional[Path] = None) -> List[str]:
+                        sandbox_mode: Optional[str] = REQUIRED_SANDBOX_MODE,
+                        output_schema: Optional[Path] = None,
+                        permission_config: Sequence[Tuple[str, str]] = (),
+                        strict_config: bool = False) -> List[str]:
     """Self-check before launching: any drift from the pinned local policy is a refusal.
 
     ``--ignore-user-config`` means the argv *is* the whole policy, so routing flags and every
@@ -1762,11 +1824,14 @@ def missing_config_pins(argv: Sequence[str], profile: omlx_discovery.ServerProfi
     pairs = config_override_pairs(argv)
     overrides = dict(pairs)
     problems: List[str] = []
-    pinned = expected_config_pins(profile, context_window, sandbox_mode=sandbox_mode)
+    pinned = expected_config_pins(profile, context_window, sandbox_mode=sandbox_mode,
+                                  permission_config=permission_config)
     # The documented floor stays required on its own: deleting a pin from config_overrides()
     # must not silently delete the requirement for it.
-    for key, expected in {**CONFIG_PINS, **SKILL_PINS,
-                          **policy_pins(profile, context_window)}.items():
+    required_pins = {**CONFIG_PINS, **SKILL_PINS, **policy_pins(profile, context_window)}
+    if sandbox_mode is None:
+        required_pins.pop("sandbox_mode", None)
+    for key, expected in required_pins.items():
         pinned.setdefault(key, expected)
     if catalog is not None:
         catalog_path, catalog_sha = catalog
@@ -1809,7 +1874,15 @@ def missing_config_pins(argv: Sequence[str], profile: omlx_discovery.ServerProfi
     for flag in REQUIRED_WORKER_FLAGS:
         if flag not in argv:
             problems.append(f"{flag} is missing")
-    problems.extend(_single_valued_flag(argv, SANDBOX_FLAGS, sandbox_mode))
+    if sandbox_mode is None:
+        if any(flag_values(argv, flag) for flag in SANDBOX_FLAGS):
+            problems.append("read profile argv must not combine sandbox_mode with default_permissions")
+    else:
+        problems.extend(_single_valued_flag(argv, SANDBOX_FLAGS, sandbox_mode))
+    if strict_config and argv.count("--strict-config") != 1:
+        problems.append("--strict-config must appear exactly once")
+    if not strict_config and "--strict-config" in argv:
+        problems.append("--strict-config is not allowed for this worker mode")
     problems.extend(_single_valued_flag(argv, MODEL_FLAGS, alias))
     if output_schema is not None:
         if argv.count("--output-schema") != 1:
@@ -1832,21 +1905,28 @@ def worker_argv(codex_bin: str, worktree: Path, profile: omlx_discovery.ServerPr
                 tool_overrides: Sequence[str] = (),
                 shell_excludes: Sequence[str] = (),
                 catalog_path: Optional[Path] = None,
-                sandbox_mode: str = REQUIRED_SANDBOX_MODE,
-                output_schema: Optional[Path] = None) -> List[str]:
+                sandbox_mode: Optional[str] = REQUIRED_SANDBOX_MODE,
+                output_schema: Optional[Path] = None,
+                permission_config: Sequence[Tuple[str, str]] = (),
+                strict_config: bool = False) -> List[str]:
     """The whole worker command for the job's pinned ``profile`` and ``context_window``."""
     argv = [
         codex_bin, "exec",
         "--ignore-user-config",
         "--ignore-rules",
         "-C", str(worktree),
-        "-s", sandbox_mode,
         "--json",
         "--ephemeral",
         "-o", str(last_message),
         "-m", profile.model.api_model,
         *config_overrides(profile, context_window, catalog_path, sandbox_mode=sandbox_mode),
     ]
+    if sandbox_mode is not None:
+        argv[argv.index("--json"):argv.index("--json")] = ["-s", sandbox_mode]
+    for key, value in permission_config:
+        argv.extend(["-c", f"{key}={value}"])
+    if strict_config:
+        argv.append("--strict-config")
     argv = with_shell_env_excludes(argv, shell_excludes)
     argv.extend(str(item) for item in tool_overrides)
     if output_schema is not None:
@@ -1859,14 +1939,22 @@ def cloud_worker_argv(codex_bin: str, worktree: Path, model: str,
                       reasoning_effort: Optional[str], last_message: Path,
                       tool_overrides: Sequence[str] = (),
                       shell_excludes: Sequence[str] = (),
-                      sandbox_mode: str = REQUIRED_SANDBOX_MODE,
-                      output_schema: Optional[Path] = None) -> List[str]:
+                      sandbox_mode: Optional[str] = REQUIRED_SANDBOX_MODE,
+                      output_schema: Optional[Path] = None,
+                      permission_config: Sequence[Tuple[str, str]] = (),
+                      strict_config: bool = False) -> List[str]:
     """Cloud invocation with no local provider or endpoint overrides."""
     argv = [codex_bin, "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral",
-            "--json", "-C", str(worktree), "-s", sandbox_mode, "-o", str(last_message),
-            "-m", model]
+            "--json", "-C", str(worktree)]
+    if sandbox_mode is not None:
+        argv.extend(["-s", sandbox_mode])
+    argv.extend(["-o", str(last_message), "-m", model])
     if reasoning_effort is not None:
         argv.extend(["-c", "model_reasoning_effort=" + json.dumps(reasoning_effort)])
+    for key, value in permission_config:
+        argv.extend(["-c", f"{key}={value}"])
+    if strict_config:
+        argv.append("--strict-config")
     argv = with_shell_env_excludes(argv, shell_excludes)
     argv.extend(str(item) for item in tool_overrides)
     if output_schema is not None:
@@ -1876,15 +1964,23 @@ def cloud_worker_argv(codex_bin: str, worktree: Path, model: str,
 
 
 def cloud_policy_check(argv: Sequence[str], model: str, reasoning_effort: Optional[str],
-                       sandbox_mode: str = REQUIRED_SANDBOX_MODE) -> List[str]:
+                       sandbox_mode: Optional[str] = REQUIRED_SANDBOX_MODE,
+                       output_schema: Optional[Path] = None,
+                       permission_config: Sequence[Tuple[str, str]] = (),
+                       strict_config: bool = False) -> List[str]:
     """Return cloud argv drift, including any accidental local routing pins."""
     problems = []
     for flag in ("--ignore-user-config", "--ignore-rules", "--ephemeral", "--json"):
         if list(argv).count(flag) != 1:
             problems.append(flag + " must appear exactly once")
-    problems.extend(_single_valued_flag(argv, SANDBOX_FLAGS, sandbox_mode))
+    if sandbox_mode is None:
+        if any(flag_values(argv, flag) for flag in SANDBOX_FLAGS):
+            problems.append("read profile argv must not combine sandbox_mode with default_permissions")
+    else:
+        problems.extend(_single_valued_flag(argv, SANDBOX_FLAGS, sandbox_mode))
     problems.extend(_single_valued_flag(argv, MODEL_FLAGS, model))
     overrides = config_override_pairs(argv)
+    override_map = dict(overrides)
     for key, value in overrides:
         if key.startswith("model_provider") or key.startswith("model_providers."):
             problems.append("cloud argv must not override local provider setting " + key)
@@ -1894,6 +1990,19 @@ def cloud_policy_check(argv: Sequence[str], model: str, reasoning_effort: Option
                 problems.append("model_reasoning_effort must be " + expected)
     if reasoning_effort is not None and "model_reasoning_effort" not in dict(overrides):
         problems.append("model_reasoning_effort is missing")
+    for key, value in permission_config:
+        if override_map.get(key) != value:
+            problems.append(f"{key}={value} is missing or changed")
+    if strict_config and argv.count("--strict-config") != 1:
+        problems.append("--strict-config must appear exactly once")
+    if not strict_config and "--strict-config" in argv:
+        problems.append("--strict-config is not allowed for this worker mode")
+    if output_schema is not None:
+        if argv.count("--output-schema") != 1:
+            problems.append("--output-schema must appear exactly once")
+        elif argv[argv.index("--output-schema") + 1:
+                  argv.index("--output-schema") + 2] != [str(output_schema)]:
+            problems.append("--output-schema must name the generated answer schema")
     return problems
 
 
@@ -1906,15 +2015,19 @@ def worker_argv_for_tier(options: JobOptions, worktree: Path,
                          last_message: Path, tool_overrides: Sequence[str] = (),
                          shell_excludes: Sequence[str] = (),
                          catalog_path: Optional[Path] = None,
-                         sandbox_mode: str = REQUIRED_SANDBOX_MODE,
-                         output_schema: Optional[Path] = None) -> List[str]:
+                         sandbox_mode: Optional[str] = REQUIRED_SANDBOX_MODE,
+                         output_schema: Optional[Path] = None,
+                         permission_config: Sequence[Tuple[str, str]] = (),
+                         strict_config: bool = False) -> List[str]:
     if options.task.tier.kind == "cloud":
         return cloud_worker_argv(options.codex_bin, worktree, options.task.tier.model or "",
             options.task.tier.reasoning_effort, last_message, tool_overrides, shell_excludes,
-            sandbox_mode=sandbox_mode, output_schema=output_schema)
+            sandbox_mode=sandbox_mode, output_schema=output_schema,
+            permission_config=permission_config, strict_config=strict_config)
     return worker_argv(options.codex_bin, worktree, profile, context_window, last_message,
         tool_overrides, shell_excludes, catalog_path, sandbox_mode=sandbox_mode,
-        output_schema=output_schema)
+        output_schema=output_schema, permission_config=permission_config,
+        strict_config=strict_config)
 
 
 def cloud_worker_env(codex_home: Path, environment_pass: Sequence[str] = ()) -> Tuple[Dict[str, str], List[str], List[str]]:
@@ -2740,11 +2853,15 @@ def ensure_report_dir(options: JobOptions, report: Dict[str, Any]) -> Optional[P
 
 def _policy_check(argv: Sequence[str], profile: omlx_discovery.ServerProfile,
                   context_window: int, catalog: Optional[Tuple[Path, str]] = None,
-                  sandbox_mode: str = REQUIRED_SANDBOX_MODE,
-                  output_schema: Optional[Path] = None) -> None:
+                  sandbox_mode: Optional[str] = REQUIRED_SANDBOX_MODE,
+                  output_schema: Optional[Path] = None,
+                  permission_config: Sequence[Tuple[str, str]] = (),
+                  strict_config: bool = False) -> None:
     """Refuse to launch a worker whose pinned local policy drifted in any way."""
     problems = missing_config_pins(argv, profile, context_window, catalog,
-                                   sandbox_mode=sandbox_mode, output_schema=output_schema)
+                                   sandbox_mode=sandbox_mode, output_schema=output_schema,
+                                   permission_config=permission_config,
+                                   strict_config=strict_config)
     if problems:
         raise BlockedError("worker policy self-check refused the launch: " + "; ".join(problems))
 
@@ -2794,8 +2911,11 @@ def _read_prompt(task: Task, worktree: Path) -> str:
     return "\n".join([
         f"Read task {task.task_id} (base commit {task.base_ref}).",
         "Answer the question using only the current worktree. Do not modify any files.",
-        "Return the answer as JSON matching the supplied output schema, with citations that "
-        "quote the cited source lines exactly apart from whitespace normalization.",
+        "Start with cat on the listed paths and read each scoped source file as text before answering. "
+        "Cite only lines read from the current worktree.",
+        "Return JSON matching this schema. Include at least one citation and quote the cited "
+        "source lines exactly apart from whitespace normalization.",
+        json.dumps(read_answers.envelope_schema(task.answer_schema or {}), sort_keys=True),
         "Question:", task.question or "",
         "Scope paths:", *["- " + path for path in task.scope_paths],
         "Worktree:", str(worktree),
@@ -2807,7 +2927,8 @@ def _execute_read_job(options: JobOptions, report: Dict[str, Any], deadline: Dea
                       worktree: Path, report_dir: Path, env: Dict[str, str],
                       loaded: Dict[str, Any], catalog_path: Path,
                       catalog: Optional[Tuple[Path, str]], wrapper: DenyWrapper,
-                      secrets: Sequence[str], stream: Any) -> None:
+                      secrets: Sequence[str], stream: Any,
+                      permission_config: Sequence[Tuple[str, str]]) -> None:
     """Run one structured, read-only turn and release only schema/citation checked data."""
     task = options.task
     schema_path = report_dir / "answer.schema.json"
@@ -2826,17 +2947,23 @@ def _execute_read_job(options: JobOptions, report: Dict[str, Any], deadline: Dea
     jsonl_path = report_dir / "worker-attempt-1.jsonl"
     prompt = _read_prompt(task, worktree)
     prompt_path.write_text(redact(prompt, secrets), encoding="utf-8")
+    # Keep Codex's native response-format contract for local and cloud reads. The launcher
+    # independently validates the envelope and every citation before releasing an answer.
+    output_schema = schema_path
     argv = worker_argv_for_tier(options, worktree, profile, context_window, last_path,
                                 loaded["overrides"], list(loaded["environment"]), catalog_path,
-                                sandbox_mode="read-only", output_schema=schema_path)
+                                sandbox_mode=None, output_schema=output_schema,
+                                permission_config=permission_config, strict_config=True)
     if task.tier.kind == "cloud":
         problems = cloud_policy_check(argv, task.tier.model or "", task.tier.reasoning_effort,
-                                      sandbox_mode="read-only")
+                                      sandbox_mode=None, output_schema=output_schema,
+                                      permission_config=permission_config, strict_config=True)
         if problems:
             raise BlockedError("cloud worker policy self-check refused the launch: " + "; ".join(problems))
     else:
         _policy_check(argv, profile, context_window, catalog,
-                      sandbox_mode="read-only", output_schema=schema_path)
+                      sandbox_mode=None, output_schema=output_schema,
+                      permission_config=permission_config, strict_config=True)
     if stream is not None:
         stream.start_attempt(report["job_id"])
     report["_active_attempt"] = {"before_patch": ""}
@@ -2849,7 +2976,7 @@ def _execute_read_job(options: JobOptions, report: Dict[str, Any], deadline: Dea
     timeout = deadline.cap(remaining)
     try:
         result = run_bounded(
-            wrapper.wrap(argv), cwd=worktree, env=env, timeout=timeout,
+            argv, cwd=worktree, env=env, timeout=timeout,
             stdin_data=prompt.encode("utf-8"), stall_seconds=stall["seconds"],
             on_stall=(None if task.tier.kind == "cloud" else
                 lambda: server_busy(options.settings_path, options.omlx_fetch,
@@ -2924,6 +3051,15 @@ def _execute_read_job(options: JobOptions, report: Dict[str, Any], deadline: Dea
     report["citations"] = []
     report["citation_verification"] = {"total": 0, "verified": 0, "failures": []}
     errors: List[str] = []
+    read_audit = audit_worktree(worktree, str(report.get("base_commit") or task.base_ref),
+                                [], secrets, scratch_dir=report_dir,
+                                git_layout=report.get("_git_layout"),
+                                git_admin_before=report.get("_git_admin_before"))
+    report["read_audit"] = {"changed_paths": read_audit.changed_paths,
+                            "violations": read_audit.violations,
+                            "no_changes_required": True}
+    if read_audit.changed_paths or read_audit.violations:
+        errors.append("the read worker changed the task worktree; the answer was withheld")
     if report["answer_bytes"] > task.max_answer_bytes:
         errors.append("answer exceeds max_answer_bytes (%d > %d)" %
                       (report["answer_bytes"], task.max_answer_bytes))
@@ -3435,6 +3571,39 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     credentials = set(selected) | set(loaded["environment"])
     verify_env = {name: value for name, value in env.items()
                   if name != API_KEY_ENV and name not in credentials}
+    # Prepare the outer deny profile before the tool probe. Read-tier model tools use Codex's
+    # native read-only profile; each stdio MCP helper and its preflight app-server retain this
+    # independently proven outer profile.
+    wrapper = setup_deny_wrapper(options, report, perms, report_dir, worktree, codex_home,
+                                 git_layout, verify_env, secrets, deadline)
+    cloud_source_home = Path(report["cloud_auth"]["source_home"]) if report.get("cloud_auth") else None
+    mcp_profile = read_stdio_profile(report_dir, wrapper, cloud_source_home) \
+        if task.kind == "read" else None
+    read_permission_config: List[Tuple[str, str]] = []
+    if task.kind == "read":
+        has_stdio_mcp = any(isinstance(meta, dict) and meta.get("transport") == "stdio"
+                            for meta in (loaded.get("evidence", {}).get("servers", {}) or {}).values())
+        if has_stdio_mcp and mcp_profile is None:
+            raise BlockedError("read-only stdio MCP helpers require the proven outer deny profile")
+        read_permission_config = native_read_profile_overrides(
+            perms, state_dir, worktree,
+            extra_deny_read=([cloud_source_home] if cloud_source_home else ()))
+        stdio_profile_used = bool(has_stdio_mcp and mcp_profile and wrapper.applied)
+        report["permissions"].update(
+            native_read_profile_applied=True,
+            native_read_profile_name=READ_PERMISSION_PROFILE,
+            native_read_profile_scope="Codex model tools only: read-only task worktree; launcher state, configured secret paths, and cloud CODEX_HOME denied",
+            deny_list_scope=("setup and probe subprocesses plus stdio MCP helpers; the Codex read worker is governed by the native profile"),
+            mcp_stdio_profile=str(mcp_profile) if mcp_profile else None,
+            mcp_stdio_profile_sha256=(hashlib.sha256(mcp_profile.read_bytes()).hexdigest()
+                                      if mcp_profile else None),
+            mcp_stdio_profile_applied=stdio_profile_used)
+        if isinstance(loaded.get("evidence"), dict):
+            loaded["evidence"]["read_profile"] = {
+                "codex_native_profile": READ_PERMISSION_PROFILE,
+                "stdio_mcp_profile_applied": stdio_profile_used,
+                "http_transport_trust": "remote HTTP MCP endpoints are trusted by explicit task manifest",
+            }
     # Required tools are confirmed before any inference, with the installed Codex MCP client and
     # no model turn: the probe sends only initialize, initialized and mcpServerStatus/list. A
     # server that cannot list a configured tool blocks the job instead of spending tokens on a
@@ -3447,13 +3616,14 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
                 overrides=(cloud_config_overrides(task.tier.reasoning_effort) if is_cloud else
                     config_overrides(profile, context_window, catalog_path,
                     sandbox_mode="read-only" if task.kind == "read" else REQUIRED_SANDBOX_MODE)),
-                deadline=deadline, codex_home=codex_home)
+                deadline=deadline, codex_home=codex_home,
+                process_profile_path=(mcp_profile if task.kind == "read" else None))
         except ToolProbeError as error:
             raise BlockedError(f"required MCP tools could not be probed: {error}") from error
     else:
         report["tooling"] = {"status": "not used by capture-only job"}
-    # Self-check the pinned policy before the first subprocess: drift is a refusal, not a
-    # degraded run. Read jobs add Codex's read-only sandbox and generated output schema.
+    # Self-check the pinned policy before the worker: drift is a refusal, not a degraded run.
+    # Read jobs use a strict Codex-native profile rather than nesting macOS Seatbelt sandboxes.
     if task.kind == "read":
         read_schema_path = report_dir / "answer.schema.json"
         read_schema_path.write_text(json.dumps(
@@ -3462,16 +3632,21 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         read_argv = worker_argv_for_tier(
             options, worktree, profile, context_window,
             report_dir / "policy-check.last-message.txt", loaded["overrides"],
-            list(loaded["environment"]), catalog_path, sandbox_mode="read-only",
-            output_schema=read_schema_path)
+            list(loaded["environment"]), catalog_path, sandbox_mode=None,
+            output_schema=read_schema_path, permission_config=read_permission_config,
+            strict_config=True)
         if is_cloud:
             problems = cloud_policy_check(read_argv, task.tier.model or "",
-                                          task.tier.reasoning_effort, sandbox_mode="read-only")
+                                          task.tier.reasoning_effort, sandbox_mode=None,
+                                          output_schema=read_schema_path,
+                                          permission_config=read_permission_config,
+                                          strict_config=True)
             if problems:
                 raise BlockedError("cloud worker policy self-check refused the launch: " + "; ".join(problems))
         else:
             _policy_check(read_argv, profile, context_window, catalog,
-                          sandbox_mode="read-only", output_schema=read_schema_path)
+                          sandbox_mode=None, output_schema=read_schema_path,
+                          permission_config=read_permission_config, strict_config=True)
     elif task.kind == "capture":
         pass
     else:
@@ -3486,9 +3661,8 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         else:
             _policy_check(argv, profile, context_window, catalog)
     # Every process that runs model-influenced code from here on (the worker, each check, each
-    # native step) runs behind the job's deny wrapper; the self-check above saw the inner argv.
-    wrapper = setup_deny_wrapper(options, report, perms, report_dir, worktree, codex_home,
-                                 git_layout, verify_env, secrets, deadline)
+    # native step) runs behind the job's deny wrapper, except read workers, which are protected
+    # by the native profile self-checked above.
     sandbox = probe_sandbox(options.codex_bin, worktree, verify_env, secrets, deadline)
     if not options.verify:
         sandbox = dict(sandbox)
@@ -3498,6 +3672,13 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         sandbox = _apple_opt_in(options, report, report_dir, worktree, sandbox, verify_env,
                                 secrets, deadline)
     sandbox = dict(sandbox, deny_list_applied=wrapper.applied)
+    if task.kind == "read":
+        sandbox.update(deny_list_applied=False,
+                       native_read_profile_applied=True,
+                       native_read_profile_name=READ_PERMISSION_PROFILE,
+                       stdio_mcp_profile_applied=bool(report["permissions"].get(
+                           "mcp_stdio_profile_applied")),
+                       codex_worker_process_wrapped=False)
     if wrapper.applied and sandbox.get("backend") == FULL_HOST_BACKEND:
         sandbox["confinement"] = FULL_HOST_DENY_CONFINEMENT
     report["sandbox"] = sandbox
@@ -3507,9 +3688,12 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
             raise BlockedError("read jobs cannot opt into native build or simulator execution")
         sandbox["verification"] = "not run for read jobs"
         report["sandbox"] = sandbox
+        if mcp_profile is not None:
+            loaded = tools.wrap_stdio_commands(loaded, mcp_profile)
+            report["tooling"] = loaded.get("evidence", report.get("tooling"))
         _execute_read_job(options, report, deadline, profile, context_window, worktree,
                           report_dir, env, loaded, catalog_path, catalog, wrapper, secrets,
-                          report.get("_policy"))
+                          report.get("_policy"), read_permission_config)
         return
 
     if task.kind == "capture":
@@ -4456,7 +4640,10 @@ def summary_lines(report: Dict[str, Any]) -> List[str]:
     for test in report.get("tests", []):
         lines.append(f"test {json.dumps(test['command'])}: {test['status']}")
     record = report.get("permissions") or {}
-    if record.get("deny_list_applied"):
+    if record.get("native_read_profile_applied"):
+        lines.append(f"permissions: Codex native read-only profile {record.get('native_read_profile_name')} applied; "
+                     f"outer deny profile applied to {record.get('deny_list_scope')}")
+    elif record.get("deny_list_applied"):
         lines.append(f"permissions: deny list applied, {len(record.get('denials') or [])} "
                      "denial(s)")
     else:

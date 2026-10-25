@@ -8,6 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 import worker_tools as wt  # noqa: E402
+import local_worker as lw  # noqa: E402
 
 TOKEN = 'Bearer super-secret-token-8f2c'
 OTHER = 'another-secret-value-42'
@@ -393,6 +394,24 @@ class RoutingPreservationTests(ManifestTests):
         self.assertEqual(wt.toml_value(True), 'true')
         self.assertEqual(wt.toml_value(60), '60')
         self.assertEqual(json.loads(wt.toml_value(['a', 'b'])), ['a', 'b'])
+
+    def test_read_tier_wraps_stdio_servers_and_marks_http_trust(self):
+        loaded = {"overrides": ["-c", 'mcp_servers.ctx.command="/usr/bin/python3"',
+                                "-c", 'mcp_servers.ctx.args=["-m","fixture"]',
+                                "-c", 'mcp_servers.remote.url="https://mcp.example"'],
+                  "environment": {}, "secrets": {},
+                  "evidence": {"servers": {
+                      "ctx": {"transport": "stdio"},
+                      "remote": {"transport": "http"}}}}
+        result = wt.wrap_stdio_commands(loaded, Path("/tmp/readonly.sb"))
+        overrides = lw.config_overrides_map(["codex", "exec", *result["overrides"]])
+        self.assertEqual(json.loads(overrides["mcp_servers.ctx.command"]), "/usr/bin/sandbox-exec")
+        self.assertEqual(json.loads(overrides["mcp_servers.ctx.args"]),
+                         ["-f", "/tmp/readonly.sb", "/usr/bin/python3", "-m", "fixture"])
+        self.assertIn("read-only", result["evidence"]["servers"]["ctx"]["process_wrapper"])
+        self.assertIn("explicitly trusted by the task manifest",
+                      result["evidence"]["servers"]["remote"]["process_wrapper"])
+        self.assertEqual(loaded["overrides"][1], 'mcp_servers.ctx.command="/usr/bin/python3"')
 
 
 class CredentialLeakTests(ManifestTests):

@@ -147,6 +147,32 @@ class JobHome(IsolationCase):
 
 
 class SelfCheck(IsolationCase):
+    def test_read_argv_pins_native_profile_strict_config_schema_and_omits_sandbox_mode(self):
+        self.argv_with_catalog()
+        state = self.root / "state"
+        worktree = state / "worktrees" / "read-job"
+        worktree.mkdir(parents=True)
+        permission_config = lw.native_read_profile_overrides(
+            lw.permissions.default_permissions(), state, worktree)
+        schema = self.root / "answer.schema.json"
+        schema.write_text("{}", encoding="utf-8")
+        argv = lw.worker_argv("codex", worktree, self.profile, 32768,
+                              self.root / "last-message.txt", catalog_path=self.catalog,
+                              sandbox_mode=None, output_schema=schema,
+                              permission_config=permission_config, strict_config=True)
+        self.assertEqual(lw.missing_config_pins(argv, self.profile, 32768,
+            (self.catalog, self.catalog_sha), sandbox_mode=None,
+            output_schema=schema, permission_config=permission_config, strict_config=True), [])
+        self.assertNotIn("-s", argv)
+        self.assertNotIn("sandbox_mode", lw.config_overrides_map(argv))
+        self.assertIn("--output-schema", argv)
+        self.assertIn("--strict-config", argv)
+        for drift in ([item for item in argv if item != "--strict-config"],
+                      [*argv, "-s", "read-only"]):
+            self.assertTrue(lw.missing_config_pins(drift, self.profile, 32768,
+                (self.catalog, self.catalog_sha), sandbox_mode=None,
+                output_schema=schema, permission_config=permission_config, strict_config=True))
+
     def test_catalog_drift_is_refused(self):
         argv = self.argv_with_catalog()
         Path(self.catalog).write_text("{}")
@@ -218,7 +244,7 @@ class Compatibility(IsolationCase):
         self.assertEqual(lw.MIN_CODEX_VERSION, (0, 164, 0))
         self.assertEqual(sorted(lw.CODEX_REQUIRED_FLAGS),
                          sorted(["--ephemeral", "--output-schema", "--ignore-user-config",
-                                 "--ignore-rules", "--json"]))
+                                 "--ignore-rules", "--json", "--strict-config"]))
 
     def test_a_compatible_codex_reports_its_version_and_both_calls(self):
         run = sp.fake_help()
@@ -241,6 +267,23 @@ class Compatibility(IsolationCase):
                 self.assertFalse(compat["ok"])
                 self.assertEqual(compat["missing_flags"], [flag])
                 self.assertIn(flag, compat["reason"])
+
+    def test_native_read_profile_is_read_only_and_hides_state_and_denied_paths(self):
+        state = self.root / "state"
+        worktree = state / "worktrees" / "job"
+        state.mkdir()
+        worktree.mkdir(parents=True)
+        denied = self.root / "private" / "secret.txt"
+        denied.parent.mkdir()
+        config = dict(lw.native_read_profile_overrides(
+            lw.permissions.default_permissions(), state, worktree, extra_deny_read=[denied]))
+        self.assertEqual(config["default_permissions"], json.dumps(lw.READ_PERMISSION_PROFILE))
+        self.assertEqual(config["permissions.%s.extends" % lw.READ_PERMISSION_PROFILE],
+                         json.dumps(":read-only"))
+        filesystem = config["permissions.%s.filesystem" % lw.READ_PERMISSION_PROFILE]
+        for path, action in ((state.resolve(), "deny"), (worktree.resolve(), "read"),
+                             (denied.resolve(), "deny")):
+            self.assertIn(json.dumps(str(path)) + " = " + json.dumps(action), filesystem)
 
     def test_an_unreadable_version_or_a_missing_binary_is_not_compatible(self):
         compat = lw.codex_compat("codex", run=sp.fake_help(version="codex-cli dev"))

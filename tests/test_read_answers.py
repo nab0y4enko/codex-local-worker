@@ -34,6 +34,8 @@ class ReadAnswerTests(unittest.TestCase):
         schema = read_answers.envelope_schema({"type": "string"})
         self.assertEqual(schema["required"], ["answer", "citations"])
         self.assertEqual(schema["properties"]["answer"], {"type": "string"})
+        self.assertEqual(schema["properties"]["citations"]["minItems"], 1)
+        self.assertTrue(read_answers.validate({"answer": "ok", "citations": []}, schema))
 
 
 if __name__ == "__main__":

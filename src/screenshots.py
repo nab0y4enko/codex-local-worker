@@ -309,6 +309,16 @@ def capture_source(plan: Dict, source: CaptureSource, worktree: Path, out_dir: P
     source_plan["destination"] = dict(source.destination)
     source_plan["app_bundle"] = str(app_bundle)
     source_plan["result_bundle"] = str(result_bundle)
+    if "simulator" in source.destination:
+        install_argv = list(source_plan["install"])
+        launch_argv = list(source_plan["launch"])
+        if (len(install_argv) != 5 or install_argv[1:3] != ["simctl", "install"] or
+                len(launch_argv) != 5 or launch_argv[1:3] != ["simctl", "launch"]):
+            raise ValueError("simulator capture plan must use direct simctl install and launch")
+        install_argv[3:] = ["{simulator_udid}", "{app_bundle}"]
+        launch_argv[3:] = ["{simulator_udid}", "{bundle_id}"]
+        source_plan["install"] = install_argv
+        source_plan["launch"] = launch_argv
     for stage in ("build", "test"):
         argv = list(source_plan[stage])
         if source.scheme is not None and "-scheme" in argv:
@@ -321,6 +331,23 @@ def capture_source(plan: Dict, source: CaptureSource, worktree: Path, out_dir: P
             selector = ("id=" + source.destination["simulator"]
                         if "simulator" in source.destination else "platform=macOS")
             argv[index + 1] = selector
+        if stage == "test":
+            if "-derivedDataPath" in argv:
+                index = argv.index("-derivedDataPath")
+                if index + 1 >= len(argv):
+                    raise ValueError("test: -derivedDataPath needs a value")
+                argv[index + 1] = str(derived_data)
+            else:
+                action_index = argv.index("test")
+                argv[action_index:action_index] = ["-derivedDataPath", str(derived_data)]
+            if "-resultBundlePath" in argv:
+                index = argv.index("-resultBundlePath")
+                if index + 1 >= len(argv):
+                    raise ValueError("test: -resultBundlePath needs a value")
+                argv[index + 1] = str(result_bundle)
+            else:
+                action_index = argv.index("test")
+                argv[action_index:action_index] = ["-resultBundlePath", str(result_bundle)]
         source_plan[stage] = argv
     build_argv = source_plan["build"]
     configured_derived = False

@@ -29,7 +29,7 @@ def envelope_schema(answer_schema: Dict[str, Any]) -> Dict[str, Any]:
         "additionalProperties": False,
         "properties": {
             "answer": answer_schema,
-            "citations": {"type": "array", "items": citation},
+            "citations": {"type": "array", "minItems": 1, "items": citation},
         },
     }
 
