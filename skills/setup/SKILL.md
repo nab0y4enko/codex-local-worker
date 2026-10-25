@@ -10,8 +10,9 @@ Setup validates the installed plugin and can migrate an older managed block in
 settings, or route every project automatically.
 
 Install the plugin with the Codex CLI by following the repository's
-[install steps](../../README.md#install): add the `nab0y4enko/codex-local-worker` marketplace,
-install `codex-local-worker@codex-local-worker`, then run the installed doctor's read-only report.
+[install steps](../../README.md#install): choose the local checkout command for the version in
+this checkout, or the GitHub marketplace command for the published default branch; then install
+`codex-local-worker@codex-local-worker` and run the installed doctor's read-only report.
 
 Resolve the plugin root from this skill: it is `<root>/skills/setup/SKILL.md`, two directories
 below `<root>`. The first-party manifest is `<root>/.codex-plugin/plugin.json`.

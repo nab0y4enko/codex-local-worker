@@ -27,11 +27,17 @@ class NotifyTests(unittest.TestCase):
         self.assertLessEqual(len(argv[-1]), 200)
 
     def test_disabled_and_failing_notifications_never_raise(self):
-        with mock.patch.dict(os.environ, {"LOCAL_WORKER_NOTIFY": "0"}):
-            self.assertFalse(notify.notify("job", "t", "m", run=self.fail_if_called))
-        self.assertFalse(notify.notify("job", "t", "m", run=lambda *a, **k: (_ for _ in ()).throw(OSError("no"))))
-        self.assertFalse(notify.notify("job", "t", "m", run=lambda *a, **k:
-                                      subprocess.CompletedProcess([], 1)))
+        with self.assertLogs(notify._log, level="WARNING") as captured:
+            with mock.patch.dict(os.environ, {"LOCAL_WORKER_NOTIFY": "0"}):
+                self.assertFalse(notify.notify("job", "t", "m", run=self.fail_if_called))
+            with mock.patch.dict(os.environ, {"LOCAL_WORKER_NOTIFY": "1"}):
+                self.assertFalse(notify.notify("job", "t", "m",
+                                               run=lambda *a, **k: (_ for _ in ()).throw(OSError("no"))))
+                self.assertFalse(notify.notify("job", "t", "m", run=lambda *a, **k:
+                                               subprocess.CompletedProcess([], 1)))
+        self.assertEqual(len(captured.output), 2)
+        self.assertTrue(all("macOS notification failed" in message
+                            for message in captured.output))
 
     def test_notification_caller_redacts_before_sending(self):
         import local_worker

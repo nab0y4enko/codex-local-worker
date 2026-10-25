@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Install the committed package into a disposable Codex home and check skill discovery."""
+import json
 import os
 import shutil
 import subprocess
@@ -35,6 +36,9 @@ def main():
         package.mkdir()
         with zipfile.ZipFile(str(archive)) as bundle:
             bundle.extractall(str(package))
+        manifest = json.loads((package / ".codex-plugin" / "plugin.json").read_text(
+            encoding="utf-8"))
+        expected_version = manifest["version"]
         home = temp / "home"
         codex_home = temp / "codex-home"
         home.mkdir()
@@ -45,6 +49,13 @@ def main():
         run([codex, "plugin", "marketplace", "add", str(package)], temp, env)
         run([codex, "plugin", "add", "codex-local-worker@codex-local-worker", "--json"],
             temp, env)
+        installed_plugins = json.loads(run([codex, "plugin", "list", "--json"], temp, env))
+        installed = [item for item in installed_plugins.get("installed", [])
+                     if item.get("pluginId") == "codex-local-worker@codex-local-worker"]
+        if (len(installed) != 1 or not installed[0].get("installed")
+                or installed[0].get("version") != expected_version):
+            raise RuntimeError("installed plugin version does not match archived manifest "
+                               "version %s: %r" % (expected_version, installed))
         prompts = run([codex, "debug", "prompt-input"], temp, env)
         missing = [skill for skill in EXPECTED if skill not in prompts]
         if missing:
