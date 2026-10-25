@@ -4,6 +4,7 @@ import io
 import json
 import re
 import sys
+import subprocess
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -29,6 +30,35 @@ class CloudTierTests(unittest.TestCase):
         self.assertEqual([model.slug for model in models], [
             item["slug"] for item in sp.load_fixture("codex/debug_models.json")["models"]
             if item.get("visibility") == "list"])
+
+    def test_cloud_catalog_job_probe_uses_the_remaining_deadline_and_supervised_runner(self):
+        payload = sp.load_fixture_text("codex/debug_models.json").encode()
+        outcome = {"returncode": 0, "stdout": payload, "stderr": b"", "timed_out": False}
+        with mock.patch.object(lw, "run_bounded", return_value=outcome) as bounded:
+            models = lw.cloud_catalog_for_job("codex", subprocess.run, lw.Deadline(5.0))
+        self.assertIn("gpt-6-luna", [model.slug for model in models])
+        self.assertEqual(bounded.call_args.args[0], ["codex", "debug", "models"])
+        self.assertGreater(bounded.call_args.kwargs["timeout"], 0)
+        self.assertLessEqual(bounded.call_args.kwargs["timeout"], 5.0)
+
+    def test_cloud_catalog_job_probe_keeps_injected_runner_signature_and_deadline(self):
+        payload = sp.load_fixture_text("codex/debug_models.json")
+        seen = []
+
+        def fake(argv, **kwargs):
+            seen.append((argv, kwargs))
+            return sp.fake_completed(stdout=payload)
+
+        models = lw.cloud_catalog_for_job("codex", fake, lw.Deadline(5.0))
+        self.assertTrue(models)
+        self.assertEqual(seen[0][0], ["codex", "debug", "models"])
+        self.assertLessEqual(seen[0][1]["timeout"], 5.0)
+
+    def test_cloud_catalog_job_probe_stops_when_job_budget_is_exhausted(self):
+        with mock.patch.object(lw, "run_bounded") as bounded:
+            with self.assertRaises(lw.DeadlineExpired):
+                lw.cloud_catalog_for_job("codex", subprocess.run, lw.Deadline(0.0))
+        bounded.assert_not_called()
 
     def test_cloud_job_uses_the_same_pipeline_and_links_its_origin(self):
         fake = sp.FakeRun(worker_edit=sp.fix_add)

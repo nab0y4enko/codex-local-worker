@@ -106,6 +106,31 @@ class Processes(unittest.TestCase):
         self.assertFalse(outcome["termination"]["survivors"])
         self.assertEqual(outcome["returncode"], -signal.SIGTERM)
 
+    def test_reaped_supervisor_is_never_signalled_again_by_its_numeric_group_id(self):
+        class CompletedPopen:
+            pid = 424242
+
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+
+        process = CompletedPopen()
+        with mock.patch.object(lw.os, "getpgid", return_value=process.pid), \
+                mock.patch.object(lw.os, "getsid", return_value=process.pid), \
+                mock.patch.object(lw.os, "killpg") as killpg, \
+                mock.patch.object(lw.process_supervisor, "process_start_identity", return_value="birth"), \
+                mock.patch.object(lw.process_supervisor, "process_group_members", return_value=[
+                    {"pid": process.pid, "pgid": process.pid, "sid": process.pid, "state": "S"}]), \
+                mock.patch.object(lw, "_group_alive", return_value=True), \
+                mock.patch.object(lw, "KILL_GRACE_SECONDS", 0.0):
+            outcome = lw._terminate_group(process)
+        # A wait that reaps the kept supervisor proves its group drained. The stale numeric PGID
+        # may already belong to another session, so no follow-up KILL is safe.
+        self.assertEqual(killpg.call_args_list, [mock.call(process.pid, signal.SIGTERM)])
+        self.assertFalse(outcome["force_killed"])
+
     def test_children_that_ignore_sigterm_are_force_killed(self):
         (self.root / "ignorer.sh").write_text("#!/bin/sh\ntrap '' TERM\nsleep 30\n")
         (self.root / "ignorer.sh").chmod(0o755)

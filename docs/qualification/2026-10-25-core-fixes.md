@@ -29,10 +29,14 @@ repository change is therefore surfaced for review rather than treated as unchan
 Launcher-owned long process groups are recorded before worker startup and kept under a stable
 supervisor leader. Reaping requires matching launcher and owner birth identities, process group,
 and session evidence. Process-table errors and mismatches preserve the record and surface
-`ownership_uncertain_preserved`; they do not signal an unproven group. Escalation revalidates the
-keeper immediately before `SIGKILL`. Probe and worker commands share the job's absolute deadline,
-including Codex compatibility/version/help probes and oMLX discovery/rechecks; follow-up probes
-are skipped when the budget is exhausted.
+`ownership_uncertain_preserved`; they do not signal an unproven group. The supervisor installs
+TERM/USR1 handlers before starting its command and holds the group leader after TERM until the
+parent releases it or safely escalates; release uses bounded polling so a signal cannot be lost
+between a check and a wait. Foreground cleanup revalidates the unreaped keeper before escalation
+and never signals a numeric PGID after reaping it. Probe and worker commands share the job's
+absolute deadline, including Codex compatibility/version/help, the cloud model catalog probe, and
+oMLX discovery/rechecks; follow-up probes are skipped when the budget is exhausted. Real cloud
+inference was not used.
 
 ## Classification and metrics
 
@@ -51,8 +55,11 @@ Command:
 python3 -m unittest discover -s tests -v
 ```
 
-Result: **1007 tests passed; 8 live-only tests skipped; 168.118 seconds**. The skipped tests are
-opt-in live qualification cases and are not counted as evidence for this fix wave. Syntax check
+Result on commit `a56c710`: **1007 tests total, 999 executed successfully, 8 live-only skips,
+168.118 seconds**. A follow-up run before the last signal-handler ordering change totaled 1011 tests
+with 1003 executed successfully and 8 skips in 201.319 seconds; the final full-suite result for
+the signal-handler ordering follow-up is pending. The skipped tests are opt-in live qualification
+cases and are not counted as executed passes. Syntax check
 passed with:
 
 ```sh
@@ -61,9 +68,13 @@ python3 -m py_compile src/local_worker.py src/process_supervisor.py src/worktree
 
 Diff whitespace check passed with `git diff --check`.
 
-## Live qualification
+## Initial post-fix live qualification
 
-Post-fix real local write/read and native qualification is pending. The new qualification state,
-job manifest, simulator identity, and exact commands/results will be recorded here and in the
-external manifest after those runs. Cloud inference is not authorized and is not part of this
-qualification.
+On `a56c710`, before the cloud-catalog and final supervisor-signal follow-ups, the opt-in live
+suite passed **8/8 cases in 196.908 seconds**. It used real local write/read jobs and a native
+iPhone 17 simulator qualification; the forced capability-failure and context-overflow cases also
+passed their expected classification assertions. Cloud inference was not called. Full report and
+all job worktrees are retained under `/Users/oleksii.naboichenko/.local/share/codex-local-worker/
+core-fixwave-2026-10-25/live/qualification`; the simulator UDID was
+`4D3B2328-F90D-4703-9D83-956C7AFE5083`. The final follow-up live qualification is pending and
+will be added after rerunning on the completed commit.

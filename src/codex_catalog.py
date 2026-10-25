@@ -35,11 +35,12 @@ class CloudModel:
 
 
 def list_cloud_models(codex_bin: str,
-                      run: Callable[..., Any] = subprocess.run) -> List[CloudModel]:
+                      run: Callable[..., Any] = subprocess.run,
+                      timeout: float = 30.0) -> List[CloudModel]:
     """Read the currently installed Codex cloud catalog, preserving its list order."""
     try:
         completed = run([codex_bin, "debug", "models"], capture_output=True,
-                        timeout=30, check=False)
+                        timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise RuntimeError("cannot read the Codex model catalog: %s" % error) from error
     if getattr(completed, "returncode", 1) != 0:

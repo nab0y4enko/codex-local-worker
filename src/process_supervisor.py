@@ -6,6 +6,7 @@ birth identity before signalling the entire owned group.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import signal
 import ctypes
@@ -106,6 +107,23 @@ def popen(argv: Sequence[str], **kwargs: Any) -> subprocess.Popen:
         raise
     os.close(ready_read)
     process._local_worker_ready_fd = ready_write
+    identity = process_start_identity(process.pid)
+    try:
+        owner_sid = os.getsid(process.pid)
+    except (ProcessLookupError, PermissionError):
+        owner_sid = None
+    if not identity or owner_sid != process.pid:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        with contextlib.suppress(Exception):
+            process.wait(timeout=2)
+        with contextlib.suppress(OSError):
+            os.close(ready_write)
+        process._local_worker_ready_fd = None
+        raise OSError("cannot prove the supervised process birth and session identity")
+    process._local_worker_start_identity = identity
+    process._local_worker_owner_sid = owner_sid
+    process._local_worker_supervisor_protocol = 1
     return process
 
 
@@ -143,6 +161,12 @@ def _group_has_other_members(pgid: int, owner: int) -> bool:
     return False
 
 
+def _wait_for_release(is_released) -> None:
+    """Poll a signal-handler flag; bounded sleep avoids both lost wakeups and handler locks."""
+    while not is_released():
+        time.sleep(.025)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     ready_fd = None
@@ -160,15 +184,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 125
     if not args:
         return 127
-    command = subprocess.Popen(args)
-    # The owner remains the stable group leader while descendants terminate. Installing this
-    # after spawning ensures the command keeps its normal SIGTERM behavior; a later SIGKILL is
-    # issued only after the launcher revalidates this keeper's birth identity.
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    status = command.wait()
+    termination_requested = False
+    release_requested = False
+
+    def request_termination(_signum, _frame):
+        nonlocal termination_requested
+        termination_requested = True
+
+    def release_owner(_signum, _frame):
+        nonlocal release_requested
+        release_requested = True
+
+    # Install only in the supervisor before exec. Caught handlers reset to defaults across
+    # exec, so the user command keeps its ordinary TERM behavior while the owner cannot vanish
+    # between group membership proof and escalation.
+    signal.signal(signal.SIGTERM, request_termination)
+    signal.signal(signal.SIGUSR1, release_owner)
+    if termination_requested:
+        status = -signal.SIGTERM
+    else:
+        command = subprocess.Popen(args)
+        status = command.wait()
     owner = os.getpid()
     while _group_has_other_members(owner, owner):
         time.sleep(.025)
+    # On a termination path, retain the session/process-group leader until the parent has
+    # verified that descendants are gone or has safely escalated against this exact owner.
+    # This prevents a numeric PGID from being reused between the TERM poll and SIGKILL.
+    if termination_requested:
+        _wait_for_release(lambda: release_requested)
     if status < 0:
         # Restore the conventional negative signal exit status after descendants have left.
         # The supervisor ignored TERM while holding ownership proof, so it can now terminate

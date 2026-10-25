@@ -139,6 +139,7 @@ class ActiveGroupTracker:
             raise BlockedError("supervised process group does not own its recorded session")
         self.groups[int(pgid)] = {"pgid": int(pgid), "owner_pid": int(pgid),
                                   "owner_start_identity": identity, "owner_sid": owner_sid,
+                                  "supervisor_protocol": 1,
                                   "command": str(argv[0]) if argv else ""}
         self._persist()
 
@@ -879,6 +880,27 @@ def codex_compat(codex_bin: str, run: Callable[..., Any] = subprocess.run,
     result["ok"] = not problems
     result["reason"] = "; ".join(problems) or None
     return result
+
+
+def cloud_catalog_for_job(codex_bin: str, run: Callable[..., Any],
+                          deadline: Deadline) -> List[codex_catalog.CloudModel]:
+    """Read the cloud catalog under the job's remaining deadline and tracked process ownership."""
+    timeout = min(CODEX_COMPAT_TIMEOUT_SECONDS, deadline.remaining())
+    if timeout <= 0:
+        raise DeadlineExpired("job deadline expired before the Codex cloud catalog probe")
+    if run is subprocess.run:
+        argv = [str(codex_bin), "debug", "models"]
+        outcome = run_bounded(argv, cwd=None, env=dict(os.environ), timeout=timeout)
+        if outcome.get("timed_out"):
+            if deadline.remaining() <= 0:
+                raise DeadlineExpired("job deadline expired during the Codex cloud catalog probe")
+            raise RuntimeError("cannot read the Codex model catalog: probe timed out")
+        completed = subprocess.CompletedProcess(argv, outcome["returncode"],
+                                                 outcome["stdout"], outcome["stderr"])
+        return codex_catalog.list_cloud_models(codex_bin, run=lambda *a, **k: completed,
+                                               timeout=timeout)
+    # Test and embedding runners retain their established `run(argv, **kwargs)` seam.
+    return codex_catalog.list_cloud_models(codex_bin, run=run, timeout=timeout)
 
 
 def require_codex_compat(codex_bin: str, run: Callable[..., Any] = subprocess.run
@@ -1733,39 +1755,115 @@ def _group_alive(pgid: int) -> bool:
 
 
 def _terminate_group(process: subprocess.Popen) -> Dict[str, Any]:
-    """SIGTERM the group, then *always* SIGKILL it when any member survived the grace.
-
-    Waiting only on the leader is not enough: a descendant that traps SIGTERM keeps the
-    group alive after the leader exits. The leader is reaped first (so a finished leader
-    is not mistaken for a survivor), then the group itself is probed and killed.
-    """
+    """Stop only a group whose unreaped supervisor still proves its original identity."""
     outcome: Dict[str, Any] = {"terminated": False, "force_killed": False, "survivors": False}
+    pgid = int(process.pid)
+    owner_pid = int(process.pid)
+    owner_identity = (getattr(process, "_local_worker_start_identity", None) or
+                      process_supervisor.process_start_identity(owner_pid))
+    owner_sid = getattr(process, "_local_worker_owner_sid", None)
+    protocol = getattr(process, "_local_worker_supervisor_protocol", None)
     try:
-        pgid = os.getpgid(process.pid)
+        actual_pgid = os.getpgid(owner_pid)
+        actual_sid = os.getsid(owner_pid)
+    except (ProcessLookupError, PermissionError):
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=TERMINATE_GRACE_SECONDS)
+        return outcome
+    if (not owner_identity or actual_pgid != pgid or actual_sid != pgid or
+            (owner_sid is not None and actual_sid != owner_sid)):
+        outcome.update(ownership_uncertain=True, survivors=True)
+        return outcome
+
+    def members_with_keeper() -> Optional[List[Dict[str, Any]]]:
+        members = process_supervisor.process_group_members(pgid)
+        if members is None:
+            return None
+        keeper = next((item for item in members if item["pid"] == owner_pid and
+                       item["pgid"] == pgid and item["sid"] == pgid and
+                       not str(item.get("state", "")).startswith("Z")), None)
+        if (keeper is None or
+                process_supervisor.process_start_identity(owner_pid) != owner_identity):
+            return None
+        return members
+
+    if members_with_keeper() is None:
+        outcome.update(ownership_uncertain=True, survivors=True)
+        return outcome
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+        outcome["terminated"] = True
     except ProcessLookupError:
         with contextlib.suppress(subprocess.TimeoutExpired):
             process.wait(timeout=TERMINATE_GRACE_SECONDS)
         return outcome
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(pgid, signal.SIGTERM)
-        outcome["terminated"] = True
-    with contextlib.suppress(subprocess.TimeoutExpired):
+    except PermissionError:
+        outcome.update(ownership_uncertain=True, survivors=True)
+        return outcome
+
+    try:
         process.wait(timeout=TERMINATE_GRACE_SECONDS)
-    if _group_alive(pgid):
+        # The supervisor exits only after all descendants have left. Its reaped Popen result
+        # proves the group drained; signaling the numeric PGID now could hit a foreign session.
+        return outcome
+    except subprocess.TimeoutExpired:
+        pass
+
+    members = members_with_keeper()
+    if members is None:
+        outcome.update(ownership_uncertain=True, survivors=True)
+        return outcome
+    live = [item for item in members if not str(item.get("state", "")).startswith("Z")]
+    other_live = [item for item in live if item["pid"] != owner_pid]
+    if not other_live:
+        if protocol == 1:
+            # The keeper is deliberately holding the PGID while the parent decides whether to
+            # release it or escalate. With no descendants left, release only this verified PID.
+            if members_with_keeper() is None:
+                outcome.update(ownership_uncertain=True, survivors=True)
+                return outcome
+            try:
+                os.kill(owner_pid, signal.SIGUSR1)
+                process.wait(timeout=TERMINATE_GRACE_SECONDS)
+                return outcome
+            except (ProcessLookupError, subprocess.TimeoutExpired, PermissionError):
+                outcome.update(ownership_uncertain=True, survivors=True)
+                return outcome
+        # Older records have no explicit release protocol. With no other live group member,
+        # signal only the exact unreaped child PID, never a potentially reused numeric PGID.
+        if members_with_keeper() is None:
+            outcome.update(ownership_uncertain=True, survivors=True)
+            return outcome
+        try:
+            os.kill(owner_pid, signal.SIGKILL)
+            outcome["force_killed"] = True
+            process.wait(timeout=KILL_GRACE_SECONDS)
+            return outcome
+        except (ProcessLookupError, subprocess.TimeoutExpired, PermissionError):
+            outcome.update(ownership_uncertain=True, survivors=True)
+            return outcome
+
+    # The supervisor remains alive in its hold state while descendants remain. Revalidate the
+    # same keeper immediately before group escalation, so the PGID cannot be reused in between.
+    if members_with_keeper() is None:
+        outcome.update(ownership_uncertain=True, survivors=True)
+        return outcome
+    try:
+        os.killpg(pgid, signal.SIGKILL)
         outcome["force_killed"] = True
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(pgid, signal.SIGKILL)
-        kill_deadline = time.monotonic() + KILL_GRACE_SECONDS
-        while time.monotonic() < kill_deadline:
-            # The killed leader is *our* child: until it is reaped its zombie still answers
-            # killpg(pgid, 0), so an unreaped leader would look like a survivor forever.
-            process.poll()
-            if not _group_alive(pgid):
-                break
-            time.sleep(0.05)
-        outcome["survivors"] = _group_alive(pgid)
+    except ProcessLookupError:
+        return outcome
+    except PermissionError:
+        outcome.update(ownership_uncertain=True, survivors=True)
+        return outcome
     with contextlib.suppress(subprocess.TimeoutExpired):
-        process.wait(timeout=TERMINATE_GRACE_SECONDS)
+        process.wait(timeout=KILL_GRACE_SECONDS)
+    members_after = process_supervisor.process_group_members(pgid)
+    if members_after is None:
+        outcome.update(ownership_uncertain=True, survivors=True)
+    else:
+        outcome["survivors"] = any(
+            not str(item.get("state", "")).startswith("Z") for item in members_after)
     return outcome
 
 
@@ -3841,7 +3939,7 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     selected_cloud = None
     if is_cloud:
         try:
-            catalog_models = codex_catalog.list_cloud_models(options.codex_bin, run=options.codex_run)
+            catalog_models = cloud_catalog_for_job(options.codex_bin, options.codex_run, deadline)
         except RuntimeError as error:
             raise BlockedError(str(error)) from error
         selected_cloud = next((model for model in catalog_models if model.slug == task.tier.model), None)

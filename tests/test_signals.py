@@ -2,6 +2,7 @@
 import json
 import contextlib
 import os
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -36,6 +37,42 @@ def owned_group_snapshot(pgid):
 
 
 class OrphanReaping(unittest.TestCase):
+    def test_keeper_installs_term_and_release_handlers_before_spawning_command(self):
+        old_term = signal.getsignal(signal.SIGTERM)
+        old_release = signal.getsignal(signal.SIGUSR1)
+        observed = {}
+
+        class Command:
+            def wait(self):
+                return 0
+
+        def spawn(_argv):
+            observed["term"] = signal.getsignal(signal.SIGTERM)
+            observed["release"] = signal.getsignal(signal.SIGUSR1)
+            return Command()
+
+        try:
+            with mock.patch.object(process_supervisor.subprocess, "Popen", side_effect=spawn), \
+                    mock.patch.object(process_supervisor, "_group_has_other_members",
+                                      return_value=False):
+                self.assertEqual(process_supervisor.main(["/bin/true"]), 0)
+        finally:
+            signal.signal(signal.SIGTERM, old_term)
+            signal.signal(signal.SIGUSR1, old_release)
+        self.assertTrue(callable(observed["term"]))
+        self.assertTrue(callable(observed["release"]))
+
+    def test_keeper_release_wait_uses_bounded_polling_without_a_pause_gap(self):
+        checks = {"count": 0}
+
+        def released():
+            checks["count"] += 1
+            return checks["count"] == 2
+
+        with mock.patch.object(process_supervisor.time, "sleep") as sleep:
+            process_supervisor._wait_for_release(released)
+        sleep.assert_called_once_with(.025)
+
     def test_launcher_sigkill_reaps_a_preworker_owned_probe_group(self):
         with tempfile.TemporaryDirectory() as root:
             state = Path(root)
