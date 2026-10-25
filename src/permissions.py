@@ -43,6 +43,8 @@ Standard library only; importable without ``local_worker`` so that module can us
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -52,19 +54,20 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Sequence, Tuple
 
 __all__ = [
     "DEFAULT_DENY_READ", "DEFAULT_DENY_WRITE", "GIT_ADMIN_REDIRECTS", "LOG_FILE", "MODE_FULL_HOST",
     "PERMISSIONS_FILE", "SANDBOX_EXEC", "SCHEMA_VERSION", "Permissions", "PermissionsError",
     "add_deny_read", "add_deny_write", "check_conflicts", "default_permissions", "describe",
-    "find_denials", "load_permissions", "normalize_entry", "permissions_payload", "record_change",
+    "edit_lock", "find_denials", "load_permissions", "normalize_entry", "permissions_payload", "record_change",
     "remove_deny_read", "remove_deny_write", "resolve_git_dirs", "save_permissions",
     "seatbelt_profile", "wrap_argv", "wrapper_available",
 ]
 
 PERMISSIONS_FILE = "permissions.json"
 LOG_FILE = "permissions.log"
+LOCK_FILE = "permissions.lock"
 SCHEMA_VERSION = 1
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 MODE_FULL_HOST = "full_host"
@@ -924,17 +927,35 @@ def record_change(state_dir: Path, action: str, path: str) -> None:
                                f"{log} could not be written: {error}") from None
 
 
+@contextlib.contextmanager
+def edit_lock(state_dir: Path) -> Iterator[None]:
+    """Hold ``<state>/permissions.lock`` (``flock``) across one read-modify-write of the list, so
+    two simultaneous ``permissions`` edits both land instead of the last writer winning."""
+    directory = Path(state_dir)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(str(directory / LOCK_FILE), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as error:
+        raise PermissionsError(f"cannot lock {directory / LOCK_FILE}: {error}") from None
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)   # closing releases the lock
+
+
 def _add_entry(state_dir: Path, raw: str, attribute: str, action: str) -> Permissions:
     """Add ``raw`` to ``perms.<attribute>`` (a path already there is left as is, not logged)."""
     entry = normalize_entry(raw)
-    perms = load_permissions(state_dir)
-    listing = getattr(perms, attribute)
-    if any(_same(_real(existing), _real(entry)) for existing in listing):
+    with edit_lock(state_dir):
+        perms = load_permissions(state_dir)
+        listing = getattr(perms, attribute)
+        if any(_same(_real(existing), _real(entry)) for existing in listing):
+            return perms
+        listing.append(entry)
+        save_permissions(state_dir, perms)
+        record_change(state_dir, action, entry)
         return perms
-    listing.append(entry)
-    save_permissions(state_dir, perms)
-    record_change(state_dir, action, entry)
-    return perms
 
 
 def _remove_entry(state_dir: Path, raw: str, attribute: str, action: str, label: str) -> Permissions:
@@ -942,22 +963,23 @@ def _remove_entry(state_dir: Path, raw: str, attribute: str, action: str, label:
     removable (the file is the user's); a path only *under* a listed entry is refused with the
     entry to lift, since the list is whole entries."""
     entry = normalize_entry(raw)
-    perms = load_permissions(state_dir)
-    listing = getattr(perms, attribute)
-    target = _real(entry)
-    kept = [existing for existing in listing if not _same(_real(existing), target)]
-    if len(kept) == len(listing):
-        covering = [existing for existing in listing if _covers(_real(existing), target)]
-        if covering:
-            raise PermissionsError(
-                f"{entry} is not listed itself; it is hidden by {attribute} entry "
-                f"{', '.join(repr(item) for item in covering)}: run {action} on that entry to "
-                f"lift it")
-        raise PermissionsError(f"{entry} is not in the {attribute} list")
-    setattr(perms, attribute, kept)
-    save_permissions(state_dir, perms)
-    record_change(state_dir, action, entry)
-    return perms
+    with edit_lock(state_dir):
+        perms = load_permissions(state_dir)
+        listing = getattr(perms, attribute)
+        target = _real(entry)
+        kept = [existing for existing in listing if not _same(_real(existing), target)]
+        if len(kept) == len(listing):
+            covering = [existing for existing in listing if _covers(_real(existing), target)]
+            if covering:
+                raise PermissionsError(
+                    f"{entry} is not listed itself; it is hidden by {attribute} entry "
+                    f"{', '.join(repr(item) for item in covering)}: run {action} on that entry to "
+                    f"lift it")
+            raise PermissionsError(f"{entry} is not in the {attribute} list")
+        setattr(perms, attribute, kept)
+        save_permissions(state_dir, perms)
+        record_change(state_dir, action, entry)
+        return perms
 
 
 def add_deny_read(state_dir: Path, raw: str) -> Permissions:

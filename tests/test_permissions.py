@@ -238,6 +238,38 @@ class RefusedFiles(PermissionsCase):
         self.assertEqual(self.file.read_bytes(), before)
 
 
+class ConcurrentEdits(PermissionsCase):
+    def test_an_edit_waits_for_the_lock_instead_of_racing_it(self):
+        import threading
+        finished = threading.Event()
+
+        def edit():
+            permissions.add_deny_read(self.state, str(self.root / "secret-a"))
+            finished.set()
+
+        with permissions.edit_lock(self.state):
+            worker = threading.Thread(target=edit)
+            worker.start()
+            self.assertFalse(finished.wait(.3), "the edit ran while the lock was held")
+        worker.join(10)
+        self.assertTrue(finished.is_set())
+        self.assertIn(real(self.root / "secret-a"),
+                      [real(item) for item in permissions.load_permissions(self.state).deny_read])
+
+    def test_simultaneous_edits_all_land(self):
+        import threading
+        names = [str(self.root / ("secret-%d" % number)) for number in range(8)]
+        threads = [threading.Thread(target=permissions.add_deny_read, args=(self.state, name))
+                   for name in names]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        listed = [real(item) for item in permissions.load_permissions(self.state).deny_read]
+        for name in names:
+            self.assertIn(real(name), listed)
+
+
 class Profile(PermissionsCase):
     def test_profile_allows_by_default_and_lists_only_denials(self):
         text = permissions.seatbelt_profile(self.perms, primary_repo=self.repo)
