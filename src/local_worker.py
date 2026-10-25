@@ -71,6 +71,7 @@ import codex_catalog
 import ledger
 import omlx_discovery
 import permissions
+import plugin_setup
 import notify
 import read_answers
 import worker_pool as pool
@@ -4385,6 +4386,11 @@ def build_parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status", help="read progress and actual usage without starting a worker")
     status.add_argument("--state-dir")
     status.add_argument("--job-id")
+    doctor = sub.add_parser("doctor", help="read local Codex, oMLX, permissions and simulator readiness")
+    doctor.add_argument("--json", action="store_true", help="print the complete doctor report as JSON")
+    doctor.add_argument("--state-dir", help="read permissions from this state directory")
+    doctor.add_argument("--settings", default=str(OMLX_SETTINGS), help="oMLX settings path")
+    doctor.add_argument("--codex-bin", help="Codex CLI path (default PATH or %s)" % CODEX_BIN_ENV)
     models = sub.add_parser("models", help="show available local or cloud models")
     models.add_argument("--cloud", action="store_true", help="read the live Codex cloud catalog")
     models.add_argument("--json", action="store_true", help="print model data as JSON")
@@ -4566,12 +4572,105 @@ def run_permissions_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _doctor_simulators(run: Optional[Callable[[Sequence[str]], Any]] = None
+                       ) -> List[Dict[str, str]]:
+    """Read available simulator metadata; an unavailable Xcode install yields an empty list."""
+    if run is None:
+        def run(argv):
+            return subprocess.run(list(argv), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True, timeout=20, check=False)
+    try:
+        devices = apple.simctl_devices(run)
+    except (OSError, subprocess.SubprocessError, apple.ApplePolicyError, ValueError):
+        return []
+    output = []
+    for udid, item in devices.items():
+        runtime = str(item.get("runtime") or "unknown")
+        runtime = runtime.rsplit(".", 1)[-1]
+        parts = runtime.split("-")
+        platform = parts[0] if parts else "unknown"
+        if len(parts) > 1:
+            platform += " " + ".".join(parts[1:])
+        output.append({"udid": udid, "name": str(item.get("name") or "unknown"),
+                       "platform": platform, "state": str(item.get("state") or "unknown")})
+    return sorted(output, key=lambda item: (item["platform"], item["name"], item["udid"]))
+
+
+def _doctor_permissions(state_dir: Path) -> Dict[str, Any]:
+    """Read permission settings without creating a default file or changing user data."""
+    path = Path(state_dir) / permissions.PERMISSIONS_FILE
+    try:
+        if path.is_symlink():
+            raise permissions.PermissionsError("permissions.json is a symlink")
+        if path.is_file():
+            perms = permissions._parse(path.read_bytes(), str(path))
+        else:
+            perms = permissions.default_permissions()
+        mode = perms.mode
+        deny_list = {"read": list(perms.deny_read), "write": list(perms.deny_write)}
+    except (OSError, permissions.PermissionsError):
+        mode = "unavailable"
+        deny_list = {"read": [], "write": []}
+    return {"mode": mode, "deny_list": deny_list,
+            "wrapper_available": permissions.wrapper_available()}
+
+
+def doctor_report(*, settings_path: Path = OMLX_SETTINGS,
+                  state_dir: Optional[Path] = None,
+                  codex_bin: Optional[str] = None,
+                  codex_run: Callable[..., Any] = subprocess.run,
+                  omlx_fetch: omlx_discovery.HttpFetch = omlx_discovery.http_fetch,
+                  simctl_run: Optional[Callable[[Sequence[str]], Any]] = None
+                  ) -> Dict[str, Any]:
+    """Collect current local readiness without writing state or starting a model turn."""
+    state = Path(state_dir) if state_dir is not None else resolve_state_dir()
+    try:
+        codex_path = resolve_codex_bin(codex_bin)
+        compat = codex_compat(codex_path, run=codex_run)
+        codex = {"version": compat.get("version"), "flags_ok": bool(compat.get("ok"))}
+    except (PreflightError, OSError):
+        codex = {"version": None, "flags_ok": False}
+    try:
+        omlx = run_preflight(Path(settings_path).expanduser(), None, None, omlx_fetch)
+    except PreflightError as error:
+        omlx = {"error_code": error.code or "discovery_failed"}
+    except (OSError, ValueError):
+        omlx = {"error_code": "discovery_failed"}
+    root = Path(__file__).resolve().parents[1]
+    return {"codex": codex, "omlx": omlx,
+            "permissions": _doctor_permissions(state),
+            "simulators": _doctor_simulators(simctl_run),
+            "state_dir": str(state),
+            "plugin_version": plugin_setup.plugin_version(root)}
+
+
 def main(argv: Optional[Sequence[str]] = None, *,
          omlx_fetch: omlx_discovery.HttpFetch = omlx_discovery.http_fetch,
-         codex_run: Callable[..., Any] = subprocess.run) -> int:
+         codex_run: Callable[..., Any] = subprocess.run,
+         simctl_run: Optional[Callable[[Sequence[str]], Any]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:
+        if args.command == "doctor":
+            report = doctor_report(settings_path=Path(os.path.expanduser(args.settings)),
+                                   state_dir=resolve_state_dir(args.state_dir),
+                                   codex_bin=args.codex_bin, codex_run=codex_run,
+                                   omlx_fetch=omlx_fetch, simctl_run=simctl_run)
+            if args.json:
+                print(json.dumps(report, indent=2))
+            else:
+                print("Codex: %s (required flags %s)" %
+                      (report["codex"]["version"] or "unavailable",
+                       "ok" if report["codex"]["flags_ok"] else "not ready"))
+                print("oMLX: %s" % (report["omlx"].get("error_code") or "reachable"))
+                print("Permissions: %s; wrapper %s" %
+                      (report["permissions"]["mode"],
+                       "available" if report["permissions"]["wrapper_available"]
+                       else "unavailable"))
+                print("Simulators: %d available" % len(report["simulators"]))
+                print("State: %s; plugin: %s" %
+                      (report["state_dir"], report["plugin_version"]))
+            return 0
         if args.command == "status":
             state = resolve_state_dir(args.state_dir)
             if args.job_id and not re.fullmatch(r"[A-Za-z0-9._-]+", args.job_id):

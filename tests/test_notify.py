@@ -3,6 +3,8 @@ import sys
 import subprocess
 import tempfile
 import unittest
+import contextlib
+import io
 from pathlib import Path
 from unittest import mock
 
@@ -55,8 +57,9 @@ class NotifyTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"CODEX_HOME": str(root / "codex"),
                                               "LOCAL_WORKER_NOTIFY": "0"}):
                 with mock.patch.object(local_worker.notify, "notify", return_value=True) as sent:
-                    result = local_worker.main(["summary", "--session", "S1",
-                                                "--state-dir", str(state)])
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        result = local_worker.main(["summary", "--session", "S1",
+                                                    "--state-dir", str(state)])
         self.assertEqual(result, 0)
         self.assertEqual(sent.call_args.args[0], "summary")
         self.assertIn("written", sent.call_args.args[2])

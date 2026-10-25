@@ -1,228 +1,97 @@
 ---
 name: local-worker
-description: Use when implementing, fixing, refactoring, or testing code in a trusted local Git repository under this setup's pinned local worker policy.
+description: Use when a repository task can be split into local read, write, or capture jobs that need verified results, screenshots, or a live cloud escalation path.
 ---
 
 # Local Worker
 
-The model selected in this Codex window plans, scopes, and reviews. The pinned local worker
-model performs every implementation and repair; the launcher then runs the contract's
-verification commands. Both the worker and verification run full-host: the launcher's own
-filesystem permissions, network enabled, no sandbox confinement, no approval prompts, and no
-execpolicy rules. This is a local routing default, never a reason to switch to a cloud worker.
-It does not change the window model, global provider, or app-wide enforcement.
+Use the window model to plan and review. The launcher discovers the currently loaded local
+chat model and its endpoint, pins that profile for each job, and returns structured evidence.
+Do not assume a model name, alias, port, or context size.
 
-Resolve the plugin root from this skill's own path instead of trusting a remembered checkout.
-This file is `<root>/skills/local-worker/SKILL.md`, so the plugin root is two directories above
-it, `plugin.json` sits directly inside it, and the launcher is `<root>/bin/local-worker`. The
-root is wherever the installed package lives; it changes on every update or reinstall, so never
-hardcode a personal checkout path. The user-wide default that routes work here is
-[the canonical global policy](references/global-policy.md).
+Resolve the installed root from this skill path: this file is
+`<root>/skills/local-worker/SKILL.md`; the root is two directories above it. The manifest is
+`<root>/.codex-plugin/plugin.json` and the launcher is `<root>/bin/local-worker`.
 
 ```sh
-<root>/bin/local-worker --help
+<root>/bin/local-worker doctor --json
+<root>/bin/local-worker preflight
+<root>/bin/local-worker models --json
 ```
 
-The default execution backend is `full-host-access`; legacy explicit helpers also exist.
-The worker runs `codex exec` with
-`-s danger-full-access`, `approval_policy=never` and `--ignore-rules`; verification runs the
-contract argv arrays directly on the host, unwrapped. Every result records `sandboxed: false`
-with the backend and confinement, so a report never claims a sandbox it did not apply. Legacy
-confined helpers still exist in the code for an explicitly selected backend; nothing in the
-default flow uses them, and no current instruction asks you to generate or grant Seatbelt or
-`codex sandbox` rules.
+`doctor` reports Codex compatibility, live oMLX discovery, permission mode and deny lists,
+wrapper availability, available simulators, state directory, and plugin version. `preflight`
+checks the installed Codex CLI and live local model endpoint. `models` shows discovered local
+models and their limits. Treat unavailable discovery as an environment problem; do not guess a
+model or endpoint.
 
-## Before launching
+## Planner loop
 
-1. Read the repository instructions and enough of its specification to write a narrow,
-   reviewable task contract. Keep the primary checkout and its existing changes intact.
-2. Run the endpoint/model check:
+Follow these steps for each repository request:
+
+1. **Decompose.** Turn the request into small, ordered jobs with clear acceptance criteria and
+   disjoint `allowed_paths` for write jobs. Use a read job first when repository behavior or
+   facts need inspection before implementation. Keep the user's main checkout intact.
+2. **Read job.** Create a `kind: "read"` contract with a question, `scope_paths`, an
+   `answer_schema`, and an answer-size limit. The launcher validates the JSON answer and checks
+   its citations against the worktree. Review the answer and the cited files before planning
+   edits.
+3. **Plan, then write job.** Use a `kind: "write"` contract with a concrete goal,
+   `acceptance_criteria`, `allowed_paths`, argv-array `test_commands`, and one total
+   `timeout_seconds` budget. The nine-field [`examples/task.json`](../../examples/task.json)
+   remains a supported v1 write contract; new contracts may also include v2 fields such as
+   `kind`, `workstream`, `environment`, `tier`, and `ui_review`.
 
    ```sh
-   <launcher> preflight
+   <root>/bin/local-worker run --task-file /absolute/path/task.json --json
    ```
 
-   It confirms the pinned alias, loopback endpoint, availability, and disabled fallback. It
-   does not check the native toolchain, simulator, or dependency cache. Stop on failure; do
-   not repair account permissions automatically or route to another model.
-3. Use one shared default state directory and one worker by default. Raise `--max-workers`
-   only for independently scoped contracts with non-overlapping owned paths and a clear
-   integration plan. The pool is shared across launcher copies; each Apple simulator UUID
-   also has one exclusive lease. See [the operating policy](references/operating-policy.md)
-   before changing concurrency, retry, or recovery behavior.
-4. Use the stable workstream name `default` unless the task has an established workstream.
-   For an ordinary task, write the nine-field contract shown in
-   [`examples/task.json`](../../examples/task.json) and run:
+4. **Review.** Read the JSON fields `status`, `classification`, `answer`, `patch_path`,
+   `screenshots`, `tests`, `tokens`, `durations`, and `report_path`. Inspect the patch, test
+   results, audit, and report yourself before integrating anything. For UI work, include a
+   native plan and request `ui_review`; inspect the `screenshots/index.md` and each before/after
+   image. A `kind: "capture"` contract uses a `capture` object to produce screenshot evidence
+   without worker changes; use it only for an explicit capture request, not as a substitute for
+   reviewing a write job.
+5. **Follow `next_action`.** `done` ends that job. For `retry_local`, apply the concrete
+   remediation and retry at most once per failure code, within the original job deadline. Then
+   follow the final classification; do not blindly repeat a retry, create a replacement job, or
+   reset the workstream. `needs_user` means report the blocker and ask for what is actually
+   missing. For `escalate_cloud`, inspect the live catalog with `models --cloud --json`, choose
+   the cheapest suitable model from its current descriptions, and start with low reasoning
+   effort. Escalate in order: local worker, cheapest suitable cloud model, a stronger cloud
+   model only when justified, then planner implementation as a last resort. Each escalation
+   must be authorized by the user's request and applicable policy. Continue the same scoped task
+   and link it with `--escalates <job-id>`; do not invent a model slug, retry a cloud job as
+   local, or silently reset the workstream.
+6. **Summarize.** After the last job, run `<root>/bin/local-worker summary`. Report the generated
+   summary, job outcomes, measured token and time totals, screenshots, escalations, missing
+   evidence, and any section named **Suggested fixes for this plugin**. The summary notification
+   is a hand-off that the session record is ready; it is not approval to integrate a patch.
 
-   ```sh
-   <launcher> run --task-file /absolute/path/task.json --json
-   ```
+## Permissions and recovery
 
-   For a native Apple task, first use the native gate below. `--no-verify` means verification
-   was not run; it is not a bypass.
+Workers use the launcher's full-host access and a macOS deny wrapper when available. Worktree
+scope and post-run audit detect out-of-scope edits; they do not confine filesystem or network
+access. Keep secrets out of repositories. `permissions.json` belongs to the user: **never edit permissions.json**.
+Read it with `<root>/bin/local-worker permissions show`; use the explicit
+`permissions deny-read`, `allow-read`, `deny-write`, or `allow-write` commands only when the user
+asks to change the list. Doctor is read-only and does not create a missing permission file.
 
-## Native Apple task
+Use `status --state-dir <dir> [--job-id <id>]` to inspect active work. A failed, interrupted, or
+superseded job preserves its report, logs, worktree, and patch for review. Do not reset or merge
+its worktree. After reviewed work is committed and pushed, archive a completed launcher worktree
+with `<root>/bin/local-worker-archive archive --repo <repo> --state-dir <state> --job-id <id>`;
+verify the recovery ref, bundle, and archive receipt before cleanup. See
+[operating policy](references/operating-policy.md) for retention and failure handling and
+[Apple verification](references/apple-verification.md) for simulator plans.
 
-The legacy `preflight` checks model routing only. Before Qwen sees a native task, require a
-versioned native preflight plan and run:
+## Guardrails
 
-```sh
-<launcher> run --task-file /absolute/path/task.json \
-  --apple-simulator-udid <UUID> \
-  --native-preflight-plan /absolute/path/native-plan.json \
-  --workstream <stable-name> --job-kind implementation
-```
-
-The gate must build a fresh app from the selected worktree with the real toolchain, install
-and launch it on that UUID, then run the planned positive XCTest target on that same device,
-using the same full-host permissions and environment as later verification. Every step and its
-artifact path must pass before the worker starts. Missing dependencies, an invalid plan, an
-unavailable simulator, a failed app step, or a command that could not run makes the job
-`blocked`; stop there and report the check. Availability or metadata alone is never
-qualification: require the actual build product, launched bundle identifier with a positive
-process ID, and a result bundle with at least one passing test and no failures.
-`--preflight-only` runs this gate without starting Qwen. Read
-[Apple verification](references/apple-verification.md) for the plan schema and evidence.
-
-A native job stays on the full-host backend: the opt-in pins scope, not confinement. One
-selected simulator UUID is held under an exclusive lease and the toolchain environment is
-pinned, while `HOME` stays unchanged (the worker's `CODEX_HOME` is the job's own, as for every
-job). The worker can call `xcrun`, `simctl`,
-`xcodebuild` and `xcresulttool` directly, so keep it bound to the selected device and its task
-scope. `--no-verify` cannot bypass this gate for a native task. A runner PID or suspended
-process is not a passing XCTest case. For startup hangs or cross-job asset-compiler failures,
-use the bounded diagnosis in the Apple reference.
-
-## Repairs and stop conditions
-
-Give every related job the same stable `--workstream` value; a task ID or job ID change does
-not start a new repair history. Mark the initial job `--job-kind implementation` and any
-follow-up `--job-kind repair`. A repair contract names the exact failed acceptance item,
-relevant diagnostic, and narrow paths it may change.
-
-The launcher preserves a per-workstream circuit breaker across jobs. Two consecutive worker
-attempts that produce no in-scope patch stop further launch for that workstream, even if a
-new task ID is supplied. A repair workstream also has a maximum of two worker attempts and
-1,200 seconds aggregate budget shared across all jobs in that workstream, including
-concurrent jobs, waiting, and verification. `--preflight-only` starts no worker and does not
-consume a policy attempt. The launcher rechecks persisted usage before each start and never
-renews or resets it automatically. If a limit is reached, stop and report the preserved
-evidence; change the plan only after human review.
-
-Reserve verification time in `timeout_seconds`: the default worker-attempt cap is 300
-seconds, and the verification reserve is 20% of the job budget, bounded from 5 to 60
-seconds. The worker must not consume the entire job deadline. A zero-patch run, failed
-worker, blocked gate, skipped check, or timed-out verification is not success evidence.
-Acceptance is the planner's decision after inspecting the patch and actual verification
-results.
-
-## Monitor and review
-
-While a worker runs, use the live status command and stream available attempt logs:
-
-```sh
-<launcher> status --state-dir "$LOCAL_WORKER_STATE_DIR" --job-id <job-id>
-```
-
-Status reports elapsed time and token usage only when measured, with its source or an
-explicit unavailable/partial state. Missing log output is not evidence of a stall; do not
-invent a completion estimate or infer a throughput or cost. Use actual state transitions
-and emitted events to describe progress.
-
-After completion, inspect `report.json`, `changes.patch`, each attempt's last message and
-logs, every native preflight artifact, and every `verify-attempt-N-M.log`. Report actual worker,
-preflight, and verification durations plus measured usage by attempt. Keep cached-token
-counts separate from uncached counts; never label tokens as billed dollars or present
-missing counts as zero. The worktree, report, and patches remain available for review until the
-reviewed parent archives the job and removes that worktree under the global completion rule.
-
-Check the audit and each acceptance criterion yourself. A passing test does not excuse an
-out-of-scope edit. A worker summary or a readiness probe is not semantic acceptance. Never
-apply an unreviewed patch to the primary checkout or auto-merge it. When work is finished,
-the reviewed parent follows the global completion rule: commit and push the task branch,
-archive needed artifacts and remove completed linked worktrees. Workers never perform those
-Git or cleanup operations. If a repair is warranted, use the
-same workstream, a new narrowly scoped contract, and `--job-kind repair`; stop at the
-circuit-breaker or repair budget.
-
-This skill is discovered from the installed package, so there is nothing to copy here. The
-installer behind [setup](../setup/SKILL.md) maintains the small managed global instruction block
-that points at this skill and at [the canonical global policy](references/global-policy.md); a
-legacy hand-copied `~/.codex/skills/local-worker/SKILL.md` can be retired once the plugin
-install is qualified. A worker never installs a skill or writes global configuration.
-
-## Per-task MCP tools and cleanup
-
-Task tooling is its own schema-1 manifest, passed per job; nothing is inherited from the plugin,
-the app configuration, or another task:
-
-```sh
-<root>/bin/local-worker run --task-file /absolute/path/task.json \
-  --tool-config /absolute/path/tools.json
-```
-
-[`../../examples/tool-config.json`](../../examples/tool-config.json) is this repository's working
-manifest for the local stdio fixture: explicit `required_commands` (`python3`), server `command`
-plus `args` (`tests/fixtures/mcp_echo.py`), `env_vars` (`TASK_TOOL_TOKEN`), a non-empty
-`enabled_tools` allowlist (`echo`), `startup_timeout_sec` 10 and `tool_timeout_sec` 15.
-
-- Credentials are environment variable **names**, never values; a selected value must be at
-  least 4 characters so it can be redacted, and it never reaches argv, the prompt, the report or
-  the logs. A manifest carrying a literal token, a missing `enabled_tools` allowlist, an
-  unresolvable `required_commands` entry, a server that cannot be probed, an allowlisted tool the
-  probe did not advertise, or an unset named credential **blocks the job before the worker
-  starts**; the report states which one. A server may advertise more tools than `enabled_tools`
-  selects: unselected advertised tools are normal and block nothing, while an allowlisted tool the
-  probe did not list is the real missing-capability block. The parent may prepare or correct the
-  per-task contract and tool manifest itself; those are parent-side orchestration artifacts, not
-  implementation work. Code changes still go to the worker in a narrowly scoped
-  `--job-kind repair` job, never to a hand edit in the worktree.
-- Keep the three evidence states apart in any report: `configured` (the manifest named it),
-  `probed` (the metadata probe initialized the server and listed its tools), `observed` (an
-  explicit `mcp_tool_call` lifecycle event in that job's own stdout named that server and tool).
-  A successful tool listing is not an observed call, a tool name quoted in prose is not one
-  either, and the probe is a capability check rather than the live worker backend. Observations
-  accumulate across attempts, so an earlier call is still evidence after an idle retry.
-- At completion the reviewed parent archives before cleanup, after the task branch is pushed:
-
-```sh
-<root>/bin/local-worker-archive archive --repo /absolute/path/repo \
-  --state-dir /absolute/path/state --job-id <job-id>
-```
-
-  The retained receipt (`prepared` before removal, `archived` after), recovery ref
-  `refs/local-worker/archive/<job-id>`, verified bundle and hash-verified archive copy are the
-  evidence that the worktree was disposable; quote them instead of claiming retention.
-
-## Failure handling
-
-- Read the current report's `failure_reason`, gate checks, attempt records, audit, and
-  verification logs. Do not diagnose from an old run or quoted text in model output.
-- A missing native dependency cache is a preparation blocker, not a code regression. Network is
-  already enabled on the full-host backend, so prepare a pinned, worktree-local cache through
-  an explicitly authorized deterministic setup step, or report the dependency as blocked.
-- For a native failure, distinguish gate failure from build, install, launch, and test failure
-  using [Apple verification](references/apple-verification.md). Fix a command or the task
-  contract; do not restate an availability check as proof that tests ran.
-- Keep active work and evidence. At completion, preserve failed/superseded drafts in recovery
-  refs or verified bundles and retain needed artifacts before removing their worktrees. See
-  [retention and trust boundaries](references/operating-policy.md).
-
-## Constraints
-
-- Never run the worker through `codex exec` directly. The launcher is what pins local model
-  routing, isolates the worktree, audits its changes, and redacts secrets. Nothing else
-  constrains a worker that already has full host access.
-- Never change the model selected in this window or the global provider to Qwen. No cloud
-  fallback or cloud implementation is permitted by this skill.
-- Full-host execution is not a boundary. The worktree, the `allowed_paths` contract, and the
-  post-run audit are scope and detection evidence; they do not enforce filesystem permissions.
-  Treat anything this host can read or write as reachable, and use trusted, scrubbed copies.
-- Run long commands in the foreground through `exec_command` and poll the managed session.
-  Never detach a test with a raw `&`, `nohup`, or `disown`, and never poll with sleep-and-tail
-  loops: a bare background process dies when its tool call ends and leaves an incomplete log.
-  The parent's deterministic verifier is the right place for broad test suites.
-- Bound exploration. Read the files a contract names once, do not re-inspect unchanged
-  evidence, and prefer a compact result manifest over long case tables.
-- Only use the launcher with trusted repositories. Its reports are review evidence, not
-  approval to integrate changes.
+- Never call `codex exec` directly for a job; use the launcher so its discovery, isolation,
+  verification, audit, and report stay connected.
+- Never hand-apply a worker patch before reviewing the diff and verification evidence.
+- A runnable command that exits nonzero is `failed`; a command that could not run is `blocked`.
+  Do not present either as a passing check.
+- The local model identity comes from live discovery and pinned request evidence. If discovery
+  fails, report its classification and follow the returned `next_action`.

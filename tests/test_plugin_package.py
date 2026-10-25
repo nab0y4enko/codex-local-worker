@@ -263,6 +263,20 @@ class CopiedPackageTest(PackageBase):
             target = self.resolve(reference, skill.parent)
             self.assertTrue(target.is_file(), "skill reference is missing: " + reference)
 
+    def test_skill_teaches_the_planner_loop_and_forbids_permission_edits(self):
+        skill = (Path(self.root) / "skills/local-worker/SKILL.md").read_text(encoding="utf-8")
+        readme = (Path(self.root) / "README.md").read_text(encoding="utf-8")
+        for anchor in ("read job", "write job", "next_action", "escalate_cloud",
+                       "models --cloud", "summary", "Suggested fixes for this plugin",
+                       "never edit permissions.json", "once per failure code",
+                       "cheapest suitable cloud", "last resort"):
+            self.assertIn(anchor, skill)
+        for gone in ("Qwen3.8", "qwen-3.8", "tvOS simulator UUID", "global-policy.md"):
+            self.assertNotIn(gone, skill + readme)
+        setup = (Path(self.root) / "skills/setup/SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("user-owned commit/push/worktree-cleanup rule", setup)
+        self.assertIn("../../README.md#install", setup)
+
     def test_global_policy_is_not_shipped_but_legacy_migration_input_is_unchanged(self):
         self.assertFalse((Path(self.root) / "skills/local-worker/references/global-policy.md").exists())
         legacy = (ROOT / "evidence" / "global-default" / "AGENTS.md").read_text(encoding="utf-8")
@@ -276,15 +290,16 @@ class CopiedPackageTest(PackageBase):
         doctor = (Path(self.root) / "skills" / "doctor" / "SKILL.md").read_text(encoding="utf-8")
         for phrase in ("python3 <root>/src/plugin_setup.py --check",
                        "python3 <root>/src/plugin_setup.py --apply",
+                       "python3 <root>/src/plugin_setup.py --apply --pointer",
                        "CODEX_HOME", "AGENTS.md", "idempotent",
                        "backup"):
             self.assertIn(phrase, setup, "setup must document: " + phrase)
-        self.assertIn("python3 <root>/src/plugin_setup.py --check --preflight", doctor)
-        self.assertIn("<root>/bin/local-worker preflight", doctor)
-        for must_not in ("plugin_setup.py --apply", "install oMLX"):
+        self.assertIn("<root>/bin/local-worker doctor --json", doctor)
+        self.assertIn("permissions.wrapper_available", doctor)
+        self.assertIn("error_code", doctor)
+        for must_not in ("plugin_setup.py --apply", "create a missing permission file"):
             self.assertNotIn(must_not, doctor, "doctor must stay read-only: " + must_not)
         self.assertIn("no credentials", setup.lower())
-        self.assertIn("never fall", setup.lower())
         script = Path(self.root) / "src" / "plugin_setup.py"
         self.assertTrue(script.is_file(), "the documented setup helper must ship: " + str(script))
         source = script.read_text(encoding="utf-8")
@@ -379,6 +394,8 @@ class ManifestParityTest(PackageBase):
         for key in ("logo", "logoDark", "composerIcon"):
             self.assertTrue((ROOT / manifest["interface"][key]).is_file())
         self.assertTrue(manifest["interface"]["screenshots"])
+        for screenshot in manifest["interface"]["screenshots"]:
+            self.assertTrue((ROOT / screenshot).is_file())
 
     def test_version_has_one_source(self):
         from src import plugin_setup

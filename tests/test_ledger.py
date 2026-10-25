@@ -1,4 +1,6 @@
 import json
+import contextlib
+import io
 import os
 import tempfile
 import unittest
@@ -132,8 +134,9 @@ class LedgerTests(unittest.TestCase):
     def test_summary_command_writes_both_formats(self):
         with mock.patch.dict("os.environ", {"CODEX_HOME": str(self.home),
                                              "LOCAL_WORKER_NOTIFY": "0"}):
-            code = local_worker.main(["summary", "--session", "S8",
-                                      "--state-dir", str(self.state)])
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = local_worker.main(["summary", "--session", "S8",
+                                          "--state-dir", str(self.state)])
         self.assertEqual(code, 0)
         self.assertTrue((self.state / "sessions" / "S8" / "summary.md").is_file())
         self.assertTrue((self.state / "sessions" / "S8" / "summary.json").is_file())
