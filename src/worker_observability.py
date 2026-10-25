@@ -438,7 +438,8 @@ def _atomic_json(path, value):
 
 class RunObserver:
     """Persist sanitized output immediately and replace an atomic progress snapshot."""
-    def __init__(self, report_dir, secrets=(), attempt=1, job_id=None, job=None):
+    def __init__(self, report_dir, secrets=(), attempt=1, job_id=None, job=None,
+                 active_dir=None, worker_command=None):
         self.report_dir = Path(report_dir)
         self.report_dir.mkdir(parents=True, exist_ok=True)
         self.started = time.monotonic()
@@ -455,6 +456,10 @@ class RunObserver:
         self.redactors = {name: _Redactor(secrets) for name in ("stdout", "stderr")}
         redactor = _Redactor(secrets)
         self.job_id = redactor.feed(str(job_id or "").encode(), final=True) or None
+        self.active_dir = Path(active_dir) if active_dir is not None else None
+        self.worker_command = str(worker_command or "")
+        self.active_path = (self.active_dir / f"{self.job_id}.json"
+                            if self.active_dir is not None and self.job_id else None)
         self.attempt = attempt
         self.launcher_pid = os.getpid()
         self.worker_pid = None
@@ -480,8 +485,15 @@ class RunObserver:
         self._write_progress()
 
     def process_started(self, pid):
-        """Record the actual Popen PID; liveness interpretation belongs to the caller."""
+        """Record the actual worker process group for interruption and orphan recovery."""
         self.worker_pid = pid
+        if self.active_path is not None:
+            self.active_dir.mkdir(parents=True, exist_ok=True)
+            _atomic_json(self.active_path, {
+                "job_id": self.job_id, "launcher_pid": self.launcher_pid,
+                "worker_pgid": pid, "worker_command": self.worker_command,
+                "started_at": self.started_at,
+            })
         self._write_progress()
 
     def _inherited(self):
@@ -603,6 +615,9 @@ class RunObserver:
                 self._event(json.loads(self.line))
         for handle in self.files.values():
             handle.close()
+        if self.active_path is not None:
+            with contextlib.suppress(OSError):
+                self.active_path.unlink()
         if result and result.get("timed_out"):
             status = "timed_out"
         elif result and result.get("returncode") not in (None, 0) and status == "completed":

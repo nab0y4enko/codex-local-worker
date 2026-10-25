@@ -255,6 +255,7 @@ EXIT_CODES = {
     "timeout": 8,
     "model_mismatch": 9,
     "no_changes": 10,
+    "interrupted": 11,
 }
 
 LIMITATIONS = (
@@ -293,6 +294,70 @@ class LauncherError(Exception):
     """Base class for failures that carry a report status."""
 
     status = "worker_failed"
+
+
+class Interrupted(LauncherError):
+    """The launcher received a termination signal while a job was active."""
+
+    status = "interrupted"
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def reap_orphans(state_dir: Path) -> List[Dict[str, Any]]:
+    """Stop recorded worker groups only after their launcher died and command identity matches."""
+    active_dir = Path(state_dir) / "active"
+    killed: List[Dict[str, Any]] = []
+    if not active_dir.is_dir():
+        return killed
+    for record_path in sorted(active_dir.glob("*.json")):
+        try:
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            launcher_pid = int(record["launcher_pid"])
+            pgid = int(record["worker_pgid"])
+            command = str(record["worker_command"])
+        except (OSError, ValueError, TypeError, KeyError):
+            continue
+        if launcher_pid <= 0 or pgid <= 0 or not command or _pid_alive(launcher_pid):
+            continue
+        if not observation._group_exists(pgid):
+            with contextlib.suppress(OSError):
+                record_path.unlink()
+            continue
+        try:
+            actual = subprocess.run(["ps", "-o", "command=", "-p", str(pgid)],
+                                    capture_output=True, text=True, timeout=2, check=False).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if not actual.startswith(command):
+            continue
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pgid, signal.SIGTERM)
+        deadline = time.monotonic() + .5
+        while time.monotonic() < deadline and observation._group_exists(pgid):
+            time.sleep(.02)
+        if observation._group_exists(pgid):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(pgid, signal.SIGKILL)
+        item = {"job_id": record.get("job_id"), "launcher_pid": launcher_pid,
+                "worker_pgid": pgid, "worker_command": command, "action": "killed"}
+        killed.append(item)
+        with contextlib.suppress(OSError):
+            record_path.unlink()
+        try:
+            with (active_dir / "reaped.jsonl").open("a", encoding="utf-8") as log:
+                log.write(json.dumps(item, sort_keys=True) + "\n")
+        except OSError:
+            pass
+    return killed
 
 
 class ContractError(LauncherError):
@@ -3112,6 +3177,8 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         before_states = {path: path_state(worktree / path) for path in before_worker.changed_paths}
         observer = observation.RunObserver(report_dir, secrets=secrets,
                                            attempt=attempt_number, job_id=report["job_id"],
+                                           active_dir=state_dir / "active",
+                                           worker_command=options.codex_bin,
                                            job={"started_at": report.get("started_at"),
                                                 "workstream": report.get("workstream"),
                                                 "job_kind": report.get("job_kind")})
@@ -3479,6 +3546,7 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
                            float(options.task.timeout_seconds),
                            max(deadline.remaining(), 0.0))
         with job_lease(options, report, lock_timeout, job_deadline=deadline.end) as lease:
+            report["reaped_orphans"] = reap_orphans(options.state_dir)
             if key_error is not None:
                 raise key_error
             _execute(options, report, deadline, lease, secrets=secrets)
@@ -3859,7 +3927,16 @@ def main(argv: Optional[Sequence[str]] = None, *,
             tool_config=args.tool_config,
             codex_run=codex_run,
         )
-        report = run_job(options)
+        previous_handlers = {}
+        def interrupt_handler(signum, _frame):
+            raise Interrupted(f"launcher interrupted by signal {signal.Signals(signum).name}")
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            previous_handlers[signum] = signal.signal(signum, interrupt_handler)
+        try:
+            report = run_job(options)
+        finally:
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
     except LauncherError as error:
         print(json.dumps(refusal_payload(error), indent=2))
         return EXIT_CODES.get(error.status, 4)
