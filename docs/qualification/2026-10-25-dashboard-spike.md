@@ -8,9 +8,12 @@ reload the installed app if needed.
 
 - `spikes/dashboard/server.py` is a dependency-free stdio MCP server with `initialize`,
   `tools/list`, `tools/call`, `resources/list`, `resources/read`, and `ping`. The only tool is
-  `open_dashboard`; fixture data is synthetic and read-only. `DASHBOARD_FIXTURE` optionally points
-  it at an owned JSON fixture so a reviewer can change revision A to B without touching worker
-  state or user data.
+  `open_dashboard`; fixture data is synthetic and read-only. It reads only the fixed
+  `spikes/dashboard/fixtures/dashboard.json` file beside the server. The server does not accept a
+  fixture path from the environment or tool arguments. It rejects a symlinked fixture directory
+  or file, resolves the target under the package fixture directory, opens with `O_NOFOLLOW` where
+  supported, and requires a regular file. Tests change revision A to B only in a copied disposable
+  package.
 - `spikes/dashboard/widget.html` is static HTML with a table, an embedded PNG data URI, an MCP Apps
   `ui/initialize` bridge handshake, a refresh button using `tools/call`, and a PiP request button
   shown only when the host advertises `pip`. Its visible diagnostics distinguish the app-declared
@@ -24,16 +27,18 @@ reload the installed app if needed.
   `hostContext.availableDisplayModes` and records the actual response to a `pip` request.
 - `tests/test_dashboard_spike.py` exercises the JSONL stdio protocol with real subprocess pipes,
   capability negotiation and text-only fallback, resource URI/MIME, embedded PNG signature and
-  CRCs, tool result data, and fixture revision refresh.
+  CRCs, tool result data, fixture revision refresh, an ignored `../../outside.json` environment
+  override, and rejected outside-target and outside-ancestor symlinks.
 
 ## Evidence collected
 
 | Check | Result |
 |---|---|
-| Protocol test | `python3 -m unittest tests.test_dashboard_spike` — 4 tests passed. |
+| Protocol and fixture-boundary tests | `python3 -m unittest tests.test_dashboard_spike` — 7 tests passed. |
 | Python syntax | `python3 -m py_compile spikes/dashboard/server.py tests/test_dashboard_spike.py` — passed. |
 | App package | `/Applications/ChatGPT.app` version `26.1021.31345`; prior local readiness inspection identifies it as the Codex variant. No app UI was opened, installed, reloaded, or restarted for this spike. |
-| CLI | `codex-cli 0.164.0-alpha.11.1`. Isolated `codex plugin marketplace add`, `codex plugin add`, `codex plugin list`, and `codex mcp list` succeeded with both `HOME` and `CODEX_HOME` set to `/tmp/dashboard-spike-cli-home.r8G7mB`. The CLI listed `dashboard_spike` as an enabled stdio MCP server. It has no widget-rendering surface in these CLI commands. No prompt, model inference, login, or user config access was performed. Therefore this establishes CLI package/server qualification, not that an assistant invocation ignores the UI metadata. |
+| CLI package | `codex-cli 0.164.0-alpha.11.1`. Isolated `codex plugin marketplace add`, `codex plugin add`, `codex plugin list`, and `codex mcp list` succeeded with `HOME=CODEX_HOME=/tmp/dashboard-spike-cli-home-r1-20261025`. The CLI listed `dashboard_spike` as an enabled stdio MCP server with no environment overrides. |
+| Actual Codex MCP handshake | In the same isolated home, `/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex app-server --listen stdio://` accepted a no-inference JSON-RPC `initialize` handshake, then `mcpServerStatus/list` started the plugin server and reported `toolsError: null` with `open_dashboard`. The request was repeated with and without the `io.modelcontextprotocol/ui` capability in the outer app-server initialize; the status response exposed the tool name but not `_meta` fields. This verifies MCP server startup and tool listing in the CLI app-server, not desktop rendering or UI capability support. No prompt, model inference, login, or real user config access was performed. |
 | Desktop rendering / advertised host modes / PiP | Not observed; requires the approved desktop install/reload step. |
 | A→B mounted refresh / unsolicited updates | Not observed in the host. The fixture and refresh round trip are prepared; the server has no push mechanism. |
 
@@ -53,13 +58,14 @@ Prepared outside the installed package cache and outside the repository:
   plugin/.mcp.json
   plugin/server.py
   plugin/widget.html
-  plugin/fixture.json
+  plugin/fixtures/dashboard.json
 ```
 
 The plugin identity is `dashboard-mcpapps-spike-20261025`, distinct from `codex-local-worker`.
 The CLI qualification changed only the disposable test home at
-`/tmp/dashboard-spike-cli-home.r8G7mB`; the real `~/.codex` and desktop settings were not read or
-changed.
+`/tmp/dashboard-spike-cli-home-r1-20261025`; the real `~/.codex` and desktop settings were not
+read or changed. The marketplace package version is `0.1.1` and the MCP manifest contains no
+external fixture path or environment override.
 
 After the parent reviews this prepared result and obtains approval for the desktop action, the
 CLI-managed marketplace command is:
@@ -76,8 +82,8 @@ codex plugin add dashboard-mcpapps-spike-20261025@dashboard-spike-20261025
 
 The setting to record is only the `dashboard-spike-20261025` marketplace source plus the
 `dashboard-mcpapps-spike-20261025` plugin install/enable choice. Before making those changes,
-record `codex plugin marketplace list` and the plugin list so rollback can restore the prior
-state. Rollback uses the inverse commands:
+record `codex plugin marketplace list` and `codex plugin list --json` so rollback can restore the
+prior state. Rollback uses the inverse commands:
 
 ```sh
 codex plugin remove dashboard-mcpapps-spike-20261025@dashboard-spike-20261025
@@ -87,6 +93,8 @@ codex plugin marketplace remove dashboard-spike-20261025
 If app reload is requested by the desktop, do it only as part of the approved gate and record
 that action; after rollback, reload again only if needed to make the removal effective. The
 temporary marketplace can then be removed with `rm -rf /tmp/codex-dashboard-mcpapps-spike-20261025`.
+The disposable CLI qualification home can then be removed with
+`rm -rf /tmp/dashboard-spike-cli-home-r1-20261025`.
 The installed app remains untouched until that approval. Do not copy or inspect session,
 message, credential, or authentication data for this gate.
 

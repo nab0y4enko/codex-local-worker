@@ -3,29 +3,42 @@
 
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 
 
 RESOURCE_URI = "ui://local-worker/dashboard"
 MIME_TYPE = "text/html;profile=mcp-app"
-FIXTURE_ENV = "DASHBOARD_FIXTURE"
 
 
 def _load_dashboard():
-    fixture = os.environ.get(FIXTURE_ENV)
-    if fixture:
-        data = json.loads(Path(fixture).read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
-            raise ValueError("fixture must be an object with a rows list")
-        return data
-    return {
-        "revision": "A",
-        "rows": [
-            {"job": "demo-local-01", "status": "complete", "tier": "local"},
-            {"job": "demo-local-02", "status": "running", "tier": "local"},
-        ],
-    }
+    package_root = Path(__file__).resolve().parent
+    fixtures_dir = Path(__file__).parent / "fixtures"
+    fixture_path = fixtures_dir / "dashboard.json"
+    if fixtures_dir.is_symlink() or fixture_path.is_symlink():
+        raise ValueError("dashboard fixture directory and file must not be symlinks")
+    resolved_fixtures = fixtures_dir.resolve(strict=True)
+    resolved_fixture = fixture_path.resolve(strict=True)
+    if resolved_fixtures != package_root / "fixtures" or resolved_fixture.parent != resolved_fixtures:
+        raise ValueError("dashboard fixture must stay inside the package fixtures directory")
+    directory_descriptor = os.open(
+        str(fixtures_dir), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+        getattr(os, "O_NOFOLLOW", 0))
+    try:
+        if not stat.S_ISDIR(os.fstat(directory_descriptor).st_mode):
+            raise ValueError("dashboard fixture directory must be a directory")
+        descriptor = os.open("dashboard.json", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                             dir_fd=directory_descriptor)
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ValueError("dashboard fixture must be a regular file")
+            data = json.load(handle)
+    finally:
+        os.close(directory_descriptor)
+    if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
+        raise ValueError("fixture must be an object with a rows list")
+    return data
 
 
 def _text_summary(data):
