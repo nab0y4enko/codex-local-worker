@@ -120,6 +120,125 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(result["input_tokens"], 25)
         self.assertEqual(result["output_tokens"], 4)
         self.assertEqual(result["subagents"], "not linked")
+        self.assertEqual(result["completeness"], "snapshot")
+
+    def test_planner_usage_is_final_only_after_matching_task_completion(self):
+        home = self.planner_home(session="S-final")
+        path = home / "sessions" / "2026" / "rollout_planner.jsonl"
+        rows = [
+            {"type": "session_meta", "payload": {"id": "S-final"}},
+            {"timestamp": "2026-10-25T19:00:00Z", "type": "event_msg", "payload": {
+                "type": "task_started", "turn_id": "turn-1"}},
+            {"timestamp": "2026-10-25T19:00:01Z", "type": "event_msg", "payload": {
+                "type": "token_count", "info": {"total_token_usage": {
+                    "input_tokens": 10, "output_tokens": 2}}}},
+            {"timestamp": "2026-10-25T19:00:02Z", "type": "event_msg", "payload": {
+                "type": "task_complete", "turn_id": "turn-other"}},
+        ]
+        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+        result = ledger.planner_usage("S-final", home)
+        self.assertEqual(result["completeness"], "snapshot")
+
+        rows[-1]["payload"]["turn_id"] = "turn-1"
+        rows.append({"timestamp": "2026-10-25T19:00:03Z", "type": "event_msg", "payload": {
+            "type": "token_count", "info": {"total_token_usage": {
+                "input_tokens": 14, "output_tokens": 3}}}})
+        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+        result = ledger.planner_usage("S-final", home)
+        self.assertEqual(result["completeness"], "final")
+        self.assertEqual(result["input_tokens"], 14)
+        self.assertEqual(result["as_of"], "2026-10-25T19:00:03Z")
+
+    def test_completed_turn_without_a_new_count_remains_a_snapshot(self):
+        home = self.planner_home(session="S-stale")
+        path = home / "sessions" / "2026" / "rollout_planner.jsonl"
+        rows = [
+            {"type": "session_meta", "payload": {"id": "S-stale"}},
+            {"timestamp": "2026-10-25T19:00:00Z", "type": "event_msg", "payload": {
+                "type": "task_started", "turn_id": "turn-old"}},
+            {"timestamp": "2026-10-25T19:00:01Z", "type": "event_msg", "payload": {
+                "type": "token_count", "info": {"total_token_usage": {
+                    "input_tokens": 10, "output_tokens": 2}}}},
+            {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-old"}},
+            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-new"}},
+            {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-new"}},
+        ]
+        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+        result = ledger.planner_usage("S-stale", home)
+        self.assertEqual(result["completeness"], "snapshot")
+        self.assertEqual(result["input_tokens"], 10)
+
+    def test_latest_count_without_timestamp_clears_stale_as_of(self):
+        home = self.planner_home(session="S-as-of")
+        path = home / "sessions" / "2026" / "rollout_planner.jsonl"
+        rows = [
+            {"type": "session_meta", "payload": {"id": "S-as-of"}},
+            {"timestamp": "2026-10-25T19:00:00Z", "type": "event_msg", "payload": {
+                "type": "token_count", "info": {"total_token_usage": {
+                    "input_tokens": 10, "output_tokens": 2}}}},
+            {"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 11, "output_tokens": 3}}}},
+        ]
+        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+        result = ledger.planner_usage("S-as-of", home)
+        self.assertIsNone(result["as_of"])
+        self.assertEqual(result["input_tokens"], 11)
+
+    def test_new_started_turn_and_incomplete_linked_child_keep_planner_snapshot(self):
+        child = self.home / "sessions" / "2026" / "rollout_child.jsonl"
+        child.parent.mkdir(parents=True, exist_ok=True)
+        child.write_text("\n".join([
+            json.dumps({"type": "session_meta", "payload": {
+                "id": "child-1", "parent_session_id": "S-active"}}),
+            json.dumps({"type": "event_msg", "payload": {"type": "task_started",
+                                                                  "turn_id": "child-turn"}}),
+        ]) + "\n")
+        parent = self.planner_home(session="S-active")
+        path = parent / "sessions" / "2026" / "rollout_planner.jsonl"
+        rows = [
+            {"type": "session_meta", "payload": {"id": "S-active"}},
+            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-1"}},
+            {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-1"}},
+            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-2"}},
+            {"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 20, "output_tokens": 4}}}},
+        ]
+        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+        result = ledger.planner_usage("S-active", parent)
+        self.assertEqual(result["completeness"], "snapshot")
+        self.assertIn("child-1", result["incomplete_children"])
+        self.assertIsNone(result["input_tokens"])
+
+    def test_snapshot_planner_usage_does_not_produce_a_final_local_share(self):
+        ledger.append_job(self.state, "S-snapshot", self.job("local-job", tokens=(10, 5, 2, 1)))
+        home = self.planner_home(session="S-snapshot")
+        summary = ledger.build_summary(self.state, "S-snapshot", home)
+        self.assertEqual(summary["planner"]["completeness"], "snapshot")
+        self.assertIsNone(summary["local_share"])
+        self.assertIn("snapshot", ledger.render_markdown(summary))
+
+    def test_missing_planner_usage_does_not_look_like_a_fully_local_session(self):
+        ledger.append_job(self.state, "S-no-planner", self.job("local-job", tokens=(10, 5, 2, 1)))
+        summary = ledger.build_summary(self.state, "S-no-planner", self.home)
+        self.assertIsNone(summary["planner"])
+        self.assertIsNone(summary["local_share"])
+
+    def test_summary_keeps_only_review_finding_counts_per_job(self):
+        report = self.job("reviewed", tokens=(10, 5, 2, 1))
+        report["review_findings"] = [{"path": "tests/test_x.py", "line": 3, "message": "missing assert"},
+                                    {"path": "tests/test_y.py", "line": 7, "message": "weak check"}]
+        ledger.append_job(self.state, "S-findings", report)
+        summary = ledger.build_summary(self.state, "S-findings", self.home)
+        self.assertEqual(summary["jobs"][0]["review_findings_count"], 2)
+        self.assertNotIn("missing assert", json.dumps(summary))
+        self.assertIn("Advisory test findings", ledger.render_markdown(summary))
+        self.assertIn("| 2 |", ledger.render_markdown(summary))
+
+    def test_summary_preserves_unknown_review_finding_count(self):
+        report = self.job("legacy", tokens=(10, 5, 2, 1))
+        report.pop("review_findings", None)
+        row = ledger._safe_report(report)
+        self.assertIsNone(row["review_findings_count"])
 
     def test_linked_child_usage_is_included_and_missing_fields_stay_missing(self):
         child = self.home / "sessions" / "2026" / "rollout_child.jsonl"

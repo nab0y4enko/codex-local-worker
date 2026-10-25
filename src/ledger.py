@@ -65,6 +65,7 @@ def _safe_report(report: Dict[str, Any]) -> Dict[str, Any]:
     timings = report.get("timing")
     timings = timings if isinstance(timings, dict) else {}
     attempts = [item for item in report.get("attempts", []) if isinstance(item, dict)]
+    review_findings = report.get("review_findings")
     classification = report.get("classification")
     classification = classification if isinstance(classification, dict) else {}
     screenshots = report.get("screenshots")
@@ -83,6 +84,7 @@ def _safe_report(report: Dict[str, Any]) -> Dict[str, Any]:
         "model": str(model),
         "profile": profile_value,
         "attempts": len(attempts),
+        "review_findings_count": len(review_findings) if isinstance(review_findings, list) else None,
         "first_try_success": bool(report.get("status") in ("ok", "ready") and len(attempts) == 1
                                   and attempts[0].get("returncode") == 0
                                   and not attempts[0].get("terminal_failures")
@@ -163,11 +165,16 @@ def _count_fields(raw: Any) -> Dict[str, Optional[int]]:
     return result
 
 
-def _latest_rollout_usage(path: Path, wanted_session: str) -> Tuple[Optional[Dict[str, Optional[int]]], List[str]]:
-    """Read only session metadata and token-count fields from a rollout file."""
+def _latest_rollout_usage(path: Path, wanted_session: str) -> Tuple[
+        Optional[Dict[str, Optional[int]]], List[str], str, Optional[str], Optional[str]]:
+    """Read filtered usage and matching task completion evidence from a rollout."""
     session = None
     parent = None
     latest = None
+    as_of = None
+    active_turn_id = None
+    completed_turn_id = None
+    count_after_active_start = False
     try:
         with path.open("r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
@@ -187,15 +194,38 @@ def _latest_rollout_usage(path: Path, wanted_session: str) -> Tuple[Optional[Dic
                         session = candidate
                     parent = next((payload.get(key) for key in _PARENT_KEYS
                                    if isinstance(payload.get(key), str)), None)
-                elif kind == "event_msg" and payload.get("type") == "token_count":
-                    info = payload.get("info")
-                    if isinstance(info, dict):
-                        total = info.get("total_token_usage")
-                        if isinstance(total, dict):
-                            latest = _count_fields(total)
+                elif kind == "event_msg":
+                    event_type = payload.get("type")
+                    turn_id = payload.get("turn_id")
+                    if event_type == "task_started":
+                        active_turn_id = turn_id if isinstance(turn_id, str) and turn_id else None
+                        completed_turn_id = None
+                        count_after_active_start = False
+                    elif event_type == "task_complete":
+                        if (active_turn_id is not None and isinstance(turn_id, str)
+                                and turn_id == active_turn_id):
+                            completed_turn_id = turn_id
+                    elif event_type == "token_count":
+                        info = payload.get("info")
+                        if isinstance(info, dict):
+                            total = info.get("total_token_usage")
+                            if isinstance(total, dict):
+                                latest = _count_fields(total)
+                                count_after_active_start = active_turn_id is not None
+                                # The timestamp belongs to this count only; never carry
+                                # forward the timestamp from an older observation.
+                                as_of = None
+                                timestamp = event.get("timestamp")
+                                if isinstance(timestamp, str) and timestamp:
+                                    as_of = timestamp
     except OSError:
-        return None, []
-    return (latest, [parent] if parent else []) if session == wanted_session else (None, [])
+        return None, [], "snapshot", None, None
+    if session != wanted_session:
+        return None, [], "snapshot", None, None
+    completeness = ("final" if active_turn_id is not None and
+                    completed_turn_id == active_turn_id and
+                    count_after_active_start else "snapshot")
+    return latest, ([parent] if parent else []), completeness, as_of, completed_turn_id
 
 
 def planner_usage(session: str, codex_home: Path) -> Optional[Dict]:
@@ -206,42 +236,62 @@ def planner_usage(session: str, codex_home: Path) -> Optional[Dict]:
         return None
     found: Dict[str, Dict[str, Optional[int]]] = {}
     parents: Dict[str, List[str]] = {}
+    completeness: Dict[str, str] = {}
+    as_of: Dict[str, Optional[str]] = {}
     try:
         paths = sorted(path for path in home.rglob("rollout*.jsonl")
                        if path.is_file() and not path.is_symlink())
     except OSError:
         paths = []
     for path in paths:
-        # Only filtered metadata and token-count records are returned by this parser.
-        usage, parent_ids = _latest_rollout_usage(path, session)
+        # Only filtered session metadata, task lifecycle markers, and token counts are used.
+        usage, parent_ids, usage_state, usage_as_of, _ = _latest_rollout_usage(path, session)
         if usage is not None:
             # A rollout only belongs to this session when its own metadata matches it. The
             # parent map is then used to account for directly linked child rollouts.
             found[session] = usage
             parents[session] = parent_ids
+            completeness[session] = usage_state
+            as_of[session] = usage_as_of
         else:
             # Child matching requires its own ID; scan its session metadata keys only.
-            child_id, child_parent, child_usage = _read_child_metadata(path)
-            if child_id and child_parent == session and child_usage is not None:
-                found[child_id] = child_usage
+            child_id, child_parent, child_usage, child_state, child_as_of = _read_child_metadata(path)
+            if child_id and child_parent == session:
+                if child_usage is not None:
+                    found[child_id] = child_usage
                 parents[child_id] = [session]
+                completeness[child_id] = child_state
+                as_of[child_id] = child_as_of
     if session not in found:
         return None
     own = found[session]
     children = [item for item, parent_ids in parents.items() if item != session and session in parent_ids]
     result: Dict[str, Any] = dict(own)
     for field in COUNT_FIELDS + ("total_tokens",):
-        values = [found[session].get(field)] + [found[item].get(field) for item in children]
+        values = [found[session].get(field)] + [
+            found.get(item, {}).get(field) for item in children]
         result[field] = sum(values) if values and all(value is not None for value in values) else None
     result["session"] = session
     result["subagents"] = ("not linked" if not children else
                            {"count": len(children), "sessions": sorted(children)})
+    incomplete_children = sorted(item for item in children
+                                 if completeness.get(item) != "final" or item not in found)
+    result["completeness"] = ("final" if completeness.get(session) == "final" and
+                              not incomplete_children else "snapshot")
+    result["source"] = "codex_rollout_token_count"
+    result["as_of"] = as_of.get(session)
+    result["incomplete_children"] = incomplete_children
     return result
 
 
-def _read_child_metadata(path: Path) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, Optional[int]]]]:
+def _read_child_metadata(path: Path) -> Tuple[
+        Optional[str], Optional[str], Optional[Dict[str, Optional[int]]], str, Optional[str]]:
     child_id = parent_id = None
     latest = None
+    as_of = None
+    active_turn_id = None
+    completed_turn_id = None
+    count_after_active_start = False
     try:
         with path.open("r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
@@ -256,13 +306,33 @@ def _read_child_metadata(path: Path) -> Tuple[Optional[str], Optional[str], Opti
                     child_id = payload.get("id") or payload.get("session_id")
                     parent_id = next((payload.get(key) for key in _PARENT_KEYS
                                       if isinstance(payload.get(key), str)), None)
-                elif event.get("type") == "event_msg" and payload.get("type") == "token_count":
-                    info = payload.get("info")
-                    if isinstance(info, dict) and isinstance(info.get("total_token_usage"), dict):
-                        latest = _count_fields(info["total_token_usage"])
+                elif event.get("type") == "event_msg":
+                    event_type = payload.get("type")
+                    turn_id = payload.get("turn_id")
+                    if event_type == "task_started":
+                        active_turn_id = turn_id if isinstance(turn_id, str) and turn_id else None
+                        completed_turn_id = None
+                        count_after_active_start = False
+                    elif event_type == "task_complete":
+                        if (active_turn_id is not None and isinstance(turn_id, str)
+                                and turn_id == active_turn_id):
+                            completed_turn_id = turn_id
+                    elif event_type == "token_count":
+                        info = payload.get("info")
+                        if isinstance(info, dict) and isinstance(info.get("total_token_usage"), dict):
+                            latest = _count_fields(info["total_token_usage"])
+                            count_after_active_start = active_turn_id is not None
+                            as_of = None
+                            timestamp = event.get("timestamp")
+                            if isinstance(timestamp, str) and timestamp:
+                                as_of = timestamp
     except OSError:
-        return None, None, None
-    return (child_id, parent_id, latest) if isinstance(child_id, str) else (None, None, None)
+        return None, None, None, "snapshot", None
+    state = ("final" if active_turn_id is not None and
+             completed_turn_id == active_turn_id and
+             count_after_active_start else "snapshot")
+    return ((child_id, parent_id, latest, state, as_of) if isinstance(child_id, str)
+            else (None, None, None, "snapshot", None))
 
 
 def _read_ledger(path: Path, *, tolerate_corruption: bool = False) -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -330,7 +400,7 @@ def build_summary(state_dir: Path, session: str, codex_home: Path) -> Dict:
                 values[key] = None
     all_input_parts = [job_totals.get("input_tokens")]
     all_output_parts = [job_totals.get("output_tokens")]
-    if planner is not None:
+    if planner is not None and planner.get("completeness") == "final":
         all_input_parts.append(planner.get("input_tokens"))
         all_output_parts.append(planner.get("output_tokens"))
     all_input = sum(all_input_parts) if all_input_parts and all(
@@ -341,7 +411,8 @@ def build_summary(state_dir: Path, session: str, codex_home: Path) -> Dict:
     local_output = totals.get("local", {}).get("output_tokens")
     local_tokens = local_input + local_output if local_input is not None and local_output is not None else None
     denominator = all_input + all_output if all_input is not None and all_output is not None else None
-    local_share = (local_tokens / denominator if local_tokens is not None and denominator else None)
+    local_share = (local_tokens / denominator if local_tokens is not None and denominator and
+                   planner is not None and planner.get("completeness") == "final" else None)
     suggestions = sorted({suggestion for row in rows
                           if (suggestion := row.get("classification", {}).get("plugin_suggestion"))})
     permissions_log = Path(state_dir) / "permissions.log"
@@ -397,14 +468,15 @@ def _format(value: Any) -> str:
 
 def render_markdown(summary: Dict) -> str:
     lines = ["# Local Worker session summary", "", "Session: `%s`" % summary.get("session", "not reported"), "",
-             "## Jobs", "", "| Job | Kind | Tier | Model | Attempts | Status | Input | Cached | Output | Reasoning |",
-             "| --- | --- | --- | --- | ---: | --- | ---: | ---: | ---: | ---: |"]
+             "## Jobs", "", "| Job | Kind | Tier | Model | Attempts | Status | Advisory test findings | Input | Cached | Output | Reasoning |",
+             "| --- | --- | --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |"]
     for row in summary.get("jobs", []):
         tokens = row.get("tokens", {})
-        lines.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+        lines.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
             row.get("job_id", "not reported"), row.get("kind", "not reported"),
             row.get("tier", "not reported"), row.get("model", "not reported"),
             _format(row.get("attempts")), row.get("status", "not reported"),
+            _format(row.get("review_findings_count")),
             _format(tokens.get("input")), _format(tokens.get("cached")),
             _format(tokens.get("output")), _format(tokens.get("reasoning"))))
     lines += ["", "## Totals by tier", "", "| Tier | Input | Cached | Output | Reasoning |",
@@ -424,6 +496,17 @@ def render_markdown(summary: Dict) -> str:
     if planner is None:
         lines.append("Planner usage: not reported.")
     else:
+        completeness = planner.get("completeness", "snapshot")
+        lines.append("Planner usage source: %s; completeness: %s." % (
+            planner.get("source", "not reported"), completeness))
+        if planner.get("as_of"):
+            lines.append("Latest planner usage snapshot: %s." % planner["as_of"])
+        if completeness != "final":
+            lines.append("Planner usage is an incomplete rollout snapshot and may omit usage "
+                         "after this summary ran; rerun summary after the Codex turn completes.")
+        if planner.get("incomplete_children"):
+            lines.append("Linked child usage is missing or active for: %s." %
+                         ", ".join(planner["incomplete_children"]))
         lines.append("Input: %s; cached input: %s; output: %s; reasoning: %s; total: %s; subagents: %s." % (
             _format(planner.get("input_tokens")), _format(planner.get("cached_input_tokens")),
             _format(planner.get("output_tokens")), _format(planner.get("reasoning_tokens")),
