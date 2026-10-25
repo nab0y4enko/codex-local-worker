@@ -214,6 +214,17 @@ class CaptureTests(unittest.TestCase):
                 stdout = "org.example.App: 123\n"
             elif argv[1:3] == ["simctl", "launch"]:
                 stdout = "org.example.App: 123\n"
+            elif argv[1:4] == ["xcresulttool", "export", "attachments"]:
+                export_dir = Path(argv[argv.index("--output-path") + 1])
+                export_dir.mkdir(parents=True, exist_ok=True)
+                sp.write_png(export_dir / "NativePilotMainScreen.png", 8, 8,
+                             (30, 90, 150), dot=(240, 220, 20))
+                (export_dir / "manifest.json").write_text(json.dumps([{
+                    "testIdentifier": "NativePilotUITests/testAppShowsQualificationLabel()",
+                    "attachments": [{
+                        "exportedFileName": "NativePilotMainScreen.png",
+                        "suggestedHumanReadableName": "NativePilotMainScreen_0_ABCDEF.png"}]}]),
+                    encoding="utf-8")
             elif argv[1:2] == ["xcresulttool"] and argv[2:4] == ["get", "test-results"]:
                 stdout = json.dumps(summary)
             elif argv[-1] == "test":
@@ -223,11 +234,17 @@ class CaptureTests(unittest.TestCase):
                 sp.write_png(argv[-1], 4, 4, (1, 2, 3), dot=(4, 5, 6))
             return {"returncode": 0, "stdout": stdout, "stderr": ""}
 
-        result = screenshots.capture_source(self.plan, self.source, self.work, self.out, run)
+        plan = dict(self.plan, screenshots=[*self.plan["screenshots"], {
+            "name": "xctest-main-screen", "xcuitest_attachment": "NativePilotMainScreen"}])
+        result = screenshots.capture_source(plan, self.source, self.work, self.out, run)
         self.assertEqual(result[0]["method"], "simctl")
         self.assertIsNone(result[0]["error"])
         self.assertFalse(result[0]["uniform"])
         self.assertTrue(Path(result[0]["path"]).is_file())
+        self.assertEqual(result[1]["method"], "xcresult")
+        self.assertIsNone(result[1]["error"])
+        self.assertFalse(result[1]["uniform"])
+        self.assertTrue(Path(result[1]["path"]).is_file())
         self.assertTrue(any("CONFIGURATION_BUILD_DIR=" in arg for call in calls for arg in call))
         builds = [call for call in calls if "build" in call and "test" not in call]
         tests = [call for call in calls if call[-1] == "test"]

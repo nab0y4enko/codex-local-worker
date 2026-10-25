@@ -224,9 +224,11 @@ def _success(result: Any, label: str) -> str:
 
 
 def _attachment(export_dir: Path, wanted: str) -> Path:
-    manifest = export_dir / "Manifest.json"
+    manifest = next((path for path in export_dir.iterdir()
+                     if path.is_file() and not path.is_symlink()
+                     and path.name.lower() == "manifest.json"), None)
     candidates: List[str] = []
-    if manifest.is_file() and not manifest.is_symlink():
+    if manifest is not None:
         try:
             data = json.loads(manifest.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -235,8 +237,12 @@ def _attachment(export_dir: Path, wanted: str) -> Path:
         def visit(value):
             if isinstance(value, dict):
                 name_values = [str(value.get(key, "")) for key in
-                               ("name", "attachmentName", "displayName")]
-                if wanted in name_values:
+                               ("name", "attachmentName", "displayName",
+                                "suggestedHumanReadableName")]
+                matched = any(name == wanted or Path(name).stem == wanted or
+                              Path(name).stem.startswith(wanted + "_")
+                              for name in name_values if name)
+                if matched:
                     for key in ("exportedFileName", "fileName", "filename", "path"):
                         candidate = value.get(key)
                         if isinstance(candidate, str):
