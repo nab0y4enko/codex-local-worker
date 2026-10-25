@@ -17,13 +17,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_ID = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
 PLUGIN_NAME = "codex-local-worker"
-PLUGIN_VERSION = "0.2.0"
+PLUGIN_VERSION = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())["version"]
 MARKETPLACE_NAME = "codex-local-worker"
 ONBOARDING = "./skills/setup/SKILL.md"
 
 # Closed portable manifest: anything else at top level is a schema violation.
-MANIFEST_FIELDS = {"$schema", "name", "version", "description", "author", "homepage",
-                   "repository", "license", "keywords", "extensions"}
+MANIFEST_FIELDS = {"name", "version", "description", "author", "homepage",
+                   "repository", "license", "keywords", "skills", "interface"}
 NAME_PATTERN = re.compile(r"^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
 
 LAUNCHER_FILES = ["bin/local-worker", "src/local_worker.py", "src/run_policy.py",

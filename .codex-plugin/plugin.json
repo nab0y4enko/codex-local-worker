@@ -1,11 +1,11 @@
 {
   "name": "codex-local-worker",
-  "version": "0.2.0",
-  "description": "Plan with the model you selected in this window and implement with a pinned local worker model on your own machine. Setup checks and installs the user-wide routing (migrating the pre-rename pointer block), doctor verifies an existing install read-only, and the launcher runs scoped jobs in throwaway git worktrees, returning a patch, real test results and an audit of every changed file.",
-  "author": "OpenAI",
-  "homepage": "https://github.com/openai/codex-local-worker",
-  "repository": "https://github.com/openai/codex-local-worker",
-  "license": "MIT",
+  "version": "0.3.0",
+  "description": "Plan and run scoped local worker jobs with model discovery, verification, and reviewable results. The package includes read-only diagnostics, optional Codex setup guidance, and skills for jobs, escalation, and summaries.",
+  "author": "Naboy4enko",
+  "homepage": "https://github.com/nab0y4enko/codex-local-worker",
+  "repository": "https://github.com/nab0y4enko/codex-local-worker",
+  "license": "UNLICENSED",
   "keywords": [
     "local-first",
     "local-model",
@@ -21,7 +21,7 @@
     "displayName": "Local Worker",
     "shortDescription": "Plan here, implement with a local worker",
     "longDescription": "Build scoped Codex jobs with a local worker, verify the resulting changes, and review concise evidence before integrating.",
-    "developerName": "OpenAI",
+    "developerName": "Naboy4enko",
     "category": "Developer tools",
     "capabilities": [
       "local model discovery",
