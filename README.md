@@ -74,6 +74,8 @@ See [the setup skill](skills/setup/SKILL.md) for override handling and the migra
    A `worker_busy` result means the worker never started: wait and retry as directed, without
    treating it as verification failure. Use `--max-workers 2` (up to 4) only for deliberately
    independent jobs with non-overlapping paths and resources; keep one shared state directory.
+   A single oMLX inference server is a shared resource even when files do not overlap. Keep
+   its jobs sequential unless concurrent inference capacity has been independently qualified.
 
 4. **Review.** Inspect the returned `status`, `classification.next_action`, patch, tests, audit,
    logs, screenshots, timings, and token counts. A successful command is evidence for that
@@ -179,8 +181,9 @@ that tests assert observable behavior or expected exceptions and that they would
 implementation. Repair missing checks and rerun relevant tests; disclose planner edits.
 
 Read workers are given `src/source_citations.py` to obtain numbered source and ready-to-copy
-citation entries within the declared scope. Copy entries exactly rather than inventing line
-numbers or retyping quotes. This helper improves evidence capture; final path, range and quote
+citation entries within the declared scope. Local workers return only the helper's `source_id`
+from `source_refs`; the launcher resolves IDs from observed command output and rechecks the
+source. Cloud reads retain full citation objects. Never invent IDs, line numbers or quotes. This helper improves evidence capture; final path, range and quote
 validation remains mandatory, and an invalid read answer stays withheld. A read `ok` means
 those structural checks passed. Its `answer_evidence` explicitly requires semantic review and
 does not claim independent command verification. Check the claims against sources and verify
