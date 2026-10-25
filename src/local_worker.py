@@ -68,6 +68,7 @@ import apple_verification as apple
 import classify as failure_classify
 import contract
 import codex_catalog
+import ledger
 import omlx_discovery
 import permissions
 import read_answers
@@ -4240,6 +4241,13 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
                 report["codex_home_cleanup_error"] = redact(str(cleanup_error), secrets)
         progress(report, report["status"])
         write_report(report, secrets)
+        try:
+            ledger.append_job(options.state_dir, ledger.session_id(), report)
+        except (OSError, ValueError) as ledger_error:
+            # Observability must never rewrite the job outcome. Preserve the failure in the
+            # report, but never copy untrusted report or model prose into the ledger.
+            report["ledger_error"] = "ledger append failed (%s)" % ledger_error.__class__.__name__
+            write_report(report, secrets)
     return report
 
 
@@ -4356,6 +4364,10 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--codex-bin", help=f"Codex CLI path (default PATH or {CODEX_BIN_ENV}, "
                                            f"legacy {LEGACY_CODEX_BIN_ENV})")
     add_selection_arguments(check)
+
+    session_summary = sub.add_parser("summary", help="write the current session summary")
+    session_summary.add_argument("--session", help="session ID (default CODEX_THREAD_ID or UTC date)")
+    session_summary.add_argument("--state-dir", help="launcher state directory")
 
     perms = sub.add_parser("permissions", help="show or change the user-owned permissions list "
                                                "that decides what workers may read")
@@ -4531,6 +4543,15 @@ def main(argv: Optional[Sequence[str]] = None, *,
                 item = json.loads(path.read_text())
                 result.append(status_snapshot(item))
             print(json.dumps(result, indent=2))
+            return 0
+        if args.command == "summary":
+            session = ledger.session_id(args.session)
+            codex_home = Path(os.path.expanduser(os.environ.get("CODEX_HOME", "~/.codex")))
+            state_dir = resolve_state_dir(args.state_dir)
+            markdown_path, json_path = ledger.write_summary(state_dir, session, codex_home)
+            summary = ledger.build_summary(state_dir, session, codex_home)
+            print(ledger.render_markdown(summary))
+            print("Wrote %s and %s" % (markdown_path, json_path))
             return 0
         if args.command == "workstream":
             repo = Path(os.path.expanduser(args.repo)).absolute()
