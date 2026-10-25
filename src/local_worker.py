@@ -74,6 +74,7 @@ import read_answers
 import worker_pool as pool
 import native_readiness as native
 import worker_observability as observation
+import screenshots
 import run_policy as policy
 import worker_tools as tools
 from worker_tool_probe import ToolProbeError, probe_tools
@@ -261,6 +262,7 @@ EXIT_CODES = {
     "no_changes": 10,
     "interrupted": 11,
     "answer_invalid": 12,
+    "capture_failed": 13,
 }
 
 LIMITATIONS = (
@@ -1260,7 +1262,7 @@ def job_lease(options: JobOptions, report: Dict[str, Any], timeout: float,
             return
         with pool.lease(options.state_dir, capacity=capacity, task_id=task.task_id,
                         repo_identity=repo_identity(task.repo_path),
-                        allowed_paths=list(task.allowed_paths),
+                        allowed_paths=list(getattr(task, "allowed_paths", [])),
                         job_id=report.get("job_id"), base_ref=task.base_ref,
                         lock_timeout=timeout,
                         simulator_udid=options.apple_simulator_udid,
@@ -2975,16 +2977,15 @@ def native_destination(plan_path: Optional[Path], simulator_udid: Optional[str])
     if plan_path is None:
         raise BlockedError("native readiness plan is required")
     try:
-        plan = json.loads(Path(plan_path).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
+        plan = (plan_path if isinstance(plan_path, dict) else
+                json.loads(Path(plan_path).read_text(encoding="utf-8")))
+    except (OSError, ValueError, TypeError) as error:
         raise BlockedError(f"cannot read native readiness plan: {error}") from error
     if isinstance(plan, dict) and plan.get("version") == 1:
         if simulator_udid is None:
             raise BlockedError("version 1 native plans require a simulator UUID")
         return {"simulator": simulator_udid}
     destination = plan.get("destination") if isinstance(plan, dict) else None
-    if isinstance(destination, dict) and set(destination) == {"simulator"} and simulator_udid is None:
-        raise BlockedError("simulator native plans require --simulator-udid so the device lease is held")
     if simulator_udid is not None and destination != {"simulator": simulator_udid}:
         raise BlockedError("native plan destination does not match --simulator-udid")
     if not isinstance(destination, dict):
@@ -3029,6 +3030,170 @@ def native_gate(options, report, worktree, sandbox, verify_env, secrets, deadlin
     report["native_preflight"] = evidence
 
 
+def _capture_plan(options: JobOptions, report_dir: Path) -> Dict[str, Any]:
+    value = options.native_preflight_plan
+    if isinstance(value, dict):
+        plan = dict(value)
+        plan_path = report_dir / "capture-native-plan.json"
+        if plan_path.is_symlink():
+            raise BlockedError("capture native plan path is a symlink")
+        plan_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+        options.native_preflight_plan = plan_path
+    else:
+        if value is None:
+            raise BlockedError("capture job requires a native plan")
+        try:
+            plan = json.loads(Path(value).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise BlockedError(f"cannot read capture native plan: {error}") from error
+    capture = getattr(options.task, "capture", None)
+    if isinstance(capture, dict) and "screenshots" in capture:
+        plan["screenshots"] = capture["screenshots"]
+    return plan
+
+
+def _capture_source(value: Any, default_destination: Dict[str, Any],
+                    default_scheme: Optional[str] = None) -> screenshots.CaptureSource:
+    if not isinstance(value, dict):
+        raise BlockedError("capture source must be an object")
+    name = value.get("name")
+    repo_path = value.get("repo_path")
+    ref = value.get("ref")
+    scheme = value.get("scheme", default_scheme)
+    destination = value.get("destination", default_destination)
+    if not isinstance(name, str) or not name.strip():
+        raise BlockedError("capture source name is required")
+    if not isinstance(repo_path, str) or not repo_path.strip():
+        raise BlockedError(f"capture source {name} needs an absolute repo_path")
+    repo = Path(repo_path).expanduser()
+    if not repo.is_absolute():
+        repo = Path.cwd() / repo
+    repo = repo.resolve()
+    if not repo.is_dir() or repo.is_symlink():
+        raise BlockedError(f"capture source {name} repo_path is not a real directory: {repo}")
+    if not isinstance(ref, str) or not ref.strip():
+        raise BlockedError(f"capture source {name} needs a ref")
+    if scheme is not None and (not isinstance(scheme, str) or not scheme.strip()):
+        raise BlockedError(f"capture source {name} scheme must be a non-empty string")
+    if not isinstance(destination, dict):
+        raise BlockedError(f"capture source {name} destination must be an object")
+    return screenshots.CaptureSource(name, repo, ref, scheme, destination)
+
+
+def _capture_checkout(source: screenshots.CaptureSource, root: Path) -> Path:
+    """Make a disposable local clone; source repositories and refs are only read."""
+    if source.repo_path.is_symlink() or not source.repo_path.is_dir():
+        raise BlockedError(f"capture source {source.name} is not a safe repository directory")
+    target = root / source.name
+    if target.exists() or target.is_symlink():
+        raise BlockedError(f"capture scratch already exists for {source.name}: {target}")
+    root.mkdir(parents=True, exist_ok=True)
+    git(source.repo_path, "clone", "--local", "--no-hardlinks", "--no-checkout",
+        str(source.repo_path), str(target))
+    git(target, "checkout", "--detach", source.ref)
+    return target
+
+
+def _capture_all(options: JobOptions, report: Dict[str, Any], worktree: Path,
+                 report_dir: Path, verify_env: Dict[str, str], wrapper: DenyWrapper,
+                 secrets: Sequence[str], deadline: Deadline, *, capture_only: bool) -> None:
+    plan = _capture_plan(options, report_dir)
+    destination = native_destination(options.native_preflight_plan,
+                                     options.apple_simulator_udid)
+    build = plan.get("build") or []
+    scheme = None
+    if "-scheme" in build and build.index("-scheme") + 1 < len(build):
+        scheme = build[build.index("-scheme") + 1]
+    sources: List[screenshots.CaptureSource] = []
+    temporary: List[Path] = []
+    if capture_only:
+        capture = getattr(options.task, "capture", None) or {}
+        raw_sources = capture.get("sources", plan.get("capture_sources", []))
+        if not raw_sources:
+            raw_sources = [{"name": "source", "repo_path": str(options.task.repo_path),
+                            "ref": options.task.base_ref}]
+        sources = [_capture_source(item, destination, scheme) for item in raw_sources]
+    else:
+        sources = [
+            screenshots.CaptureSource("before", options.task.repo_path,
+                                      options.task.base_ref, scheme, destination),
+            screenshots.CaptureSource("after", options.task.repo_path,
+                                      "working-tree-result", scheme, destination),
+        ]
+        references = plan.get("capture_sources", [])
+        if not isinstance(references, list):
+            raise BlockedError("capture_sources must be an array")
+        sources.extend(_capture_source(item, destination, scheme) for item in references)
+    names = [source.name for source in sources]
+    if len(names) != len(set(names)):
+        raise BlockedError("capture source names must be unique")
+
+    scratch_root = report_dir / "capture-worktrees"
+    screenshot_dir = report_dir / SCREENSHOTS_DIR_NAME
+    screenshot_dir.mkdir(parents=True, exist_ok=True)
+    results: Dict[str, List[Dict[str, Any]]] = {}
+    counter = 0
+
+    def run_capture(tree: Path, argv: Sequence[str]):
+        nonlocal counter
+        deadline.require("screenshot command")
+        wrapped = wrapper.wrap(verification_argv(report.get("sandbox") or {},
+                                                 options.codex_bin, tree, argv))
+        result = run_bounded(wrapped, cwd=tree, env=full_host_env(verify_env),
+                             timeout=deadline.require("screenshot command"))
+        counter += 1
+        output = redact((result["stdout"] + b"\n" + result["stderr"]).decode(
+            "utf-8", "replace"), secrets)
+        if wrapper is not None:
+            wrapper.collect(output, f"screenshot capture command {counter}")
+        log = screenshot_dir / f"capture-command-{counter}.log"
+        log.write_text(output, encoding="utf-8")
+        report["logs"].append(str(log))
+        return dict(result, stdout=redact(result["stdout"].decode("utf-8", "replace"), secrets),
+                    stderr=redact(result["stderr"].decode("utf-8", "replace"), secrets))
+
+    try:
+        for source in sources:
+            if source.name == "after" and not capture_only:
+                tree = worktree
+            else:
+                tree = _capture_checkout(source, scratch_root)
+                temporary.append(tree)
+            if source.name == "before" and not capture_only:
+                overlays = plan.get("capture_overlay_paths", [])
+                if not isinstance(overlays, list) or any(not isinstance(path, str) for path in overlays):
+                    raise BlockedError("capture_overlay_paths must be an array of paths")
+                copied = screenshots.apply_overlay(
+                    worktree, tree, overlays,
+                    allowed_roots=["Tests", "UITests", "Test", "UITestHarness", "TestHarness",
+                                   "tests", "ui-tests", "test-harness"])
+                report.setdefault("capture_overlay", {})[source.name] = copied
+            results[source.name] = screenshots.capture_source(
+                plan, source, tree, screenshot_dir,
+                lambda argv, tree=tree: run_capture(tree, argv), deadline=deadline)
+    finally:
+        for tree in reversed(temporary):
+            if not _inside(tree, scratch_root) or tree.is_symlink():
+                raise BlockedError(f"refusing to remove unsafe capture checkout: {tree}")
+            shutil.rmtree(str(tree))
+    index = screenshots.write_index(screenshot_dir, results)
+    report["screenshots"] = {"index": str(index), "sources": results}
+    failures = []
+    for source_name, entries in results.items():
+        for entry in entries:
+            if entry.get("error"):
+                failures.append(f"{source_name}/{entry.get('name')}: {entry['error']}")
+            elif entry.get("uniform"):
+                failures.append(f"{source_name}/{entry.get('name')}: uniform blank frame")
+            elif not entry.get("path") or not Path(entry["path"]).is_file():
+                failures.append(f"{source_name}/{entry.get('name')}: screenshot image is missing")
+    if failures:
+        report["status"] = "capture_failed"
+        report["failure_reason"] = "screenshot capture failed: " + "; ".join(failures[:10])
+    elif capture_only:
+        report["status"] = "ok"
+
+
 def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
              lease: Optional["pool.Lease"] = None,
              secrets: Optional[Sequence[str]] = None) -> None:
@@ -3046,6 +3211,13 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     report_dir = ensure_report_dir(options, report)
     if report_dir is None:
         raise BlockedError(f"cannot create a report directory under {state_dir}")
+    if isinstance(options.native_preflight_plan, dict):
+        plan_path = report_dir / "native-plan.json"
+        if plan_path.is_symlink():
+            raise BlockedError("native plan report path is a symlink")
+        plan_path.write_text(json.dumps(options.native_preflight_plan, indent=2) + "\n",
+                             encoding="utf-8")
+        options.native_preflight_plan = plan_path
     lease_update(lease, report_dir=str(report_dir))
     progress(report, "model_preflight")
     deadline.require("preflight")
@@ -3229,16 +3401,19 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     # no model turn: the probe sends only initialize, initialized and mcpServerStatus/list. A
     # server that cannot list a configured tool blocks the job instead of spending tokens on a
     # worker that would silently improvise the missing capability.
-    try:
-        report["tooling"] = probe_tools(
-            loaded, codex_bin=options.codex_bin,
-            env={name: value for name, value in env.items() if name != API_KEY_ENV},
-            overrides=(cloud_config_overrides(task.tier.reasoning_effort) if is_cloud else
-                config_overrides(profile, context_window, catalog_path,
-                sandbox_mode="read-only" if task.kind == "read" else REQUIRED_SANDBOX_MODE)),
-            deadline=deadline, codex_home=codex_home)
-    except ToolProbeError as error:
-        raise BlockedError(f"required MCP tools could not be probed: {error}") from error
+    if task.kind != "capture":
+        try:
+            report["tooling"] = probe_tools(
+                loaded, codex_bin=options.codex_bin,
+                env={name: value for name, value in env.items() if name != API_KEY_ENV},
+                overrides=(cloud_config_overrides(task.tier.reasoning_effort) if is_cloud else
+                    config_overrides(profile, context_window, catalog_path,
+                    sandbox_mode="read-only" if task.kind == "read" else REQUIRED_SANDBOX_MODE)),
+                deadline=deadline, codex_home=codex_home)
+        except ToolProbeError as error:
+            raise BlockedError(f"required MCP tools could not be probed: {error}") from error
+    else:
+        report["tooling"] = {"status": "not used by capture-only job"}
     # Self-check the pinned policy before the first subprocess: drift is a refusal, not a
     # degraded run. Read jobs add Codex's read-only sandbox and generated output schema.
     if task.kind == "read":
@@ -3259,6 +3434,8 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         else:
             _policy_check(read_argv, profile, context_window, catalog,
                           sandbox_mode="read-only", output_schema=read_schema_path)
+    elif task.kind == "capture":
+        pass
     else:
         argv = worker_argv_for_tier(options, worktree, profile, context_window,
             report_dir / "policy-check.last-message.txt", loaded["overrides"],
@@ -3295,6 +3472,11 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         _execute_read_job(options, report, deadline, profile, context_window, worktree,
                           report_dir, env, loaded, catalog_path, catalog, wrapper, secrets,
                           report.get("_policy"))
+        return
+
+    if task.kind == "capture":
+        _capture_all(options, report, worktree, report_dir, verify_env, wrapper, secrets,
+                     deadline, capture_only=True)
         return
 
     if options.native_preflight_plan is not None:
@@ -3650,6 +3832,9 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
 
     report["status"] = ("blocked" if report.get("policy_stop") or model_blocked
                         else decide_status(report, worker_ok))
+    if task.ui_review:
+        _capture_all(options, report, worktree, report_dir, verify_env, wrapper, secrets,
+                     deadline, capture_only=False)
 
 
 def decide_status(report: Dict[str, Any], worker_ok: bool) -> str:
@@ -3707,6 +3892,7 @@ STATUS_REASONS = {
     "no_changes": "the worker produced no in-scope implementation patch that survived to the "
                   "final audit; baseline verification passed, and parent review is required",
     "answer_invalid": "the read worker's output failed schema or citation verification",
+    "capture_failed": "one or more requested screenshots could not be captured or were blank",
 }
 
 
@@ -3779,8 +3965,31 @@ def write_report(report: Dict[str, Any], secrets: Sequence[str]) -> None:
             pass
 
 
+def task_native_plan(task: Any) -> Any:
+    """Native plan from a write/capture contract, if that job declares one."""
+    value = getattr(task, "native_plan", None)
+    if value is None:
+        capture = getattr(task, "capture", None)
+    else:
+        capture = None
+    if value is None and isinstance(capture, dict):
+        for key in ("native_plan", "plan_path", "plan"):
+            if key in capture:
+                value = capture[key]
+                if isinstance(value, (str, Path)):
+                    path = Path(value).expanduser()
+                    return path if path.is_absolute() else task.repo_path / path
+                return value
+    if isinstance(value, (str, Path)):
+        path = Path(value).expanduser()
+        return path if path.is_absolute() else task.repo_path / path
+    return None
+
+
 def run_job(options: JobOptions) -> Dict[str, Any]:
     """Run one serialized job and return the structured report."""
+    if options.native_preflight_plan is None:
+        options.native_preflight_plan = task_native_plan(options.task)
     report = new_report(options)
     started = time.monotonic()
     # One budget for the whole job: lock wait, preflight, policy check, sandbox probe,
@@ -3798,6 +4007,12 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
     stream = None
     claimed = False
     try:
+        if options.native_preflight_plan is not None:
+            destination = native_destination(options.native_preflight_plan,
+                                             options.apple_simulator_udid)
+            if "simulator" in destination:
+                options.apple_simulator_udid = destination["simulator"]
+                report["lease"]["resource"] = "simulator:" + destination["simulator"]
         if _inside(options.state_dir, options.task.repo_path):
             raise ContractError(
                 f"state dir {options.state_dir} must live outside the repository "
@@ -3807,8 +4022,9 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
             stream = policy.Workstream(options.state_dir, repo_identity(options.task.repo_path),
                                        options.workstream or options.task.workstream,
                                        options.job_kind, tier=options.task.tier.kind)
-            if not options.preflight_only:
-                admission = stream.claim(report["job_id"], deadline.require("workstream admission"), options.task.max_attempts)
+            if not options.preflight_only and options.task.kind != "capture":
+                admission = stream.claim(report["job_id"], deadline.require("workstream admission"),
+                                         getattr(options.task, "max_attempts", 1))
                 claimed = True
                 report["workstream_admission"] = admission
                 if admission["job_budget_seconds"] < deadline.remaining():
@@ -3857,7 +4073,11 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
         unfinished = report.pop("_active_attempt", None)
         if report.get("worktree") and report.get("primary_fingerprint_before"):
             try:
-                final_audit = audit_worktree(Path(report["worktree"]), report["base_commit"], options.task.allowed_paths, secrets, scratch_dir=Path(report["report_dir"]), git_layout=report.get("_git_layout"), git_admin_before=report.get("_git_admin_before"))
+                final_audit = audit_worktree(Path(report["worktree"]), report["base_commit"],
+                                             getattr(options.task, "allowed_paths", []), secrets,
+                                             scratch_dir=Path(report["report_dir"]),
+                                             git_layout=report.get("_git_layout"),
+                                             git_admin_before=report.get("_git_admin_before"))
                 report["changed_paths"] = final_audit.changed_paths
                 report["violations"] = final_audit.violations
                 note_git_admin_tamper(report, Path(report["worktree"]))
@@ -3872,7 +4092,7 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
                     # This audit is the last word: a patch that vanished before the report was
                     # written cannot be reported as a patch. Failures below keep their priority.
                     report["worker_patch_present"] = False
-                    if report.get("status") == "ok" and options.task.kind != "read":
+                    if report.get("status") == "ok" and options.task.kind not in ("read", "capture"):
                         report["status"] = "no_changes"
                 if unfinished and claimed:
                     stream.record_attempt(report["job_id"], capability_failure=False,

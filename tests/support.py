@@ -5,10 +5,12 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import urllib.parse
+import zlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from unittest import mock
@@ -254,6 +256,27 @@ def simctl_devices(runtimes: Dict[str, List[Dict]]) -> Dict[str, Dict]:
     return {device["udid"]: dict(device, runtime=runtime)
             for runtime, devices in runtimes.items() for device in devices
             if isinstance(device, dict) and isinstance(device.get("udid"), str)}
+
+
+def write_png(path, width, height, rgb, dot=None):
+    """Write a small valid, non-interlaced 8-bit RGB PNG for screenshot tests."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pixels = [list(rgb) * width for _ in range(height)]
+    if dot is not None and width and height:
+        x, y = width // 2, height // 2
+        pixels[y][x * 3:x * 3 + 3] = list(dot)
+
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data +
+                struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff))
+
+    scanlines = b"".join(b"\x00" + bytes(row) for row in pixels)
+    data = (b"\x89PNG\r\n\x1a\n" +
+            chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(scanlines)) + chunk(b"IEND", b""))
+    path.write_bytes(data)
+    return path
 
 
 def apple_home(parent, udid=APPLE_UDID, name="home"):

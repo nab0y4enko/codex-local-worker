@@ -174,13 +174,15 @@ class NativeGateIntegrationTests(unittest.TestCase):
         self.assertIsNone(report['worktree'])
         self.assertEqual(self.events, [])
 
-    def test_plan_without_simulator_is_rejected_instead_of_ignored(self):
+    def test_v2_plan_selects_its_simulator_destination_without_cli_alias(self):
         self.options.apple_simulator_udid = None
         report = self.run_job()
-        self.assertEqual(report['status'], 'blocked')
-        self.assertEqual(self.fake.exec_calls, 0)
-        self.assertIsNone(report['worktree'])
-        self.assertEqual(self.events, [])
+        self.assertEqual(report['status'], 'ok', report.get('failure_reason'))
+        self.assertEqual(self.fake.exec_calls, 1)
+        self.assertEqual(report['sandbox']['apple_simulator_udid'], sp.APPLE_UDID)
+        self.assertEqual(self.events, ['gate_started', 'native_build', 'native_install',
+            'native_launch', 'native_test', 'native_summary', 'gate_completed', 'worker',
+            'verification'])
 
     def test_preflight_only_without_simulator_never_becomes_generic_implementation(self):
         self.options.preflight_only = True
