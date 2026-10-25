@@ -38,6 +38,18 @@ class ClassifyTests(unittest.TestCase):
         result = classify.classify(report)
         self.assertEqual((result.cls, result.code, result.next_action), ("environment", "server_unreachable", "retry_local"))
 
+    def test_untyped_failed_worker_exit_uses_job_outcome_without_reading_prose(self):
+        attempt = {"returncode": 1}
+        write = classify.classify({"status": "worker_failed", "kind": "write",
+                                   "worker_patch_present": False, "attempts": [attempt]})
+        self.assertEqual((write.cls, write.code), ("capability", "no_change"))
+        read = classify.classify({"status": "worker_failed", "kind": "read",
+                                  "attempts": [attempt]})
+        self.assertEqual((read.cls, read.code), ("capability", "invalid_answer"))
+        patched = classify.classify({"status": "worker_failed", "kind": "write",
+                                     "worker_patch_present": True, "attempts": [attempt]})
+        self.assertEqual((patched.cls, patched.code), ("capability", "tests_failed"))
+
     def test_retry_local_is_offered_once_per_code(self):
         report = dict(CASES[1][0], previous_codes=["tool_unavailable"])
         self.assertEqual(classify.classify(report).next_action, "needs_user")
@@ -50,7 +62,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertIn("citation", " ".join(result.evidence).lower())
 
     def test_planner_json_exposes_only_the_stable_summary_keys(self):
-        result = lw.planner_json({"job_id": "j", "job_kind": "repair", "tier": "local",
+        result = lw.planner_json({"job_id": "j", "kind": "read", "tier": "local",
                                   "api_model": "local-model", "status": "ok",
                                   "classification": {"class": "none", "code": "ok"},
                                   "report_dir": "/tmp/report"})

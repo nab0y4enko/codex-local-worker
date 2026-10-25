@@ -141,6 +141,15 @@ def _pick(report: Dict[str, Any]) -> tuple:
         return "server_unreachable", ["launcher error evidence reports connection refusal"]
     if "unsupported call" in combined:
         return "tool_unavailable", ["launcher error evidence reports unsupported call"]
+    if (status == "worker_failed" and attempts
+            and isinstance(attempts[-1].get("returncode"), int)
+            and attempts[-1]["returncode"] != 0):
+        if report.get("kind", report.get("job_kind")) == "read":
+            return "invalid_answer", ["launcher observed a failed read worker without a valid answer"]
+        if report.get("worker_patch_present") is False:
+            return "no_change", ["launcher observed a failed worker exit with no surviving patch"]
+        if report.get("worker_patch_present") is True:
+            return "tests_failed", ["launcher observed a failed worker exit after producing a patch"]
     if status == "tests_failed":
         return "tests_failed", ["verification status=tests_failed"]
     if status == "preflight_failed":

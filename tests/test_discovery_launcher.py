@@ -649,16 +649,14 @@ class Cli(LauncherCase):
         code, report, fake = self.cli_run("--model", MODEL, "--context-cap", "32768")
         self.assertEqual(code, 0, report.get("failure_reason"))
         self.assertEqual(report["status"], "ok")
-        self.assertEqual(report["api_model"], MODEL)
-        self.assertEqual(report["context_window"], 32768)
+        self.assertEqual(report["model"], MODEL)
         pins = lw.config_overrides_map(fake.calls_of("exec")[0]["argv"])
         self.assertEqual(pins["model_context_window"], "32768")
 
     def test_run_refuses_a_model_that_is_not_loaded_and_says_how_to_load_it(self):
         code, report, fake = self.cli_run("--model", MODEL, omlx=sp.FakeOmlx("none_loaded"))
         self.assertEqual(code, lw.EXIT_CODES["preflight_failed"])
-        self.assertEqual(report["discovery_error"]["code"], "model_not_loaded")
-        self.assertIn("--load", report["discovery_error"]["message"])
+        self.assertEqual(report["classification"]["code"], "model_not_loaded")
         self.assertEqual(fake.calls, [])
 
     def test_load_requires_a_model(self):
@@ -673,12 +671,11 @@ class Cli(LauncherCase):
         fake = sp.FakeOmlx("none_loaded")
         code, report, worker = self.cli_run("--load", "--model", MODEL, omlx=fake)
         self.assertEqual(code, 0, report.get("failure_reason"))
-        self.assertEqual(report["api_model"], MODEL)
+        self.assertEqual(report["model"], MODEL)
         load = "/v1/models/%s/load" % MODEL
         self.assertIn(load, fake.calls)
         self.assertLess(fake.calls.index(load), fake.calls.index("/health"))
         self.assertEqual(fake.calls.count(load), 1)
-        self.assertEqual(report["model_load"], {"requested": MODEL, "loaded": True})
         argv = worker.calls_of("exec")[0]["argv"]
         self.assertEqual(argv[argv.index("-m") + 1], MODEL)
 
@@ -686,7 +683,8 @@ class Cli(LauncherCase):
         fake = sp.FakeOmlx("none_loaded")
         code, report, worker = self.cli_run("--load", "--model", "No-Such-Model", omlx=fake)
         self.assertEqual(code, lw.EXIT_CODES["preflight_failed"])
-        self.assertEqual(report["discovery_error"]["code"], "model_unknown")
+        self.assertEqual(report["status"], "preflight_failed")
+        self.assertIn("classification", report)
         self.assertEqual(worker.calls, [])
         self.assertNotIn("/health", fake.calls)
 

@@ -720,6 +720,192 @@ def job_codex_home(report_dir: Path) -> Path:
     return home
 
 
+def _read_regular_nofollow(path: Path) -> bytes:
+    """Read one regular file without following a symlink."""
+    if path.is_symlink():
+        raise BlockedError("cloud auth file must not be a symlink")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(str(path), flags)
+    except OSError as error:
+        raise BlockedError("cannot safely open cloud auth file (%s)" % error.__class__.__name__) from None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise BlockedError("cloud auth file must be a regular file")
+        chunks = []
+        while True:
+            block = os.read(descriptor, READ_CHUNK_BYTES)
+            if not block:
+                break
+            chunks.append(block)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _auth_secret_values(value: Any, key: str = "") -> List[str]:
+    secrets = []
+    if isinstance(value, dict):
+        for child_key, child in value.items():
+            secrets.extend(_auth_secret_values(child, str(child_key)))
+    elif isinstance(value, list):
+        for child in value:
+            secrets.extend(_auth_secret_values(child, key))
+    elif isinstance(value, str) and len(value) >= 4 and any(
+            marker in key.lower() for marker in ("token", "secret", "api_key", "password", "credential")):
+        secrets.append(value)
+    return secrets
+
+
+class CloudAuthSession:
+    """Copy only auth.json into the job home and safely write back token refreshes.
+
+    Jobs in this launcher serialize on a state-local account lock. At completion, a changed
+    source file causes writeback refusal, preventing an older job from overwriting a concurrent
+    login or refresh performed outside the launcher.
+    """
+
+    def __init__(self, source_home: Path, job_home: Path, state_dir: Path,
+                 secrets: List[str]):
+        self.source_home = Path(source_home).expanduser().absolute()
+        self.source_path = self.source_home / "auth.json"
+        self.job_path = Path(job_home) / "auth.json"
+        self._lock = None
+        self._finished = None
+        self.secrets = secrets
+        self.job_report_dir = Path(job_home).parent
+        if self.source_home.is_symlink() or not self.source_home.is_dir():
+            raise BlockedError("cloud auth home must be a real directory")
+        if Path(job_home).is_symlink() or not Path(job_home).is_dir():
+            raise BlockedError("cloud job home must be a real directory")
+        lock_root = Path(state_dir) / "cloud-auth-locks"
+        lock_root.mkdir(parents=True, exist_ok=True)
+        lock_id = hashlib.sha256(str(self.source_path).encode("utf-8")).hexdigest()
+        self.lock_path = lock_root / (lock_id + ".lock")
+        try:
+            self._lock = self.lock_path.open("a")
+            fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self._release()
+            raise BlockedError("another cloud job is using this Codex login; retry after it finishes") from None
+        except OSError as error:
+            self._release()
+            raise BlockedError("cannot lock the cloud auth handoff (%s)" % error.__class__.__name__) from None
+        try:
+            payload = _read_regular_nofollow(self.source_path)
+            parsed = json.loads(payload.decode("utf-8"))
+            if not isinstance(parsed, dict):
+                raise BlockedError("cloud auth.json must contain a JSON object")
+            self.original = payload
+            self.original_sha = hashlib.sha256(payload).hexdigest()
+            for value in _auth_secret_values(parsed):
+                if value not in secrets:
+                    secrets.append(value)
+            descriptor = os.open(str(self.job_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(descriptor, "wb") as target:
+                    target.write(payload)
+                    target.flush()
+                    os.fsync(target.fileno())
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    self.job_path.unlink()
+                raise
+            self.job_path.chmod(0o600)
+        except (OSError, ValueError, UnicodeError) as error:
+            self._release()
+            raise BlockedError("cannot prepare the isolated cloud auth file (%s)" %
+                               error.__class__.__name__) from None
+        except BaseException:
+            self._release()
+            raise
+
+    def _release(self):
+        if self._lock is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(self._lock, fcntl.LOCK_UN)
+                self._lock.close()
+            self._lock = None
+
+    def finish(self) -> Dict[str, Any]:
+        if self._finished is not None:
+            return dict(self._finished)
+        result = {"auth_file_copied": True, "refresh_writeback": "unchanged"}
+        temporary = None
+        try:
+            updated = _read_regular_nofollow(self.job_path)
+            refreshed = json.loads(updated.decode("utf-8"))
+            if not isinstance(refreshed, dict):
+                raise BlockedError("refreshed cloud auth.json must contain a JSON object")
+            for value in _auth_secret_values(refreshed):
+                if value not in self.secrets:
+                    self.secrets.append(value)
+            result["retained_artifacts_scrubbed"] = self._scrub_retained_artifacts()
+            if hashlib.sha256(updated).hexdigest() == self.original_sha:
+                self._finished = result
+                return dict(result)
+            current = _read_regular_nofollow(self.source_path)
+            if hashlib.sha256(current).hexdigest() != self.original_sha:
+                result["refresh_writeback"] = "concurrent-change-refused"
+                self._finished = result
+                return dict(result)
+            fd, temporary = tempfile.mkstemp(prefix=".auth-refresh-", dir=str(self.source_home))
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as target:
+                target.write(updated)
+                target.flush()
+                os.fsync(target.fileno())
+            # Recheck the source immediately before replace, closing the common time-of-check gap.
+            if hashlib.sha256(_read_regular_nofollow(self.source_path)).hexdigest() != self.original_sha:
+                result["refresh_writeback"] = "concurrent-change-refused"
+                return dict(result)
+            os.replace(temporary, self.source_path)
+            temporary = None
+            result["refresh_writeback"] = "updated"
+        except (OSError, ValueError, UnicodeError, BlockedError) as error:
+            result["refresh_writeback"] = "refused"
+            result["refresh_writeback_reason"] = str(error)
+        finally:
+            if temporary and os.path.exists(temporary):
+                with contextlib.suppress(OSError):
+                    os.unlink(temporary)
+            self._release()
+            self._finished = result
+        return dict(result)
+
+    def _scrub_retained_artifacts(self) -> int:
+        """Scrub newly observed refresh tokens from text evidence already retained by the job."""
+        count = 0
+        home = Path(self.job_path).parent
+        for root, dirs, files in os.walk(str(self.job_report_dir), followlinks=False):
+            dirs[:] = [name for name in dirs
+                       if not (Path(root) / name).is_symlink()
+                       and (Path(root) / name).absolute() != home.absolute()]
+            for name in files:
+                path = Path(root) / name
+                if path.is_symlink() or path.absolute() == self.job_path.absolute():
+                    continue
+                try:
+                    if not stat.S_ISREG(path.lstat().st_mode):
+                        continue
+                    original = path.read_bytes()
+                    decoded = original.decode("utf-8")
+                except UnicodeError:
+                    continue
+                except OSError as error:
+                    raise BlockedError("cannot inspect retained cloud evidence (%s)" %
+                                       error.__class__.__name__) from None
+                scrubbed = redact(decoded, self.secrets)
+                if scrubbed != decoded:
+                    try:
+                        path.write_text(scrubbed, encoding="utf-8")
+                        count += 1
+                    except OSError as error:
+                        raise BlockedError("cannot scrub retained cloud evidence (%s)" %
+                                           error.__class__.__name__) from None
+        return count
+
+
 def create_native_roots(report_dir: Path) -> List[Path]:
     """Create ``<report_dir>/apple-scratch`` and ``<report_dir>/screenshots``, private, if absent.
 
@@ -1710,6 +1896,82 @@ def worker_argv(codex_bin: str, worktree: Path, profile: omlx_discovery.ServerPr
     return argv
 
 
+def cloud_worker_argv(codex_bin: str, worktree: Path, model: str,
+                      reasoning_effort: Optional[str], last_message: Path,
+                      tool_overrides: Sequence[str] = (),
+                      shell_excludes: Sequence[str] = (),
+                      sandbox_mode: str = REQUIRED_SANDBOX_MODE,
+                      output_schema: Optional[Path] = None) -> List[str]:
+    """Cloud invocation with no local provider or endpoint overrides."""
+    argv = [codex_bin, "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral",
+            "--json", "-C", str(worktree), "-s", sandbox_mode, "-o", str(last_message),
+            "-m", model]
+    if reasoning_effort is not None:
+        argv.extend(["-c", "model_reasoning_effort=" + json.dumps(reasoning_effort)])
+    argv = with_shell_env_excludes(argv, shell_excludes)
+    argv.extend(str(item) for item in tool_overrides)
+    if output_schema is not None:
+        argv.extend(["--output-schema", str(output_schema)])
+    argv.extend(["--", "-"])
+    return argv
+
+
+def cloud_policy_check(argv: Sequence[str], model: str, reasoning_effort: Optional[str],
+                       sandbox_mode: str = REQUIRED_SANDBOX_MODE) -> List[str]:
+    """Return cloud argv drift, including any accidental local routing pins."""
+    problems = []
+    for flag in ("--ignore-user-config", "--ignore-rules", "--ephemeral", "--json"):
+        if list(argv).count(flag) != 1:
+            problems.append(flag + " must appear exactly once")
+    problems.extend(_single_valued_flag(argv, SANDBOX_FLAGS, sandbox_mode))
+    problems.extend(_single_valued_flag(argv, MODEL_FLAGS, model))
+    overrides = config_override_pairs(argv)
+    for key, value in overrides:
+        if key.startswith("model_provider") or key.startswith("model_providers."):
+            problems.append("cloud argv must not override local provider setting " + key)
+        if key == "model_reasoning_effort" and reasoning_effort is not None:
+            expected = json.dumps(reasoning_effort)
+            if value != expected:
+                problems.append("model_reasoning_effort must be " + expected)
+    if reasoning_effort is not None and "model_reasoning_effort" not in dict(overrides):
+        problems.append("model_reasoning_effort is missing")
+    return problems
+
+
+def cloud_config_overrides(reasoning_effort: Optional[str]) -> List[str]:
+    return [] if reasoning_effort is None else ["-c", "model_reasoning_effort=" + json.dumps(reasoning_effort)]
+
+
+def worker_argv_for_tier(options: JobOptions, worktree: Path,
+                         profile: omlx_discovery.ServerProfile, context_window: int,
+                         last_message: Path, tool_overrides: Sequence[str] = (),
+                         shell_excludes: Sequence[str] = (),
+                         catalog_path: Optional[Path] = None,
+                         sandbox_mode: str = REQUIRED_SANDBOX_MODE,
+                         output_schema: Optional[Path] = None) -> List[str]:
+    if options.task.tier.kind == "cloud":
+        return cloud_worker_argv(options.codex_bin, worktree, options.task.tier.model or "",
+            options.task.tier.reasoning_effort, last_message, tool_overrides, shell_excludes,
+            sandbox_mode=sandbox_mode, output_schema=output_schema)
+    return worker_argv(options.codex_bin, worktree, profile, context_window, last_message,
+        tool_overrides, shell_excludes, catalog_path, sandbox_mode=sandbox_mode,
+        output_schema=output_schema)
+
+
+def cloud_worker_env(codex_home: Path, environment_pass: Sequence[str] = ()) -> Tuple[Dict[str, str], List[str], List[str]]:
+    """Minimal cloud environment with only the explicitly prepared job auth file available."""
+    cleaned, stripped = strip_proxy_env(dict(os.environ))
+    cloud = cloud_credential_names(cleaned)
+    env = {key: cleaned[key] for key in BASE_ENV_KEYS if key in cleaned}
+    env.setdefault("TERM", "dumb")
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    env["CODEX_HOME"] = str(codex_home)
+    for name in environment_pass:
+        if name in cleaned:
+            env[name] = cleaned[name]
+    return env, stripped, cloud
+
+
 def worker_env(api_key: str, codex_home: Path, environment_pass: Sequence[str] = ()
                ) -> Tuple[Dict[str, str], List[str], List[str]]:
     """Minimal child environment: loopback key present, proxies and cloud credentials gone, and
@@ -2492,6 +2754,7 @@ class JobOptions:
     workstream: Optional[str] = None
     job_kind: str = "implementation"
     tool_config: Optional[Path] = None
+    escalates: Optional[str] = None
     # Runs the two informational Codex calls of the compatibility check (``subprocess.run``
     # signature); tests replace it so no installed Codex is needed.
     codex_run: Callable[..., Any] = subprocess.run
@@ -2505,8 +2768,10 @@ def new_report(options: JobOptions) -> Dict[str, Any]:
         "started_at": datetime.now(timezone.utc).isoformat(),
         "job_id": f"{_now_stamp()}-{task.task_id}-{uuid.uuid4().hex[:6]}",
         "task_id": task.task_id,
+        "kind": task.kind,
         "status": "worker_failed",
-        "tier": "local",
+        "tier": "cloud" if task.tier.kind == "cloud" else "local",
+        "escalates": options.escalates,
         "failure_reason": None,
         # Filled from live discovery once preflight has succeeded.
         "endpoint": None,
@@ -2671,14 +2936,15 @@ def _execute_read_job(options: JobOptions, report: Dict[str, Any], deadline: Dea
                       profile: omlx_discovery.ServerProfile, context_window: int,
                       worktree: Path, report_dir: Path, env: Dict[str, str],
                       loaded: Dict[str, Any], catalog_path: Path,
-                      catalog: Tuple[Path, str], wrapper: DenyWrapper,
+                      catalog: Optional[Tuple[Path, str]], wrapper: DenyWrapper,
                       secrets: Sequence[str], stream: Any) -> None:
     """Run one structured, read-only turn and release only schema/citation checked data."""
     task = options.task
     schema_path = report_dir / "answer.schema.json"
     schema = read_answers.envelope_schema(task.answer_schema or {})
     schema_path.write_text(json.dumps(schema, indent=2) + "\n", encoding="utf-8")
-    if recheck_pinned_model(profile, options.settings_path, options.omlx_fetch, 1) is not None:
+    if (task.tier.kind != "cloud" and
+            recheck_pinned_model(profile, options.settings_path, options.omlx_fetch, 1) is not None):
         report["status"] = "answer_invalid"
         report["failure_reason"] = "the pinned model changed before the read attempt"
         return
@@ -2690,11 +2956,17 @@ def _execute_read_job(options: JobOptions, report: Dict[str, Any], deadline: Dea
     jsonl_path = report_dir / "worker-attempt-1.jsonl"
     prompt = _read_prompt(task, worktree)
     prompt_path.write_text(redact(prompt, secrets), encoding="utf-8")
-    argv = worker_argv(options.codex_bin, worktree, profile, context_window, last_path,
-                       loaded["overrides"], list(loaded["environment"]), catalog_path,
-                       sandbox_mode="read-only", output_schema=schema_path)
-    _policy_check(argv, profile, context_window, catalog,
-                  sandbox_mode="read-only", output_schema=schema_path)
+    argv = worker_argv_for_tier(options, worktree, profile, context_window, last_path,
+                                loaded["overrides"], list(loaded["environment"]), catalog_path,
+                                sandbox_mode="read-only", output_schema=schema_path)
+    if task.tier.kind == "cloud":
+        problems = cloud_policy_check(argv, task.tier.model or "", task.tier.reasoning_effort,
+                                      sandbox_mode="read-only")
+        if problems:
+            raise BlockedError("cloud worker policy self-check refused the launch: " + "; ".join(problems))
+    else:
+        _policy_check(argv, profile, context_window, catalog,
+                      sandbox_mode="read-only", output_schema=schema_path)
     if stream is not None:
         stream.start_attempt(report["job_id"])
     report["_active_attempt"] = {"before_patch": ""}
@@ -2709,8 +2981,9 @@ def _execute_read_job(options: JobOptions, report: Dict[str, Any], deadline: Dea
         result = run_bounded(
             wrapper.wrap(argv), cwd=worktree, env=env, timeout=timeout,
             stdin_data=prompt.encode("utf-8"), stall_seconds=stall["seconds"],
-            on_stall=lambda: server_busy(options.settings_path, options.omlx_fetch,
-                                         min(deadline.end, time.monotonic() + timeout)))
+            on_stall=(None if task.tier.kind == "cloud" else
+                lambda: server_busy(options.settings_path, options.omlx_fetch,
+                                    min(deadline.end, time.monotonic() + timeout))))
     except BaseException:
         observer.finish(status="failed")
         snapshot = observer.snapshot()
@@ -2887,6 +3160,7 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
              lease: Optional["pool.Lease"] = None,
              secrets: Optional[Sequence[str]] = None) -> None:
     task = options.task
+    is_cloud = task.tier.kind == "cloud"
     state_dir = options.state_dir
     if _inside(state_dir, task.repo_path):
         raise ContractError(
@@ -2910,6 +3184,8 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     report["codex_compat"] = codex_compat(options.codex_bin, run=options.codex_run)
     if not report["codex_compat"]["ok"]:
         raise CodexIncompatible(report["codex_compat"])
+    if options.load_model and is_cloud:
+        raise ContractError("--load is available only for local-tier jobs")
     if options.load_model:
         if not options.requested_model:
             raise ContractError("--load requires --model")
@@ -2917,19 +3193,49 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         report["model_load"] = load_requested_model(options.settings_path,
                                                     options.requested_model, options.omlx_fetch,
                                                     timeout=load_timeout)
-    profile, context_window = discover_job_profile(
-        options.settings_path, options.requested_model, options.context_cap, options.omlx_fetch)
-    report["preflight"] = preflight_receipt(profile, context_window)
-    report["endpoint"] = report["preflight"]["endpoint"]
-    report["model_profile"] = report["preflight"]["profile"]
+    selected_cloud = None
+    if is_cloud:
+        try:
+            catalog_models = codex_catalog.list_cloud_models(options.codex_bin, run=options.codex_run)
+        except RuntimeError as error:
+            raise BlockedError(str(error)) from error
+        selected_cloud = next((model for model in catalog_models if model.slug == task.tier.model), None)
+        if selected_cloud is None:
+            raise BlockedError("requested cloud model is not present in the live Codex catalog")
+        effort = task.tier.reasoning_effort
+        if effort is not None and effort not in selected_cloud.reasoning_levels:
+            raise ContractError("tier.reasoning_effort is not supported by the selected cloud model")
+        model = omlx_discovery.ModelProfile(
+            canonical_id=selected_cloud.slug, api_model=selected_cloud.slug, model_type="llm",
+            engine_type=None, context_window=selected_cloud.context_window,
+            max_output_tokens=None, accepts_images=True, thinking_default=None,
+            reasoning_efforts=list(selected_cloud.reasoning_levels))
+        profile = omlx_discovery.ServerProfile(
+            base_url="", version=None, model=model, prefill_tps=None, generation_tps=None,
+            server_prompt_tokens=None, active_requests=None,
+            discovered_at=datetime.now(timezone.utc).isoformat())
+        context_window = (min(selected_cloud.context_window, options.context_cap)
+                          if options.context_cap else selected_cloud.context_window)
+        report["preflight"] = {"tier": "cloud", "source": "codex debug models",
+                               "model": selected_cloud.slug}
+        report["endpoint"] = None
+        report["model_profile"] = {"cloud": selected_cloud.__dict__}
+        report["cloud_catalog"] = {"source": "codex debug models", "visibility": "list"}
+        api_key = ""
+    else:
+        profile, context_window = discover_job_profile(
+            options.settings_path, options.requested_model, options.context_cap, options.omlx_fetch)
+        report["preflight"] = preflight_receipt(profile, context_window)
+        report["endpoint"] = report["preflight"]["endpoint"]
+        report["model_profile"] = report["preflight"]["profile"]
+        api_key = read_api_key(options.settings_path)
     report["context_window"] = context_window
     report["api_model"] = profile.model.api_model
-    api_key = read_api_key(options.settings_path)
     # The caller's list already holds the credentials selected by the tools manifest: it grows
     # here instead of being reset, so nothing collected before the first failure is forgotten.
     if secrets is None:
         secrets = []
-    if api_key not in secrets:
+    if api_key and api_key not in secrets:
         secrets.append(api_key)
 
     if options.native_preflight_plan is not None and options.apple_simulator_udid is None:
@@ -2966,21 +3272,39 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
     # the hash write_catalog returns is what every launch self-check compares the file against.
     codex_home = job_codex_home(report_dir)
     report["codex_home"] = str(codex_home)
+    if is_cloud:
+        explicit_home = os.environ.get("CODEX_HOME")
+        source_home = Path(explicit_home).expanduser() if explicit_home else Path.home() / ".codex"
+        session = CloudAuthSession(source_home, codex_home, state_dir, secrets)
+        report["_cloud_auth"] = session
+        report["cloud_auth"] = {
+            "credential_source": "explicit CODEX_HOME" if explicit_home else "default Codex home",
+            "auth_file_copied": True,
+            "home_isolated": True,
+            "real_home_read": bool(source_home == Path.home() / ".codex"),
+            "refresh_writeback": "pending",
+        }
     # The roots the wrapper re-opens and rename-protects must exist before the profile is built:
     # a protected path that is missing cannot be created inside the job (xcodebuild's
     # -derivedDataPath, a screenshot capture).
     create_native_roots(report_dir)
-    catalog_path = report_dir / codex_catalog.CATALOG_NAME
-    try:
-        catalog_sha = codex_catalog.write_catalog(
-            catalog_path, codex_catalog.build_local_entry(profile.model, context_window))
-    except (OSError, ValueError) as error:
-        raise BlockedError(f"cannot generate the model catalog {catalog_path}: {error}") from error
-    report["catalog_sha256"] = catalog_sha
-    catalog = (catalog_path, catalog_sha)
+    catalog_path = None
+    catalog = None
+    if not is_cloud:
+        catalog_path = report_dir / codex_catalog.CATALOG_NAME
+        try:
+            catalog_sha = codex_catalog.write_catalog(
+                catalog_path, codex_catalog.build_local_entry(profile.model, context_window))
+        except (OSError, ValueError) as error:
+            raise BlockedError(f"cannot generate the model catalog {catalog_path}: {error}") from error
+        report["catalog_sha256"] = catalog_sha
+        catalog = (catalog_path, catalog_sha)
 
-    env, stripped_proxies, cloud_names = worker_env(
-        api_key, codex_home, task.environment_pass)
+    if is_cloud:
+        env, stripped_proxies, cloud_names = cloud_worker_env(codex_home, task.environment_pass)
+    else:
+        env, stripped_proxies, cloud_names = worker_env(
+            api_key, codex_home, task.environment_pass)
     if options.apple_simulator_udid is not None:
         # Native toolchain pin for the worker itself: ibtool/actool run in-process. HOME stays
         # exactly as the job had it, so the real simctl/Xcode state is used; CODEX_HOME is the
@@ -3027,9 +3351,9 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         report["tooling"] = probe_tools(
             loaded, codex_bin=options.codex_bin,
             env={name: value for name, value in env.items() if name != API_KEY_ENV},
-            overrides=config_overrides(
-                profile, context_window, catalog_path,
-                sandbox_mode="read-only" if task.kind == "read" else REQUIRED_SANDBOX_MODE),
+            overrides=(cloud_config_overrides(task.tier.reasoning_effort) if is_cloud else
+                config_overrides(profile, context_window, catalog_path,
+                sandbox_mode="read-only" if task.kind == "read" else REQUIRED_SANDBOX_MODE)),
             deadline=deadline, codex_home=codex_home)
     except ToolProbeError as error:
         raise BlockedError(f"required MCP tools could not be probed: {error}") from error
@@ -3040,18 +3364,30 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         read_schema_path.write_text(json.dumps(
             read_answers.envelope_schema(task.answer_schema or {}), indent=2) + "\n",
             encoding="utf-8")
-        read_argv = worker_argv(
-            options.codex_bin, worktree, profile, context_window,
+        read_argv = worker_argv_for_tier(
+            options, worktree, profile, context_window,
             report_dir / "policy-check.last-message.txt", loaded["overrides"],
             list(loaded["environment"]), catalog_path, sandbox_mode="read-only",
             output_schema=read_schema_path)
-        _policy_check(read_argv, profile, context_window, catalog,
-                      sandbox_mode="read-only", output_schema=read_schema_path)
+        if is_cloud:
+            problems = cloud_policy_check(read_argv, task.tier.model or "",
+                                          task.tier.reasoning_effort, sandbox_mode="read-only")
+            if problems:
+                raise BlockedError("cloud worker policy self-check refused the launch: " + "; ".join(problems))
+        else:
+            _policy_check(read_argv, profile, context_window, catalog,
+                          sandbox_mode="read-only", output_schema=read_schema_path)
     else:
-        _policy_check(worker_argv(options.codex_bin, worktree, profile, context_window,
-                                  report_dir / "policy-check.last-message.txt",
-                                  loaded["overrides"], list(loaded["environment"]), catalog_path),
-                      profile, context_window, catalog)
+        argv = worker_argv_for_tier(options, worktree, profile, context_window,
+            report_dir / "policy-check.last-message.txt", loaded["overrides"],
+            list(loaded["environment"]), catalog_path)
+        if is_cloud:
+            problems = cloud_policy_check(argv, task.tier.model or "",
+                                          task.tier.reasoning_effort)
+            if problems:
+                raise BlockedError("cloud worker policy self-check refused the launch: " + "; ".join(problems))
+        else:
+            _policy_check(argv, profile, context_window, catalog)
     # Every process that runs model-influenced code from here on (the worker, each check, each
     # native step) runs behind the job's deny wrapper; the self-check above saw the inner argv.
     wrapper = setup_deny_wrapper(options, report, perms, report_dir, worktree, codex_home,
@@ -3126,8 +3462,9 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         # after the cheap local admission checks and before the attempt's budget is computed,
         # because the request itself spends some of it. A non-``None`` answer ends the job
         # as blocked; the attempts that already ran stay audited and preserved below.
-        changed = recheck_pinned_model(profile, options.settings_path, options.omlx_fetch,
-                                       attempt_number)
+        changed = (None if is_cloud else
+                   recheck_pinned_model(profile, options.settings_path, options.omlx_fetch,
+                                        attempt_number))
         if changed is not None:
             reason, message = changed
             report["attempts"].append({"attempt": attempt_number, "skipped": message,
@@ -3153,9 +3490,14 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
         stderr_path = report_dir / f"worker-attempt-{attempt_number}.stderr.log"
         last_path = last_message_path(report_dir, attempt_number)
         prompt_path.write_text(redact(prompt, secrets), encoding="utf-8")
-        argv = worker_argv(options.codex_bin, worktree, profile, context_window, last_path,
-                           loaded["overrides"], list(loaded["environment"]), catalog_path)
-        _policy_check(argv, profile, context_window, catalog)
+        argv = worker_argv_for_tier(options, worktree, profile, context_window, last_path,
+                                    loaded["overrides"], list(loaded["environment"]), catalog_path)
+        if is_cloud:
+            problems = cloud_policy_check(argv, task.tier.model or "", task.tier.reasoning_effort)
+            if problems:
+                raise BlockedError("cloud worker policy self-check refused the launch: " + "; ".join(problems))
+        else:
+            _policy_check(argv, profile, context_window, catalog)
         before_worker = audit_worktree(worktree, base_commit, task.allowed_paths, secrets, scratch_dir=report_dir, git_layout=git_layout,
                                        git_admin_before=report["_git_admin_before"])
         patch_before = before_worker.patch
@@ -3182,9 +3524,10 @@ def _execute(options: JobOptions, report: Dict[str, Any], deadline: Deadline,
             result = run_bounded(wrapper.wrap(argv), cwd=worktree, env=env,
                                  timeout=runner_timeout, stdin_data=prompt.encode("utf-8"),
                                  stall_seconds=stall["seconds"],
-                                 on_stall=lambda: server_busy(options.settings_path,
-                                                              options.omlx_fetch,
-                                                              attempt_deadline))
+                                 on_stall=(None if is_cloud else
+                                     lambda: server_busy(options.settings_path,
+                                                         options.omlx_fetch,
+                                                         attempt_deadline)))
         except BaseException:
             observer.finish(status="failed")
             snapshot = observer.snapshot()
@@ -3594,12 +3937,13 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
             raise BlockedError(str(error)) from error
         report["_policy"] = stream if claimed else None
         key_error: Optional[Exception] = None
-        try:
-            model_key = read_api_key(options.settings_path)
-            if model_key not in secrets:
-                secrets.append(model_key)
-        except PreflightError as error:
-            key_error = error
+        if options.task.tier.kind == "local":
+            try:
+                model_key = read_api_key(options.settings_path)
+                if model_key not in secrets:
+                    secrets.append(model_key)
+            except PreflightError as error:
+                key_error = error
         # Every lock wait is inside the single job budget: it is measured, never reset.
         lock_timeout = min(float(options.lock_timeout),
                            float(options.task.timeout_seconds),
@@ -3621,6 +3965,14 @@ def run_job(options: JobOptions) -> Dict[str, Any]:
         report["failure_reason"] = redact(f"unexpected {error.__class__.__name__}: {error}", secrets)
     finally:
         report.pop("_policy", None)
+        auth_session = report.pop("_cloud_auth", None)
+        if auth_session is not None:
+            try:
+                report.setdefault("cloud_auth", {}).update(auth_session.finish())
+            except Exception as auth_error:  # report the refusal without losing the job result
+                report.setdefault("cloud_auth", {}).update(
+                    auth_file_copied=True, refresh_writeback="refused",
+                    refresh_writeback_reason=auth_error.__class__.__name__)
         unfinished = report.pop("_active_attempt", None)
         if report.get("worktree") and report.get("primary_fingerprint_before"):
             try:
@@ -3783,6 +4135,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--preflight-only", action="store_true", help="qualify native baseline without starting a worker")
     run.add_argument("--workstream", default=None, help="stable scope name shared across retries and repair jobs (default: task_id)")
     run.add_argument("--job-kind", choices=("implementation", "repair"), default="implementation")
+    run.add_argument("--escalates", metavar="JOB_ID", help="job ID this cloud escalation continues")
     run.add_argument("--tool-config", type=Path, default=None,
                      help="optional MCP tools manifest for this task: the manifest names the "
                           "credentials it needs and their values never reach argv, evidence or "
@@ -3797,6 +4150,12 @@ def build_parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status", help="read progress and actual usage without starting a worker")
     status.add_argument("--state-dir")
     status.add_argument("--job-id")
+    models = sub.add_parser("models", help="show available local or cloud models")
+    models.add_argument("--cloud", action="store_true", help="read the live Codex cloud catalog")
+    models.add_argument("--json", action="store_true", help="print model data as JSON")
+    models.add_argument("--settings", default=str(OMLX_SETTINGS))
+    models.add_argument("--codex-bin", help=f"Codex CLI path (default PATH or {CODEX_BIN_ENV})")
+    add_selection_arguments(models)
     workstream = sub.add_parser("workstream", help="manage persistent workstream budgets")
     workstream_sub = workstream.add_subparsers(dest="workstream_command", required=True)
     reset_parser = workstream_sub.add_parser("reset", help="explicitly reset both tier budgets for one workstream")
@@ -3891,7 +4250,7 @@ def planner_json(report: Dict[str, Any]) -> Dict[str, Any]:
     report_dir = report.get("report_dir")
     return {
         "job_id": report.get("job_id"),
-        "kind": report.get("job_kind", "implementation"),
+        "kind": report.get("kind", "write"),
         "tier": report.get("tier", "local"),
         "model": report.get("api_model"),
         "status": report.get("status"),
@@ -4000,6 +4359,26 @@ def main(argv: Optional[Sequence[str]] = None, *,
                                   args.workstream, actor=args.actor)
             print(json.dumps(result, indent=2))
             return 0
+        if args.command == "models":
+            if args.cloud:
+                try:
+                    data = [model.__dict__ for model in codex_catalog.list_cloud_models(
+                        resolve_codex_bin(args.codex_bin), run=codex_run)]
+                except RuntimeError as error:
+                    raise PreflightError(str(error)) from error
+            else:
+                requested_model, context_cap = selection_from_args(args)
+                data = run_preflight(Path(os.path.expanduser(args.settings)), requested_model,
+                                     context_cap, omlx_fetch)
+            if args.json:
+                print(json.dumps(data, indent=2))
+            elif args.cloud:
+                for model in data:
+                    print("%s: %s (%s tokens)" %
+                          (model["slug"], model["description"], model["context_window"]))
+            else:
+                print(json.dumps(data, indent=2))
+            return 0
         if args.command == "permissions":
             return run_permissions_command(args)
         requested_model, context_cap = selection_from_args(args)
@@ -4039,6 +4418,7 @@ def main(argv: Optional[Sequence[str]] = None, *,
             workstream=args.workstream or task.workstream,
             job_kind=args.job_kind,
             tool_config=args.tool_config,
+            escalates=args.escalates,
             codex_run=codex_run,
         )
         previous_handlers = {}

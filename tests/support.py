@@ -1,5 +1,6 @@
 """Shared helpers for the suite: real disposable git repos, mocked worker subprocess."""
 import copy
+import contextlib
 import json
 import os
 import re
@@ -216,10 +217,17 @@ def fake_help(version: str = CODEX_VERSION, missing: Sequence[str] = ()):
                 if not set(names) & set(missing):
                     lines += ["      " + option, "          (help text)", ""]
             return subprocess.CompletedProcess(argv, 0, "\n".join(lines) + "\n", "")
+        if argv[1:] == ["debug", "models"]:
+            return subprocess.CompletedProcess(argv, 0, load_fixture_text("codex/debug_models.json"), "")
         return subprocess.CompletedProcess(argv, 2, "", "error: unexpected argument\n")
 
     run.calls = []
     return run
+
+
+def fake_completed(stdout: str = "", returncode: int = 0):
+    """Completed subprocess result for catalog and other bounded command fixtures."""
+    return subprocess.CompletedProcess([], returncode, stdout, "")
 
 
 def task_payload(repo, **overrides):
@@ -227,6 +235,9 @@ def task_payload(repo, **overrides):
                "goal": "Make add() return the sum.", "acceptance_criteria": ["test_add passes"],
                "allowed_paths": ["add.py"], "test_commands": [["python3", "-m", "unittest", "-v"]],
                "timeout_seconds": 60, "max_attempts": 1}
+    if "tier" in overrides:
+        payload.update(kind="write", workstream=payload["task_id"],
+                       environment={"pass": []}, ui_review=False)
     payload.update(overrides)
     return payload
 
@@ -276,7 +287,7 @@ def job_options(root, repo, verify=True, omlx=None, max_attempts=1, apple_udid=N
 
 
 def run_clean_job(root, repo, *, omlx=None, fake_run=None, worker_edit=None,
-                  **contract_overrides) -> Tuple[Dict, "FakeRun"]:
+                  escalates=None, **contract_overrides) -> Tuple[Dict, "FakeRun"]:
     """One job end to end on the mocked worker; returns ``(report, fake_run)``.
 
     The worker makes ``add()`` correct (``fix_add``) unless ``worker_edit`` says otherwise; a
@@ -284,10 +295,22 @@ def run_clean_job(root, repo, *, omlx=None, fake_run=None, worker_edit=None,
     ``omlx`` is the discovery fake and ``contract_overrides`` replace task contract fields.
     """
     options = job_options(root, repo, omlx=omlx, **contract_overrides)
+    options.escalates = escalates
     fake = fake_run if fake_run is not None else FakeRun(worker_edit=worker_edit or fix_add)
     if fake_run is not None and worker_edit is not None:
         fake.worker_edit = worker_edit
-    with mock.patch.object(lw, "run_bounded", fake):
+    auth_context = contextlib.nullcontext()
+    if options.task.tier.kind == "cloud":
+        source_home = Path(root) / "synthetic-codex-home"
+        source_home.mkdir(parents=True, exist_ok=True)
+        (source_home / "auth.json").write_text(json.dumps({
+            "auth_mode": "chatgpt",
+            "tokens": {"access_token": "synthetic-access-token-1234",
+                       "refresh_token": "synthetic-refresh-token-1234",
+                       "id_token": "synthetic.id.token", "account_id": "fixture-account"}}),
+            encoding="utf-8")
+        auth_context = mock.patch.dict(os.environ, {"CODEX_HOME": str(source_home)})
+    with auth_context, mock.patch.object(lw, "run_bounded", fake):
         report = lw.run_job(options)
     return report, fake
 
@@ -381,7 +404,8 @@ class FakeRun:
 
     def __init__(self, worker_rc=0, test_rc=0, probe_ok=True, worker_edit=None,
                  worker_timed_out=False, worker_stderr="", apple=None, routed_model=None,
-                 wrapper_rc=0, wrapper_stderr="", first_stream=None, attempt_streams=None):
+                 wrapper_rc=0, wrapper_stderr="", first_stream=None, attempt_streams=None,
+                 auth_refresh=None):
         self.worker_rc, self.test_rc, self.probe_ok = worker_rc, test_rc, probe_ok
         # The model the worker's events name: the job's own ``-m`` model unless a test routes
         # the worker somewhere else on purpose.
@@ -390,6 +414,7 @@ class FakeRun:
             worker_timed_out, worker_stderr)
         self.first_stream = first_stream
         self.attempt_streams = list(attempt_streams or [])
+        self.auth_refresh = auth_refresh
         self.wrapper_rc, self.wrapper_stderr = wrapper_rc, wrapper_stderr
         # Knobs for the mocked /usr/bin/sandbox-exec backend: devices, verdicts, failures.
         self.apple = dict(apple or {})
@@ -508,6 +533,9 @@ class FakeRun:
         if argv[1:2] == ["exec"]:
             call["kind"] = "exec"
             self.exec_calls += 1
+            if self.auth_refresh is not None:
+                auth_path = Path(env["CODEX_HOME"]) / "auth.json"
+                auth_path.write_text(self.auth_refresh, encoding="utf-8")
             if self.worker_edit:
                 self.worker_edit(Path(cwd), self.exec_calls)
             return result(argv, self.worker_rc, self.worker_jsonl(argv, cwd, self.exec_calls),

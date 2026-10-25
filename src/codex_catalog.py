@@ -13,12 +13,71 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from omlx_discovery import ModelProfile
 
-__all__ = ["CATALOG_NAME", "TEMPLATE_PATH", "build_local_entry", "fill_template", "write_catalog"]
+__all__ = ["CATALOG_NAME", "TEMPLATE_PATH", "CloudModel", "list_cloud_models",
+           "build_local_entry", "fill_template", "write_catalog"]
+
+
+@dataclass(frozen=True)
+class CloudModel:
+    slug: str
+    display_name: str
+    description: str
+    context_window: int
+    reasoning_levels: List[str]
+    default_reasoning: Optional[str]
+
+
+def list_cloud_models(codex_bin: str,
+                      run: Callable[..., Any] = subprocess.run) -> List[CloudModel]:
+    """Read the currently installed Codex cloud catalog, preserving its list order."""
+    try:
+        completed = run([codex_bin, "debug", "models"], capture_output=True,
+                        timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError("cannot read the Codex model catalog: %s" % error) from error
+    if getattr(completed, "returncode", 1) != 0:
+        detail = getattr(completed, "stderr", "")
+        if isinstance(detail, bytes):
+            detail = detail.decode("utf-8", "replace")
+        raise RuntimeError("codex debug models failed: %s" % str(detail).strip())
+    stdout = getattr(completed, "stdout", "")
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode("utf-8", "replace")
+    try:
+        payload = json.loads(stdout)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("codex debug models did not return JSON") from error
+    rows = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        raise RuntimeError("codex debug models returned no models list")
+    models = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("visibility") != "list":
+            continue
+        slug, description = row.get("slug"), row.get("description")
+        window = row.get("context_window")
+        if (not isinstance(slug, str) or not slug or not isinstance(description, str)
+                or not description.strip() or type(window) is not int or window < 1):
+            continue
+        levels = row.get("supported_reasoning_levels", [])
+        if not isinstance(levels, list):
+            levels = []
+        reasoning = [item.get("effort") if isinstance(item, dict) else item
+                     for item in levels]
+        reasoning = [item for item in reasoning if isinstance(item, str) and item]
+        default = row.get("default_reasoning_level")
+        if not isinstance(default, str):
+            default = None
+        models.append(CloudModel(slug, str(row.get("display_name") or slug),
+                                 description.strip(), window, reasoning, default))
+    return models
 
 TEMPLATE_PATH = Path(__file__).resolve().with_name("codex_local_model_template.json")
 # The file name inside the job's report directory (the launcher's, not the worker's, to write);
