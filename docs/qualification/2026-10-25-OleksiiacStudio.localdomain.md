@@ -50,8 +50,9 @@ Durations are measured by this harness around the case.
 
 The passing read job's retained Codex event stream contains a completed `command_execution` for
 `cat widget.py`, exit code 0, with `TITLE = "Qualification Widget"` in the captured output. The
-answer's single citation was verified against that source line. The live test now asserts this
-actual inspection event in addition to answer schema and citation verification.
+answer's single citation was verified against that source line. I confirmed this directly from the
+retained event stream after the 8/8 run; the committed live test now asserts this actual inspection
+event in addition to answer schema and citation verification on future runs.
 
 An earlier read trial using a two-field answer contract was withheld: launcher status
 `answer_invalid`, citation verification 1/2 because one quote did not match its cited lines; the
