@@ -33,7 +33,6 @@ SKILL_NAMES = {"local-worker", "setup", "doctor"}
 PERSONAL = re.compile(r"oleksii|/Users/", re.IGNORECASE)
 ACTIVE_INSTRUCTIONS = [".codex-plugin/plugin.json", ".agents/plugins/marketplace.json", "README.md",
                        "skills/local-worker/SKILL.md",
-                       "skills/local-worker/references/global-policy.md",
                        "skills/setup/SKILL.md", "skills/doctor/SKILL.md"]
 NON_MCP_OR_HOOKS_NAMES = {"mcp.json", ".mcp.json", "hooks.json", "hooks.yaml", "plugin.lock.json"}
 POLICY_ANCHORS = ["Selected planner, local worker implementation", "danger-full-access",
@@ -260,41 +259,24 @@ class CopiedPackageTest(PackageBase):
                                             "goal", "max_attempts", "repo_path", "task_id",
                                             "test_commands", "timeout_seconds"])
         for reference in ("references/operating-policy.md", "references/apple-verification.md",
-                          "references/global-policy.md", "../setup/SKILL.md"):
+                          "../setup/SKILL.md"):
             target = self.resolve(reference, skill.parent)
             self.assertTrue(target.is_file(), "skill reference is missing: " + reference)
 
-    def test_canonical_global_policy_is_portable_and_faithful(self):
-        policy_path = self.resolve("skills/local-worker/references/global-policy.md")
-        policy = policy_path.read_text(encoding="utf-8")
-        for anchor in POLICY_ANCHORS:
-            self.assertIn(anchor, policy, "policy anchor missing: " + anchor)
-        self.assertIsNone(PERSONAL.search(policy))
-        self.assertIn("<root>/bin/local-worker", policy)
-        self.assertIn("<root>/skills/local-worker/SKILL.md", policy)
-        self.assertIn("plugin.json", policy)
-        self.assertIn("bundled local-worker skill", policy)
+    def test_global_policy_is_not_shipped_but_legacy_migration_input_is_unchanged(self):
+        self.assertFalse((Path(self.root) / "skills/local-worker/references/global-policy.md").exists())
         legacy = (ROOT / "evidence" / "global-default" / "AGENTS.md").read_text(encoding="utf-8")
-        # Immutable migration fixture: the historical file keeps its pre-rename bytes (and the
-        # embedded LEGACY_SHA256 depends on them), so the old path is asserted, not renamed.
+        # Immutable migration input: setup recognizes the historical bytes but ships no copy of
+        # the global policy as active guidance.
         self.assertIn("/Users/oleksii.naboichenko/.codex/skills/local-implement/SKILL.md", legacy,
                       "the historical migration input must stay unchanged")
-        moved = 0
-        for line in legacy.splitlines():
-            if not line.startswith("- "):
-                continue
-            if "/.codex/skills/local-implement/SKILL.md" in line:
-                moved += 1
-                continue
-            self.assertIn(line, policy, "policy bullet lost: " + line[:60])
-        self.assertEqual(moved, 1, "exactly the machine-specific skill path may change")
 
     def test_setup_and_doctor_document_the_same_interface(self):
         setup = (Path(self.root) / "skills" / "setup" / "SKILL.md").read_text(encoding="utf-8")
         doctor = (Path(self.root) / "skills" / "doctor" / "SKILL.md").read_text(encoding="utf-8")
         for phrase in ("python3 <root>/src/plugin_setup.py --check",
                        "python3 <root>/src/plugin_setup.py --apply",
-                       "CODEX_HOME", "AGENTS.md", "global-policy.md", "idempotent",
+                       "CODEX_HOME", "AGENTS.md", "idempotent",
                        "backup"):
             self.assertIn(phrase, setup, "setup must document: " + phrase)
         self.assertIn("python3 <root>/src/plugin_setup.py --check --preflight", doctor)

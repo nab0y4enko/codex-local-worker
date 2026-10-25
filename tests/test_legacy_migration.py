@@ -17,6 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+import plugin_setup
 
 BEGIN = "<!-- local-worker begin -->"
 END = "<!-- local-worker end -->"
@@ -96,7 +97,7 @@ class MigrationCase(unittest.TestCase):
 
 
 class LegacyPointerMigrationTest(MigrationCase):
-    def test_frozen_old_block_is_recognized_and_migrated_to_one_current_block(self):
+    def test_frozen_old_block_is_replaced_by_the_completion_rule(self):
         raw = self.write_agents(HEAD + OLD_BLOCK.encode("utf-8") + TAIL)
         code, report, output = self.invoke()
         self.assertEqual(code, 0, output)
@@ -110,21 +111,20 @@ class LegacyPointerMigrationTest(MigrationCase):
         code, report, output = self.invoke(["--apply"])
         self.assertEqual(code, 0, output)
         self.assertEqual(report["apply"]["reason"], "migrated_legacy_pointer")
-        self.assertEqual(report["apply"]["verified_state"], "current")
+        self.assertEqual(report["apply"]["verified_state"], "absent")
         self.assertEqual(Path(report["apply"]["backup"]).read_bytes(), raw)
 
         migrated = self.agents.read_bytes()
         self.assertTrue(migrated.startswith(HEAD), "user prefix must survive byte-for-byte")
         self.assertTrue(migrated.endswith(TAIL), "user suffix (incl. non-UTF8 bytes) must survive")
         text = migrated.decode("utf-8", "surrogateescape")
-        self.assertEqual(text.count(BEGIN), 1, "exactly one current block may exist")
-        self.assertEqual(text.count(END), 1)
+        self.assertEqual(text.count(BEGIN), 0, "the pointer is opt-in")
+        self.assertEqual(text.count(END), 0)
         self.assertNotIn(OLD_BEGIN, text, "the pre-rename block must not stay as a second policy")
         self.assertNotIn(OLD_END, text)
         self.assertNotIn("/Users/dev/old-checkout", text, "the stale root must be rewritten")
-        self.assertIn(str(self.package / "skills/local-worker/references/global-policy.md"), text)
-        self.assertIn(str(self.package / "skills/local-worker/SKILL.md"), text)
-        self.assertIn("<%s>" % str(self.package), text)
+        self.assertEqual(text[text.index("## Global completion rule"):],
+                         plugin_setup.USER_COMPLETION_RULE + TAIL.decode("utf-8", "surrogateescape"))
 
         again_code, again, again_output = self.invoke(["--apply"])
         self.assertEqual(again_code, 0, again_output)
@@ -134,8 +134,7 @@ class LegacyPointerMigrationTest(MigrationCase):
         self.assertEqual(len(self.backups()), 1, "a no-op must not add a backup")
         check_code, check, _ = self.invoke()
         self.assertEqual(check_code, 0)
-        self.assertEqual(check["managed_block"]["state"], "current")
-        self.assertTrue(check["managed_block"]["managed_root_matches_this_root"])
+        self.assertEqual(check["managed_block"]["state"], "absent")
 
     def test_mixed_current_and_pre_rename_blocks_refuse_without_writes(self):
         raw = (HEAD + self.current_block().encode("utf-8")
@@ -164,7 +163,7 @@ class LegacyPointerMigrationTest(MigrationCase):
         self.assertFalse(self.state.exists(), "refusal must not create shared state")
 
     def current_block(self):
-        code, report, output = self.invoke(["--apply"], env=self.environment(
+        code, report, output = self.invoke(["--apply", "--pointer"], env=self.environment(
             CODEX_HOME=str(self.temp / "other home")))
         self.assertEqual(code, 0, output)
         text = (self.temp / "other home" / "AGENTS.md").read_text(encoding="utf-8")

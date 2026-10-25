@@ -17,18 +17,79 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-POLICY_RELATIVE = "skills/local-worker/references/global-policy.md"
+sys.path.insert(0, str(ROOT / "src"))
+import plugin_setup
 BEGIN = "<!-- local-worker begin -->"
 END = "<!-- local-worker end -->"
 SENTINEL = "sk-SENTINEL-9f2c41d7b6e4"
 LEGACY_BYTES = (ROOT / "evidence" / "global-default" / "AGENTS.md").read_bytes()
 HEAD = b"# My own Codex defaults\n\n- Always run the focused tests before shipping.\n"
 TAIL = b"\n## Private notes\n- keep \xff\xfe these exact bytes\n"
-PACKAGE_KEYS = ("manifest", "canonical_policy", "launcher", "launcher_skill", "setup_script",
+PACKAGE_KEYS = ("manifest", "launcher", "launcher_skill", "setup_script",
                 "launcher_engine", "skill_local-worker", "skill_setup", "skill_doctor",
                 "onboarding_skill")
+PLUGIN_VERSION = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())["version"]
+
+OLD_MANAGED_BLOCK = """<!-- local-worker begin -->
+## Local Worker: selected planner, local worker implementation
+
+Planning stays on the model selected in the Codex window. Implementation, fixes, refactors
+and test authoring run on the pinned local worker model through the plugin launcher. This
+block is the only global text the plugin owns; the authoritative policy stays in the package.
+
+- Canonical policy: [global-policy.md](</old/package/skills/local-worker/references/global-policy.md>)
+- Bundled launcher skill: [local-worker/SKILL.md](</old/package/skills/local-worker/SKILL.md>)
+- Install root: </old/package>
+- Read the canonical policy before implementing. If that file is missing, the plugin was
+  moved or uninstalled: run `python3 /old/package/src/plugin_setup.py --check` from the current
+  install root and
+  report the blocker instead of routing implementation to a cloud model.
+
+## Completion: integrate and clean up on every task
+
+Before the final response, reuse this checkout for routine planner work instead of adding
+planner/app worktrees, commit and push the reviewed task changes to the task branch, and
+archive then remove completed temporary or linked worktrees (dirty drafts included, once
+their archive verified) without another request. Preserve the primary checkout and
+unrelated active work; if a push or safe cleanup is unsafe, report the blocker instead of
+claiming completion.
+<!-- local-worker end -->
+"""
+
+
+class MigrationPureTest(unittest.TestCase):
+    def test_rule_constant_has_the_frozen_user_hash(self):
+        import hashlib
+        self.assertEqual(hashlib.sha256(plugin_setup.USER_COMPLETION_RULE.encode()).hexdigest(),
+                         "ee423c25bfdaeb041b80a703ff434caf7ba210c01a5020794e79e34e33acc516")
+
+    def test_old_managed_block_is_replaced_by_the_rule_without_markers(self):
+        before = "# Mine\n\n" + OLD_MANAGED_BLOCK + "\nkeep me\n"
+        after, reason = plugin_setup.migrate(before, ROOT, pointer=False)
+        self.assertEqual(reason, "migrated_block")
+        self.assertIn(plugin_setup.USER_COMPLETION_RULE, after)
+        self.assertNotIn("<!-- local-worker begin -->", after)
+        self.assertTrue(after.startswith("# Mine\n") and after.endswith("keep me\n"))
+
+    def test_rule_is_not_duplicated_when_pointer_is_added_twice(self):
+        once, _ = plugin_setup.migrate(OLD_MANAGED_BLOCK, ROOT, pointer=True)
+        twice, reason = plugin_setup.migrate(once, ROOT, pointer=True)
+        self.assertEqual((twice, reason), (once, "noop"))
+        self.assertEqual(once.count("## Global completion rule"), 1)
+
+    def test_plain_install_does_nothing_without_pointer(self):
+        self.assertEqual(plugin_setup.migrate("# Mine\n", ROOT, pointer=False),
+                         ("# Mine\n", "noop"))
+
+    def test_exact_legacy_file_keeps_only_the_completion_rule(self):
+        legacy = (ROOT / "evidence" / "global-default" / "AGENTS.md").read_text()
+        after, reason = plugin_setup.migrate(legacy, ROOT, pointer=False)
+        self.assertEqual(reason, "migrated_legacy")
+        self.assertIn("## Global completion rule", after)
+        self.assertNotIn("Route all implementation", after)
 
 # The exact success receipt `bin/local-worker preflight` prints; nothing else may pass.
 RECEIPT = {"endpoint": "http://127.0.0.1:8000/v1",
@@ -133,45 +194,39 @@ class ManagedBlockTextTest(SetupCase):
 
     def test_generated_repair_command_round_trips_through_a_shell(self):
         package = self.relocated_copy("codex-local-worker's copy")
-        code, report, output = self.invoke(["--apply"], package=package)
+        code, report, output = self.invoke(["--apply", "--pointer"], package=package)
         self.assertEqual(code, 0, output)
         text = self.agents.read_text(encoding="utf-8")
         setup = str(Path(package) / "src" / "plugin_setup.py")
         self.assertIn("'", setup, "the fixture must relocate through an apostrophe")
-        matches = re.findall(r"`(python3 [^`\n]* --check)`", text)
-        self.assertEqual(len(matches), 1, "exactly one inline repair command expected:\n" + text)
-        self.assertEqual(shlex.split(matches[0]), ["python3", setup, "--check"],
+        matches = re.findall(r"`([^`\n]* doctor)`", text)
+        self.assertEqual(len(matches), 1, "exactly one doctor command expected:\n" + text)
+        self.assertEqual(shlex.split(matches[0]), [str(Path(package) / "bin/local-worker"), "doctor"],
                          "the generated command must be shell-safe and round-trip")
-        self.assertNotIn("python3 %s --check" % setup, text,
-                         "the raw unquoted path must not be emitted")
+        self.assertNotIn(setup, text)
 
     def test_markdown_links_keep_their_angle_brackets_unquoted(self):
         package = self.relocated_copy("plain copy")
-        code, report, output = self.invoke(["--apply"], package=package)
+        code, report, output = self.invoke(["--apply", "--pointer"], package=package)
         self.assertEqual(code, 0, output)
         text = self.agents.read_text(encoding="utf-8")
-        policy = str(Path(package) / POLICY_RELATIVE)
-        self.assertIn("[global-policy.md](<%s>)" % policy, text)
-        self.assertIn("[local-worker/SKILL.md](<%s>)" % str(
+        self.assertIn("Local Worker skill: <%s>" % str(
             Path(package) / "skills" / "local-worker" / "SKILL.md"), text)
-        self.assertIn("<%s>" % str(package), text)
+        self.assertIn("doctor`", text)
 
     def test_managed_block_carries_the_completion_rule_idempotently(self):
-        """Completion cleanup is global guidance, so it belongs in the one owned block."""
-        self.write_agents(HEAD + TAIL)
+        """Replacing the old block retains the exact completion rule outside its markers."""
+        self.write_agents(HEAD + OLD_MANAGED_BLOCK.encode("utf-8") + TAIL)
         code, report, output = self.invoke(["--apply"])
         self.assertEqual(code, 0, output)
         raw = self.agents.read_bytes()
         text = raw.decode("utf-8", "surrogateescape")
-        self.assertEqual(text.replace(self.block_of(text), "").strip(),
-                         (HEAD + TAIL).decode("utf-8", "surrogateescape").strip(),
-                         "unrelated bytes survive the completion rule")
-        self.assertEqual(text.count(BEGIN), 1)
-        self.assertEqual(text.count(END), 1)
-        block = self.block_of(text).lower()
-        for phrase in ("commit and push", "archive", "remove completed",
-                       "preserve the primary checkout", "report the blocker"):
-            self.assertIn(phrase, block, "completion instruction missing: " + phrase)
+        self.assertTrue(text.startswith(HEAD.decode()))
+        self.assertTrue(raw.endswith(TAIL))
+        self.assertNotIn(BEGIN, text)
+        self.assertEqual(text.count("## Global completion rule"), 1)
+        self.assertEqual(text[text.index("## Global completion rule"):],
+                         plugin_setup.USER_COMPLETION_RULE + TAIL.decode("utf-8", "surrogateescape"))
         again, repeat, output = self.invoke(["--apply"])
         self.assertEqual(again, 0, output)
         self.assertFalse(repeat["apply"]["changed"], "the completion rule must not churn")
@@ -191,7 +246,7 @@ class CheckReportTest(SetupCase):
         self.assertFalse(report["writes_performed"])
         self.assertEqual(report["plugin"]["name"], "codex-local-worker")
         self.assertEqual(report["plugin"]["root"], str(self.package))
-        self.assertEqual(report["plugin"]["version"], "0.2.0")
+        self.assertEqual(report["plugin"]["version"], PLUGIN_VERSION)
         self.assertEqual(Path(report["plugin"]["manifest"]).relative_to(self.package).as_posix(),
                          ".codex-plugin/plugin.json")
         self.assertEqual(Path(report["plugin"]["onboarding_skill"]).name, "SKILL.md")
@@ -202,8 +257,7 @@ class CheckReportTest(SetupCase):
             self.assertTrue(entry["exists"], key)
             self.assertTrue(Path(entry["path"]).is_file(), key)
             self.assertTrue(str(Path(entry["path"])).startswith(str(self.package)), key)
-        self.assertEqual(report["package"]["canonical_policy"]["path"],
-                         str(self.package / POLICY_RELATIVE))
+        self.assertIn("migration", report)
         self.assertEqual(report["managed_block"]["state"], "absent")
         self.assertFalse(report["managed_block"]["file_exists"])
         self.assertIsNone(report["managed_block"]["install_root"])
@@ -221,6 +275,24 @@ class CheckReportTest(SetupCase):
         self.assertFalse(self.state.exists(), "check must not create shared state")
         self.assertEqual(self.snapshot(self.package), before, "check must not write in the package")
         self.assertEqual(list(Path(self.package).rglob("__pycache__")), [])
+
+    def test_check_reports_pointer_preview_without_writing(self):
+        original = self.write_agents(HEAD)
+        code, report, output = self.invoke(["--check", "--pointer"])
+        self.assertEqual(code, 0, output)
+        self.assertEqual(report["migration"], {"would_change": True,
+                                               "reason": "installed_pointer"})
+        self.assertEqual(self.agents.read_bytes(), original)
+        self.assertEqual(self.backups(), [])
+
+    def test_check_reports_completion_rule_migration_without_writing(self):
+        original = self.write_agents(OLD_MANAGED_BLOCK.encode("utf-8"))
+        code, report, output = self.invoke(["--check"])
+        self.assertEqual(code, 0, output)
+        self.assertEqual(report["migration"], {"would_change": True,
+                                               "reason": "migrated_block"})
+        self.assertEqual(self.agents.read_bytes(), original)
+        self.assertEqual(self.backups(), [])
 
     def test_home_defaults_come_from_home_when_the_env_vars_are_unset(self):
         code, report, output = self.invoke(env=self.environment(CODEX_HOME=None,
@@ -300,15 +372,15 @@ class CheckReportTest(SetupCase):
 class ApplyTest(SetupCase):
     """Authorized apply: one small authoritative block, backups first, unrelated bytes intact."""
 
-    def test_apply_installs_one_small_block_and_backs_up_existing_bytes(self):
+    def test_apply_pointer_installs_two_lines_and_backs_up_existing_bytes(self):
         self.write_agents(HEAD)
-        code, report, output = self.invoke(["--apply"])
+        code, report, output = self.invoke(["--apply", "--pointer"])
         self.assertEqual(code, 0, output)
         self.assertEqual(report["mode"], "apply")
         self.assertTrue(report["writes_performed"])
         receipt = report["apply"]
         self.assertTrue(receipt["changed"])
-        self.assertEqual(receipt["reason"], "installed")
+        self.assertEqual(receipt["reason"], "installed_pointer")
         self.assertEqual(Path(receipt["destination"]).resolve(), self.agents.resolve())
         self.assertEqual(receipt["written_paths"], [str(self.agents)])
         self.assertEqual(receipt["before_sha256"], hashlib.sha256(HEAD).hexdigest())
@@ -324,24 +396,15 @@ class ApplyTest(SetupCase):
         self.assertEqual(text.count(BEGIN), 1)
         self.assertEqual(text.count(END), 1)
         block = self.block_of(text)
-        # Pointer paths plus the completion rule: still a fraction of a page, and bounded
-        # even when the install root and temporary home are both long.
-        self.assertLess(len(block), 2000, "global guidance must stay small")
-        self.assertIn("[global-policy.md](<" + str(self.package) + "/" + POLICY_RELATIVE + ">)",
-                      block)
-        self.assertIn("<" + str(self.package) + "/skills/local-worker/SKILL.md>", block)
-        self.assertIn("<" + str(self.package) + ">", block)
-        policy = (self.package / POLICY_RELATIVE).read_text(encoding="utf-8")
-        self.assertNotIn(policy[:120], block, "the authoritative policy stays in the package")
+        self.assertEqual(len(block.splitlines()), 4)
+        self.assertIn(str(self.package / "skills/local-worker/SKILL.md"), block)
+        self.assertIn("doctor", block)
         self.assertEqual(report["apply"]["verified_state"], "current")
-        installed = receipt["installed"]["canonical_policy"]
-        self.assertEqual(installed["path"], str(self.package / POLICY_RELATIVE))
-        self.assertEqual(installed["sha256"],
-                         hashlib.sha256((self.package / POLICY_RELATIVE).read_bytes()).hexdigest())
+        self.assertNotIn("canonical_policy", receipt["installed"])
         self.assertEqual(receipt["after_sha256"], hashlib.sha256(raw).hexdigest())
 
     def test_apply_to_a_fresh_home_creates_no_backup_folder(self):
-        code, report, output = self.invoke(["--apply"])
+        code, report, output = self.invoke(["--apply", "--pointer"])
         self.assertEqual(code, 0, output)
         receipt = report["apply"]
         self.assertTrue(receipt["changed"])
@@ -351,12 +414,12 @@ class ApplyTest(SetupCase):
         self.assertTrue(self.agents.is_file())
         self.assertFalse((self.state / "setup-backups").exists())
         self.assertFalse(self.state.exists())
-        again_code, again, _ = self.invoke(["--apply"])
+        again_code, again, _ = self.invoke(["--apply", "--pointer"])
         self.assertEqual(again_code, 0)
         self.assertFalse(again["apply"]["changed"])
         self.assertEqual(self.backups(), [])
 
-    def test_exact_legacy_file_migrates_to_a_header_and_one_block(self):
+    def test_exact_legacy_file_migrates_to_only_the_completion_rule(self):
         self.write_agents(LEGACY_BYTES)
         code, report, _ = self.invoke()
         self.assertEqual(code, 0)
@@ -369,18 +432,12 @@ class ApplyTest(SetupCase):
         self.assertTrue(report["apply"]["changed"])
         self.assertEqual(report["apply"]["reason"], "migrated_legacy")
         text = self.agents.read_text(encoding="utf-8")
-        lines = text.splitlines()
-        self.assertEqual(lines[0], LEGACY_BYTES.decode("utf-8").splitlines()[0])
-        self.assertEqual(lines[1], "")
-        self.assertEqual(lines[2], BEGIN)
-        self.assertEqual(text.count(BEGIN), 1)
-        self.assertNotIn("/.codex/skills/local-worker/SKILL.md", text,
-                         "the legacy global file must not be kept as a duplicate policy")
-        self.assertIn("<" + str(self.package) + "/" + POLICY_RELATIVE + ">", text)
+        self.assertEqual(text, plugin_setup.USER_COMPLETION_RULE)
+        self.assertNotIn(BEGIN, text)
         self.assertEqual(Path(report["apply"]["backup"]).read_bytes(), LEGACY_BYTES)
         after_code, after, _ = self.invoke()
         self.assertEqual(after_code, 0)
-        self.assertEqual(after["managed_block"]["state"], "current")
+        self.assertEqual(after["managed_block"]["state"], "absent")
 
     def test_legacy_migration_works_in_a_relocated_copy_without_the_fixture(self):
         relocated = self.copy_package("no evidence here", evidence=False)
@@ -394,14 +451,14 @@ class ApplyTest(SetupCase):
         code, report, output = self.invoke(["--apply"], package=relocated)
         self.assertEqual(code, 0, output)
         self.assertEqual(report["apply"]["reason"], "migrated_legacy")
-        self.assertIn("<" + str(relocated) + "/" + POLICY_RELATIVE + ">",
-                      self.agents.read_text(encoding="utf-8"))
+        self.assertEqual(self.agents.read_text(encoding="utf-8"),
+                         plugin_setup.USER_COMPLETION_RULE)
 
     def test_unrelated_bytes_survive_when_a_relocated_root_updates_the_block(self):
         relocated = self.copy_package("relocated target with spaces")
         self.assertIn(" ", str(relocated))
         self.write_agents(HEAD)
-        first, first_report, output = self.invoke(["--apply"])
+        first, first_report, output = self.invoke(["--apply", "--pointer"])
         self.assertEqual(first, 0, output)
         with open(str(self.agents), "ab") as handle:
             handle.write(TAIL)
@@ -411,14 +468,14 @@ class ApplyTest(SetupCase):
         self.assertEqual(report["managed_block"]["state"], "drift")
         self.assertEqual(report["managed_block"]["install_root"], str(self.package))
         self.assertFalse(report["managed_block"]["managed_root_matches_this_root"])
-        code, report, output = self.invoke(["--apply"], package=relocated)
+        code, report, output = self.invoke(["--apply", "--pointer"], package=relocated)
         self.assertEqual(code, 0, output)
-        self.assertEqual(report["apply"]["reason"], "updated")
+        self.assertEqual(report["apply"]["reason"], "migrated_block")
         raw = self.agents.read_bytes()
         self.assertTrue(raw.startswith(HEAD))
         self.assertTrue(raw.endswith(TAIL), "trailing user bytes must survive exactly")
         self.assertNotIn(str(self.package), raw.decode("utf-8", "surrogateescape"))
-        self.assertIn(str(relocated) + "/" + POLICY_RELATIVE,
+        self.assertIn(str(relocated / "skills/local-worker/SKILL.md"),
                       raw.decode("utf-8", "surrogateescape"))
         self.assertEqual(raw.split(TAIL, 1)[0].split(HEAD, 1)[1].count(BEGIN.encode()), 1)
         self.assertEqual(Path(report["apply"]["backup"]).read_bytes(), before)
@@ -431,14 +488,14 @@ class ApplyTest(SetupCase):
 
     def test_repeated_apply_is_a_noop_without_extra_backups(self):
         self.write_agents(HEAD)
-        first, first_report, _ = self.invoke(["--apply"])
+        first, first_report, _ = self.invoke(["--apply", "--pointer"])
         self.assertEqual(first, 0)
         count_after_first = len(self.backups())
         self.assertEqual(count_after_first, 1)
         raw = self.agents.read_bytes()
         stamp = os.stat(str(self.agents)).st_mtime_ns
         for _ in range(2):
-            code, report, output = self.invoke(["--apply"])
+            code, report, output = self.invoke(["--apply", "--pointer"])
             self.assertEqual(code, 0, output)
             self.assertFalse(report["apply"]["changed"], "identical apply is a no-op")
             self.assertEqual(report["apply"]["reason"],
@@ -472,20 +529,6 @@ class ApplyTest(SetupCase):
                 self.assertEqual(self.agents.read_bytes(), raw, "refusal must preserve bytes")
                 self.assertEqual(self.backups(), [])
                 self.assertFalse(self.state.exists())
-
-    def test_missing_canonical_policy_refuses_before_any_write(self):
-        (self.package / POLICY_RELATIVE).unlink()
-        self.write_agents(HEAD)
-        code, report, output = self.invoke()
-        self.assertEqual(code, 3, output)
-        self.assertEqual(report["error"]["stage"], "package")
-        self.assertIn("global-policy.md", report["error"]["detail"])
-        code, report, output = self.invoke(["--apply"])
-        self.assertEqual(code, 3, output)
-        self.assertNotIn("apply", report)
-        self.assertEqual(self.agents.read_bytes(), HEAD)
-        self.assertEqual(self.backups(), [])
-        self.assertFalse(self.state.exists())
 
     def test_malformed_manifest_identity_refuses_with_a_nonzero_code(self):
         manifest_path = self.package / ".codex-plugin" / "plugin.json"
@@ -606,7 +649,7 @@ class AgentsOverrideTest(SetupCase):
                 self.assertEqual(code, 0, output)
                 self.assertEqual(report["agents_override"]["state"], "empty")
                 self.assertFalse(report["agents_override"]["active"])
-                code, report, output = self.invoke(["--apply"])
+                code, report, output = self.invoke(["--apply", "--pointer"])
                 self.assertEqual(code, 0, output)
                 text = self.agents.read_text(encoding="utf-8")
                 self.assertIn(BEGIN, text)

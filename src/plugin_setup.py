@@ -40,11 +40,11 @@ import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Tuple
 
 SCHEMA_VERSION = 1
 PLUGIN_NAME = "codex-local-worker"
 MANIFEST_RELATIVE = (".codex-plugin", "plugin.json")
-POLICY_RELATIVE = ("skills", "local-worker", "references", "global-policy.md")
 SKILL_RELATIVE = ("skills", "local-worker", "SKILL.md")
 SETUP_RELATIVE = ("src", "plugin_setup.py")
 LAUNCHER_ENGINE_RELATIVE = ("src", "local_worker.py")
@@ -53,7 +53,6 @@ LEGACY_RELATIVE = ("evidence", "global-default", "AGENTS.md")
 # sha256 of the historical global AGENTS.md that ships in this package as a migration input.
 # Kept here so a package copy without evidence/ still recognizes (and migrates) the legacy file.
 LEGACY_SHA256 = "cb1192774bb1f358c9df93780c16c3ff2388e5440651bcc98429a0635bb75560"
-LEGACY_HEADER = "# User-wide Codex defaults"
 
 MARKER_BEGIN = "<!-- local-worker begin -->"
 MARKER_END = "<!-- local-worker end -->"
@@ -63,6 +62,24 @@ MARKER_END = "<!-- local-worker end -->"
 # competing routing policies must never be left behind.
 LEGACY_MARKER_BEGIN = "<!-- local-qwen begin -->"
 LEGACY_MARKER_END = "<!-- local-qwen end -->"
+USER_COMPLETION_RULE = """## Global completion rule: commit, push, clean up worktrees
+
+- When authorized work is finished, commit the reviewed task changes and push them to the task's branch before reporting completion. A request to do the work includes these completion steps; do not ask for permission again. Do not force-push or merge into a different branch without authorization.
+- Leave no temporary or linked worktrees behind for completed work. Preserve the primary checkout. Finish active work first; preserve task commits, needed uncommitted work, detached histories, logs and ignored build/test artifacts before removing linked worktrees. Make detached work recoverable on a ref or in a verified bundle; use native managed-worktree archival when applicable.
+- Keep recovery/evidence archives outside worktrees being removed. Verify the branch exists on the remote and that the repository has no remaining task worktrees after cleanup. Do not delete unrelated active work or silently discard local files.
+- If a push or safe cleanup is blocked, report the concrete remaining action and do not claim completion. This completion policy supersedes older skill defaults that retain every finished worktree or forbid the reviewed parent from committing/pushing accepted work. Workers still must not commit, push, merge or remove worktrees themselves.
+
+Completion is not a separate request and not an optional courtesy. On every task the reviewing
+parent reuses the current checkout for routine planner work instead of adding new planner or app
+worktrees, commits and pushes the reviewed task changes, then archives and removes completed
+temporary or linked worktrees, dirty drafts included once their archive verified, before the
+final response. Launcher-internal per-job worktree isolation stays required during execution: it
+is what scopes and audits a worker. Those temporary per-job worktrees are not exempt from
+completion either: once the parent has reviewed the patch, every launcher worktree is archived
+and removed as well, so a finished task leaves none behind. Verify the archive and recovery ref
+before removal, keep that evidence outside the tree being removed, and never treat an unverified
+or active tree as removable.""" + "\n"
+USER_COMPLETION_RULE_SHA256 = "ee423c25bfdaeb041b80a703ff434caf7ba210c01a5020794e79e34e33acc516"
 # Same reasoning for the environment: canonical names win, legacy names are fallbacks.
 BACKUP_DIRNAME = "setup-backups"
 CODEX_HOME_ENV = "CODEX_HOME"
@@ -212,41 +229,81 @@ def link_destination(root, relative):
 
 
 def managed_block(root):
-    """The only global text this plugin owns: a pointer at the policy plus the completion rule."""
-    policy = link_destination(root, POLICY_RELATIVE)
+    """Compatibility name for the opt-in global pointer block."""
+    return pointer_block(root)
+
+
+def pointer_block(root: Path) -> str:
+    """Build the optional, read-only pointer to the installed skill and doctor command."""
     skill = link_destination(root, SKILL_RELATIVE)
-    setup = link_destination(root, SETUP_RELATIVE)
+    doctor = link_destination(root, PREFLIGHT_COMMAND)
     lines = [
         MARKER_BEGIN,
-        "## Local Worker: selected planner, local worker implementation",
-        "",
-        "Planning stays on the model selected in the Codex window. Implementation, fixes, refactors",
-        "and test authoring run on the pinned local worker model through the plugin launcher. This",
-        "block is the only global text the plugin owns; the authoritative policy stays in the package.",
-        "",
-        "- Canonical policy: [global-policy.md](<%s>)" % policy,
-        "- Bundled launcher skill: [local-worker/SKILL.md](<%s>)" % skill,
-        "- Install root: <%s>" % str(root),
-        "- Read the canonical policy before implementing. If that file is missing, the plugin was",
-        "  moved or uninstalled: run `python3 %s --check` from the current install root and"
-        % shlex.quote(setup),
-        "  report the blocker instead of routing implementation to a cloud model.",
-        "",
-        "## Completion: integrate and clean up on every task",
-        "",
-        "Before the final response, reuse this checkout for routine planner work instead of adding",
-        "planner/app worktrees, commit and push the reviewed task changes to the task branch, and",
-        "archive then remove completed temporary or linked worktrees (dirty drafts included, once",
-        "their archive verified) without another request. Preserve the primary checkout and",
-        "unrelated active work; if a push or safe cleanup is unsafe, report the blocker instead of",
-        "claiming completion.",
+        "- Local Worker skill: <%s>" % skill,
+        "- Read-only diagnostics: `%s doctor`" % shlex.quote(doctor),
         MARKER_END,
     ]
     return "\n".join(lines) + "\n"
 
 
+def _has_rule(text: str) -> bool:
+    normalize = lambda value: " ".join(value.split())
+    return normalize(USER_COMPLETION_RULE) in normalize(text)
+
+
+def migrate(text: str, root: Path, pointer: bool) -> Tuple[str, str]:
+    """Migrate owned setup text while retaining the user's completion rule exactly once."""
+    text = str(text)
+    expected = pointer_block(root)
+    if legacy_matches(encode(text)):
+        result = USER_COMPLETION_RULE
+        if pointer:
+            result += "\n\n" + expected
+            return result, "migrated_legacy_pointer"
+        return result, "migrated_legacy"
+
+    begin, end = MARKER_BEGIN, MARKER_END
+    old_begin, old_end = LEGACY_MARKER_BEGIN, LEGACY_MARKER_END
+    lines = text.splitlines(keepends=True)
+    begins = [i for i, line in enumerate(lines) if line.rstrip("\r\n") in (begin, old_begin)]
+    ends = [i for i, line in enumerate(lines) if line.rstrip("\r\n") in (end, old_end)]
+    if begins or ends:
+        if len(begins) != 1 or len(ends) != 1 or begins[0] >= ends[0]:
+            raise SetupError(EXIT_BLOCK, "managed_block", "managed markers are malformed")
+        start = sum(len(line) for line in lines[:begins[0]])
+        stop = sum(len(line) for line in lines[:ends[0] + 1])
+        old_block = text[start:stop]
+        outside = text[:start] + text[stop:]
+        has_rule = _has_rule(outside)
+        if old_block == expected:
+            if pointer:
+                return text, "noop"
+            return outside, "removed_block"
+        rule = "" if has_rule else USER_COMPLETION_RULE
+        replacement = rule
+        if pointer:
+            if replacement and outside and not outside.endswith("\n\n"):
+                replacement += "\n\n"
+            replacement += expected
+        if not replacement:
+            return outside, "removed_block"
+        if text[:start] and not text[:start].endswith("\n\n"):
+            replacement = "\n" + replacement
+        if text[stop:] and not text[stop:].startswith("\n"):
+            replacement += "\n"
+        reason = "migrated_block" if (begin in old_block) else "migrated_legacy_pointer"
+        return text[:start] + replacement + text[stop:], reason
+
+    if pointer:
+        if expected in text:
+            return text, "noop"
+        separator = "" if not text else ("\n" if text.endswith("\n") else "\n\n")
+        return text + separator + expected, "installed_pointer"
+    return text, "noop"
+
+
 def validate_package(root):
-    """Manifest identity, the onboarding skill, the canonical policy, the launcher and its engine."""
+    """Validate manifest identity, bundled skills, setup helper, launcher and engine."""
     manifest_file = manifest_path(root)
     if not manifest_file.is_file() or manifest_file.is_symlink():
         raise SetupError(EXIT_PACKAGE, "manifest", ".codex-plugin/plugin.json is not a regular file")
@@ -267,7 +324,6 @@ def validate_package(root):
     onboarding_path = root / "skills" / "setup" / "SKILL.md"
 
     files = {"manifest": manifest_file,
-             "canonical_policy": Path(link_destination(root, POLICY_RELATIVE)),
              "launcher_skill": Path(link_destination(root, SKILL_RELATIVE)),
              "setup_script": Path(link_destination(root, SETUP_RELATIVE)),
              "launcher": Path(link_destination(root, PREFLIGHT_COMMAND)),
@@ -278,12 +334,6 @@ def validate_package(root):
         if not path.is_file() or path.is_symlink():
             raise SetupError(EXIT_PACKAGE, "package",
                              "%s is not a regular file: %s" % (name, path))
-    policy_raw = read_bytes(files["canonical_policy"])
-    if not policy_raw.strip():
-        raise SetupError(EXIT_PACKAGE, "policy",
-                         "canonical policy is empty: " + str(files["canonical_policy"]))
-    if PLUGIN_NAME.encode("utf-8") not in policy_raw:
-        raise SetupError(EXIT_PACKAGE, "policy", "canonical policy does not name " + PLUGIN_NAME)
     return {"manifest": manifest, "onboarding_skill": str(onboarding_path),
             "files": {name: str(path) for name, path in files.items()}}
 
@@ -344,8 +394,10 @@ def analyze_block(text, expected):
     # Both the canonical and the pre-rename skill path are recognized, so an old pointer still
     # reports which install root it points at instead of claiming there is no root to migrate.
     match = re.search(r"\]\(<([^<>]*)/skills/(?:local-worker|local-implement)/references/"
-                      r"global-policy\.md>\)", block)
-    result.update({"block_count": 1, "install_root": match.group(1) if match else None,
+                      r"global-policy\.md>\)|Local Worker skill: <([^<>]*)/skills/"
+                      r"local-worker/SKILL\.md>", block)
+    install_root = (match.group(1) or match.group(2)) if match else None
+    result.update({"block_count": 1, "install_root": install_root,
                    "block": block})
     if legacy:
         result.update({"state": "legacy_pointer",
@@ -592,39 +644,20 @@ def run_preflight(root, timeout):
 # ----------------------------------------------------------------------------- apply
 
 
-def apply_block(root, analysis, agents_path, home, state):
+def apply_block(root, analysis, agents_path, home, state, pointer=False):
     """Install or refresh the managed block; back up first, write atomically, report a receipt."""
     if analysis["state"] == "malformed":
         raise SetupError(EXIT_BLOCK, "managed_block", analysis["reason"])
     if agents_path.is_symlink():
         raise SetupError(EXIT_APPLY, "agents_file",
                          "refusing to follow a symlinked AGENTS.md: " + str(agents_path))
-    expected = managed_block(root)
     current_raw = None
     text = ""
     if agents_path.is_file():
         current_raw = read_bytes(agents_path)
         text = decode(current_raw)
 
-    if analysis["state"] == "current":
-        new_text, reason = text, "noop"
-    elif analysis["block_count"] == 0:
-        if legacy_matches(current_raw):
-            heading = text.split("\n", 1)[0].rstrip() if text.startswith("#") else LEGACY_HEADER
-            new_text, reason = heading + "\n\n" + expected, "migrated_legacy"
-        else:
-            separator = ""
-            if text:
-                separator = "\n" if text.endswith("\n") else "\n\n"
-            new_text, reason = text + separator + expected, "installed"
-    elif analysis["state"] == "legacy_pointer":
-        # The pre-rename block is replaced in place: its own bytes go away, exactly one current
-        # block remains, and every byte outside the old markers is preserved untouched.
-        start, end = analysis["span"]
-        new_text, reason = text[:start] + expected + text[end:], "migrated_legacy_pointer"
-    else:
-        start, end = analysis["span"]
-        new_text, reason = text[:start] + expected + text[end:], "updated"
+    new_text, reason = migrate(text, root, pointer)
 
     new_raw = encode(new_text)
     receipt = {"requested": True, "destination": str(agents_path), "backup": None,
@@ -696,7 +729,9 @@ def build_parser():
     mode.add_argument("--check", action="store_true",
                       help="read-only report (the default; writes nothing)")
     mode.add_argument("--apply", action="store_true",
-                      help="authorized install of the small managed block in $CODEX_HOME/AGENTS.md")
+                      help="authorized migration or optional pointer install in $CODEX_HOME/AGENTS.md")
+    parser.add_argument("--pointer", action="store_true",
+                        help="also install the optional skill and read-only doctor pointer")
     parser.add_argument("--preflight", action="store_true",
                         help="also run the packaged launcher's model-endpoint preflight")
     parser.add_argument("--preflight-timeout", type=float, default=DEFAULT_PREFLIGHT_TIMEOUT,
@@ -726,7 +761,8 @@ def run(args):
     agents = home / "AGENTS.md"
     override = inspect_override(home)
     report["agents_override"] = override
-    expected = managed_block(root)
+    expected = pointer_block(root)
+    text = "" if agents.is_symlink() or not agents.is_file() else decode(read_bytes(agents))
     analysis = {"state": "absent", "block_count": 0, "install_root": None, "stray_markers": 0,
                 "begin_lines": 0, "end_lines": 0, "reason": "AGENTS.md does not exist",
                 "block": None}
@@ -735,7 +771,7 @@ def run(args):
                     "reason": "AGENTS.md is a symlink; refusing to read or follow it",
                     "begin_lines": 0, "end_lines": 0, "stray_markers": 0, "block": None}
     elif agents.is_file():
-        analysis = analyze_block(decode(read_bytes(agents)), expected)
+        analysis = analyze_block(text, expected)
         if legacy_matches(read_bytes(agents)) and analysis["state"] == "absent":
             analysis["legacy_exact"] = True
     analysis["agents_file"] = str(agents)
@@ -743,6 +779,12 @@ def run(args):
     analysis["managed_root_matches_this_root"] = analysis.get("install_root") == str(root)
     report["managed_block"] = {key: value for key, value in analysis.items()
                                if key not in ("block", "span")}
+    if analysis["state"] == "malformed":
+        report["migration"] = {"would_change": False, "reason": analysis["reason"]}
+    else:
+        migrated, migration_reason = migrate(text, root, args.pointer)
+        report["migration"] = {"would_change": migrated != text,
+                               "reason": migration_reason}
 
     report["environment"] = environment_report()
     report["preflight"] = {"requested": False, "status": "not-requested", "endpoint_passed": False,
@@ -760,11 +802,9 @@ def run(args):
             raise SetupError(EXIT_OVERRIDE, "agents_override",
                              override["reason"] + "; --apply refuses before any backup or write to "
                                                   + str(agents))
-        receipt = apply_block(root, analysis, agents, home, state)
+        receipt = apply_block(root, analysis, agents, home, state, pointer=args.pointer)
         report["writes_performed"] = bool(receipt["changed"])
         receipt["installed"] = {
-            "canonical_policy": {"path": package["files"]["canonical_policy"],
-                                 "sha256": sha256_file(Path(package["files"]["canonical_policy"]))},
             "launcher_skill": {"path": package["files"]["launcher_skill"],
                                "sha256": sha256_file(Path(package["files"]["launcher_skill"]))},
             "setup_script": {"path": package["files"]["setup_script"],
@@ -777,10 +817,12 @@ def run(args):
         report["apply"] = receipt
         if receipt["changed"] and analysis["state"] != "malformed":
             after = analyze_block(decode(read_bytes(agents)), expected)
-            report["apply"]["verified_state"] = after["state"]
-            if after["state"] != "current":
+            verified = after["state"] if args.pointer else (
+                "absent" if after["state"] == "absent" else after["state"])
+            report["apply"]["verified_state"] = verified
+            if verified != ("current" if args.pointer else "absent"):
                 raise SetupError(EXIT_APPLY, "verify",
-                                 "managed block did not become current after apply")
+                                 "managed block state after apply is %s" % verified)
 
     if args.preflight:
         timeout = max(1.0, float(args.preflight_timeout))
