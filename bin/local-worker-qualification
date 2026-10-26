@@ -1,0 +1,11 @@
+#!/bin/sh
+# Deterministic qualification controller: dry-run/live campaign plus offline report and audit.
+# Stdlib Python only. Live inference is explicit opt-in (--live); report/audit never call
+# a model, a subprocess, model discovery or credentials.
+set -eu
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+if [ ! -f "$here/../src/qualification.py" ]; then
+  echo "local-worker-qualification: cannot find $here/../src/qualification.py" >&2
+  exit 1
+fi
+exec "${PYTHON:-python3}" "$here/../src/qualification.py" "$@"

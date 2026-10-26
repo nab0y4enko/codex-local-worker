@@ -1,0 +1,54 @@
+import os,sys,json,hashlib,shutil,subprocess,datetime
+from pathlib import Path
+R=Path(__file__).parent;SRC=Path(os.environ['LOCAL_WORKER_QUALIFICATION_SOURCE']).resolve();sys.path.insert(0,str(SRC/'src'));import benchmark
+F=json.loads((R/'frozen.json').read_text());BIN=str(SRC/'bin/local-worker');RAW=R/'raw-rollouts';RAW.mkdir(exist_ok=True)
+def save(p,d):p.write_text(json.dumps(d,indent=2,ensure_ascii=False)+'\n')
+def load(p):return json.loads(p.read_text())
+def env(home):
+ e=dict(os.environ,CODEX_HOME=str(home),PYTHONDONTWRITEBYTECODE='1')
+ for k in ['CODEX_THREAD_ID','CODEX_SESSION_ID']:e.pop(k,None)
+ return e
+usage={};native_summaries={};phases={};rows=[];manifest={'version':1,'benchmark_id':R.name,'tasks':[]};fields=['input_tokens','cached_input_tokens','output_tokens']
+for task in ['slug','stats']:
+ T=R/task;usage[task]={};native_summaries[task]={}
+ for home in (T/'private-homes').iterdir():
+  for raw in home.glob('sessions/**/*.jsonl'):
+   records=[json.loads(l) for l in raw.read_text().splitlines()];tokens=[x for x in records if x.get('payload',{}).get('type')=='token_count' and x['payload'].get('info')];assert tokens
+   last=tokens[-1];counts=last['payload']['info']['total_token_usage'];sid=records[0]['payload']['id'];final=any(x.get('payload',{}).get('type')=='task_complete' and x['timestamp']>=last['timestamp'] for x in records);assert final,(task,home.name,'not final')
+   # Resuming the same session preserves cumulative counters. Verify, don't sum them twice.
+   assert all(tokens[i]['payload']['info']['total_token_usage']['input_tokens']<=tokens[i+1]['payload']['info']['total_token_usage']['input_tokens'] for i in range(len(tokens)-1))
+   u={k:counts[k] for k in fields};u.update(total_tokens=counts['input_tokens']+counts['output_tokens'],session=sid,as_of=last['timestamp'],completeness='final',cloud_responses=len(tokens),raw_path=str(RAW/raw.name));usage[task][home.name]=u;shutil.copyfile(raw,RAW/raw.name)
+   if home.name=='luna-implementation':continue
+   d=T/home.name;state=T/'state' if home.name=='launcher' else d/'summary-state';p=subprocess.run([BIN,'summary','--session',sid,'--state-dir',str(state)],cwd=SRC,env=env(home),capture_output=True,text=True);(d/'summary-command.log').write_text(p.stdout+p.stderr);assert p.returncode==0
+   path=state/'sessions'/sid/'summary.json';summary=load(path);shutil.copyfile(path,d/'native-final-summary.json');assert summary['planner']['completeness']=='final';assert all(summary['planner'][k]==u[k] for k in fields),(task,home.name,'native/raw usage mismatch');native_summaries[task][home.name]=summary
+   boundary=load(d/'review-boundary.json')['time'];before=[x['payload']['info']['total_token_usage'] for x in tokens if datetime.datetime.fromisoformat(x['timestamp'].replace('Z','+00:00')).timestamp()<boundary];initial=before[-1] if before else {};phases[task+'-'+home.name]={'planning_or_direct_implementation':{k:initial.get(k,0) for k in fields},'semantic_review':{k:u[k]-initial.get(k,0) for k in fields},'note':'Host checks, waiting, decide/integration/archive use no model tokens; their time is included.'}
+ task_contract=load(T/'launcher/task.json');package_path=Path(load(T/'launcher/outcome.json')['package']);package=load(package_path);spec={k:task_contract[k] for k in ['goal','base_ref','acceptance_criteria','test_commands']};spec.update(base_commit=F['base_commit'],acceptance_checks_sha256=benchmark._package_checks_sha256(package));entry={'task_id':task_contract['task_id'],'specification':spec,'specification_sha256':benchmark.acceptance_spec_sha256(spec),'arms':{}}
+ for arm in ['direct_cloud','launcher','direct_luna']:
+  d=T/arm;o=load(d/'outcome.json');summary=native_summaries[task][arm];own=usage[task][arm];counts={k:own[k] for k in fields};child=[]
+  if arm=='direct_luna':
+   luna=usage[task]['luna-implementation'];child=[luna['session']]
+   for k in counts:counts[k]+=luna[k]
+   summary=dict(summary);summary['planner']=dict(summary['planner'],**counts,total_tokens=counts['input_tokens']+counts['output_tokens'],source='explicit_final_unique_raw_rollout_sum',subagents={'count':1,'sessions':child});summary['aggregation_note']='Same Sol planner/reviewer resumed; add independently host-launched Luna implementation exactly once. Raw own counters and native summaries retained.';phases[task+'-'+arm]['luna_implementation']={k:luna[k] for k in fields}
+  save(d/'counted-summary.json',summary);decision=load(d/'decision.json');metrics={'attempts':1,'failed_attempts':0,'failed_jobs':0,'rejected_jobs':int(decision['action']=='reject'),'semantic_rejections':int(decision['action']=='reject'),'repairs':0,'repair_jobs':0,'automatic_local_retries':0,'review_calls':o['native_review_calls'],'elapsed_seconds':o['seconds']};row={'task':task,'arm':arm,'status':o['status'],'uncached_input':counts['input_tokens']-counts['cached_input_tokens'],'cached_input':counts['cached_input_tokens'],'output':counts['output_tokens'],'total_cloud_tokens':counts['input_tokens']+counts['output_tokens'],'seconds':o['seconds'],'cloud_planner_responses':own['cloud_responses'],'luna_implementation_responses':usage[task]['luna-implementation']['cloud_responses'] if arm=='direct_luna' else 0,'metrics':metrics,'local_tokens':None,'review_rationale':decision['rationale']}
+  arm_entry={'summary':str(d/'counted-summary.json'),'reports':[],'elapsed_seconds':o['seconds'],'review_calls':o['native_review_calls'],'repairs':0,'review_records':[]}
+  if arm=='launcher':
+   job=o['job_id'];report_path=T/'state/reports'/job/'report.json';report=load(report_path);metrics.update(attempts=len(report['attempts']),automatic_local_retries=max(0,len(report['attempts'])-1),failed_attempts=sum(1 for a in report['attempts'] if a.get('status') not in (None,'ok','passed')));row['local_tokens']=report['usage'];row['denials']=(report.get('permissions') or {}).get('denials',[]);row['classification']=report.get('classification');arm_entry['reports']=[str(report_path)]
+   if o['status']=='accepted':arm_entry.update(accepted_job_id=job,package=str(package_path),receipt=o['decision_receipt'])
+   else:
+    # The comparator cannot represent a failed local arm as accepted. Retain refusal honestly.
+    arm_entry.update(accepted_job_id=None,package=str(package_path),receipt=o['decision_receipt'],status=o['status']);arm_entry['review_records']=[{'job_id':job,'package':str(package_path),'receipt':o['decision_receipt']}]
+  else:
+   packet=load(d/'review-package.json');assert hashlib.sha256((d/'review-package.json').read_bytes()).hexdigest()==decision['package_sha256'];assert packet['audit']['scope_clean'] and packet['audit']['head']==F['base_commit'];assert all(t['returncode']==0 for t in packet['tests']);assert set(packet['sources'])==set(task_contract['allowed_paths'])
+   for rel,s in packet['sources'].items():assert hashlib.sha256((d/'repo'/rel).read_bytes()).hexdigest()==s['sha256']
+   acc=dict(decision,task_id=task_contract['task_id'],session=own['session'],specification_sha256=benchmark.acceptance_spec_sha256(spec),status=o['status'],metrics=metrics);save(d/'external-acceptance.json',acc);arm_entry['acceptance']=str(d/'external-acceptance.json')
+  entry['arms'][arm]=arm_entry;rows.append(row)
+ manifest['tasks'].append(entry)
+save(R/'session-usage.json',usage);save(R/'phase-usage.json',phases);save(R/'per-task-results.json',rows);save(R/'benchmark-manifest.json',manifest)
+checks=[]
+for name,m in [('all-tasks',manifest),('accepted-matched',dict(manifest,benchmark_id=R.name+'-accepted-matched',tasks=[x for x in manifest['tasks'] if all(next(r for r in rows if r['task']==('slug' if x['task_id']=='add-slugify' else 'stats') and r['arm']==a)['status']=='accepted' for a in ['direct_cloud','launcher','direct_luna'])]))]:
+ path=R/(name+'-manifest.json');save(path,m);out=R/(name+'-benchmark.json');p=subprocess.run([BIN,'benchmark','--manifest',str(path),'--output',str(out)],capture_output=True,text=True);(R/(name+'-benchmark.log')).write_text(p.stdout+p.stderr);checks.append({'comparison':name,'returncode':p.returncode,'result':str(out)})
+save(R/'comparator-results.json',checks)
+aggregate={}
+for arm in ['direct_cloud','launcher','direct_luna']:
+ rr=[r for r in rows if r['arm']==arm];accepted=sum(r['status']=='accepted' for r in rr);total=sum(r['total_cloud_tokens'] for r in rr);aggregate[arm]={'attempted_tasks':len(rr),'completed_tasks':accepted,'total_cloud_tokens_including_rejections':total,'tokens_per_attempted_task':total/len(rr),'tokens_per_completed_task_including_failed_cost':total/accepted if accepted else None,'total_seconds_including_rejections':sum(r['seconds'] for r in rr)}
+save(R/'aggregate.json',aggregate);print(json.dumps({'per_task':[{k:r[k] for k in ['task','arm','status','uncached_input','cached_input','output','total_cloud_tokens','seconds']} for r in rows],'aggregate':aggregate,'comparators':checks},indent=2))

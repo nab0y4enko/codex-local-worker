@@ -231,3 +231,15 @@ The refreshed summary rereads cumulative rollout counts and labels them final on
 latest matching task-completion markers and usage are present for the planner and linked
 children. Missing measurements remain unavailable. Do not call an in-turn summary final or
 silently replace retained evidence.
+
+## Qualification without cloud bookkeeping
+
+Reuse `bin/local-worker-qualification` instead of writing setup, waiting, accounting and report
+scripts in the cloud. `run --output-dir /absolute/fresh/evidence` is a no-write dry plan;
+`report --evidence-dir /absolute/saved/evidence` and `audit --snapshot /absolute/saved/snapshot.json`
+are offline. Only explicit `--live` executes inference; installed copies also require `--source`
+pointing to the addon Git checkout. Existing campaigns are never overwritten or silently rerun.
+
+See the [setup/reporting overhead audit](docs/qualification/setup-reporting-overhead.md) and
+[exact saved OpenCode profile](docs/qualification/opencode-profile-recovery.md). No new live
+benchmark was run for this change.

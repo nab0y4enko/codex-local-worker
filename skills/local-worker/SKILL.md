@@ -198,3 +198,36 @@ The refreshed summary rereads cumulative rollout counts and labels them final on
 latest matching task-completion markers and usage are present for the planner and linked
 children. Missing measurements remain unavailable. Do not call an in-turn summary final or
 silently replace retained evidence.
+
+## Reusable qualification runs
+
+Reuse the packaged controller for a benchmark qualification campaign instead of re-authoring
+setup, accounting and report code inside a cloud chat. Running it with only an absolute output
+directory is a pure dry run: it prints the frozen source, evidence path, budgets and stage
+commands, writes nothing, starts no subprocess and touches no model discovery or auth file.
+Only the explicit live opt-in stages the four frozen campaign scripts from
+`<root>/src/qualification_templates/` into a fresh evidence directory and runs them in order
+with `LOCAL_WORKER_QUALIFICATION_SOURCE` in the child environment. An existing or
+checkout-contained directory is refused, so a completed campaign cannot be silently overwritten
+and a failed budget cannot be reset; a nonzero stage exit code stops the campaign and remains
+durable evidence.
+
+Report and audit are offline renderers over existing evidence: one controller call and one final
+report read, with no cloud-written setup/account/report code, no model polling and no per-stage
+bookkeeping sessions. Every attempted task is listed, rejections and failures included, and
+their tokens stay charged to the arm while the denominator counts only completed tasks. Missing
+usage stays unavailable instead of zero, and outer parent overhead is reconciled from an
+existing snapshot or reported unavailable. The parent owns the detailed documentation and the
+full host verification.
+
+Command recipes (offline by default):
+
+```sh
+<root>/bin/local-worker-qualification run --output-dir /absolute/fresh/evidence
+<root>/bin/local-worker-qualification report --evidence-dir /absolute/saved/evidence
+<root>/bin/local-worker-qualification audit --snapshot /absolute/saved/parent-overhead-snapshot.json
+```
+
+Only add `--live` for a user-authorized live campaign; from an installed cache also supply
+`--source /absolute/addon-git-checkout`. See
+[the overhead audit and controller guide](../../docs/qualification/setup-reporting-overhead.md).

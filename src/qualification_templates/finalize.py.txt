@@ -1,0 +1,56 @@
+import os,json,hashlib,subprocess,platform,datetime,tarfile
+from pathlib import Path
+R=Path(__file__).parent;SRC=Path(os.environ['LOCAL_WORKER_QUALIFICATION_SOURCE']).resolve()
+def load(p):return json.loads(p.read_text())
+def save(p,d):p.write_text(json.dumps(d,indent=2,ensure_ascii=False)+'\n')
+def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+F=load(R/'frozen.json');rows=load(R/'per-task-results.json');agg=load(R/'aggregate.json');usage=load(R/'session-usage.json');phases=load(R/'phase-usage.json')
+assert sha(R/'trusted/check_acceptance.py')==F['check_sha256'];assert all(sha(R/t/'checks.json')==h for t,h in F['manifest_hashes'].items())
+assert subprocess.check_output(['git','rev-parse','HEAD'],cwd=SRC,text=True).strip()==F['source_commit'];assert not subprocess.check_output(['git','status','--porcelain'],cwd=SRC,text=True)
+recovery=[]
+for task in ['slug','stats']:
+ o=load(R/task/'launcher/outcome.json');receipt=load(Path(o['decision_receipt']));a=receipt['archive'];b=Path(a['bundle']);assert sha(b)==a['bundle_sha256'];p=subprocess.run(['git','bundle','verify',str(b)],cwd=R/task/'launcher/repo',capture_output=True,text=True);assert p.returncode==0;ref=subprocess.check_output(['git','rev-parse',a['recovery_ref']],cwd=R/task/'launcher/repo',text=True).strip();assert ref==a['recovery_commit'];assert not Path(a['source_worktree']).exists();recovery.append({'task':task,'status':receipt['status'],'bundle':str(b),'bundle_verified':True,'recovery_ref':a['recovery_ref'],'recovery_commit':ref,'worktree_removed':True})
+ for arm in ['direct_cloud','launcher','direct_luna']:
+  wt=subprocess.check_output(['git','worktree','list','--porcelain'],cwd=R/task/arm/'repo',text=True);assert wt.count('worktree ')==1
+assert subprocess.check_output(['git','worktree','list','--porcelain'],cwd=SRC,text=True).count('worktree ')==1
+save(R/'integrity.json',{'production_unchanged':True,'source_commit':F['source_commit'],'trusted_inputs_unchanged':True,'no_linked_candidate_or_production_worktrees':True,'archives':recovery})
+# Record every non-zero model tool command separately; token counts already include them.
+errors=[]
+for task in ['slug','stats']:
+ for arm in ['direct_cloud','launcher','direct_luna']:
+  d=R/task/arm
+  files=list(d.glob('implementation.stdout'))+list(d.glob('luna-implementation.stdout'))
+  if arm=='launcher':files+=list((R/task/'state/reports').glob('*/worker-attempt-*.jsonl'))
+  for p in files:
+   for line in p.read_text(errors='replace').splitlines():
+    try:e=json.loads(line)
+    except:continue
+    i=e.get('item',{})
+    if e.get('type')=='item.completed' and i.get('type')=='command_execution' and i.get('exit_code') not in (None,0):errors.append({'task':task,'arm':arm,'source':str(p),'command':i.get('command'),'exit_code':i.get('exit_code'),'output_tail':i.get('aggregated_output','')[-2000:]})
+save(R/'failed-tool-commands.json',errors)
+# Parent usage is separate and explicitly a snapshot; retain token records, not private reasoning.
+parent={}
+# Portable staged runs cannot identify the calling parent chat thread, so outer-overhead
+# auto-collection is reported unavailable (explicitly NOT zero). The offline
+# `local-worker-qualification audit --snapshot ABS_JSON` reconciles an existing
+# parent-overhead-snapshot.json with its sibling parent-counter-records.json.
+save(R/'parent-overhead-snapshot.json',parent)
+matched={}
+for task in ['slug','stats']:
+ rr={r['arm']:r for r in rows if r['task']==task}
+ if all(r['status']=='accepted' for r in rr.values()):
+  matched[task]={}
+  for b in ['direct_cloud','direct_luna']:matched[task][b]={k:100*(rr[b][k]-rr['launcher'][k])/rr[b][k] for k in ['uncached_input','cached_input','output','total_cloud_tokens','seconds']}
+save(R/'accepted-matched-savings.json',matched)
+try:
+ hw=subprocess.check_output(['system_profiler','SPHardwareDataType'],text=True);hw='\n'.join(l.strip() for l in hw.splitlines() if any(k in l for k in ['Model Name:','Model Identifier:','Chip:','Memory:','Total Number of Cores:']))
+except:hw=platform.platform()
+(R/'hardware.txt').write_text(hw+'\n'+platform.platform()+'\nPython '+platform.python_version()+'\n')
+# report.md is NOT written here: `local-worker-qualification run --live` renders it offline with
+# build_report() from the evidence this campaign just produced, so this stage keeps only the
+# frozen integrity, archive, failed-command and usage artifacts and cannot carry any narrative
+# figure, success count or savings claim forward from an earlier study.
+measured=sum(a['total_cloud_tokens_including_rejections'] for a in agg.values())
+if parent:print('parent overhead snapshot retained; report rendered offline by the controller')
+else:print('parent overhead unavailable; not treated as zero; report rendered offline by the controller')
+print(json.dumps({'accepted_matched_savings':matched,'task_arm_cloud_total':measured,'parent_snapshot':parent.get('counts'),'failed_tool_commands':len(errors),'integrity':'passed'},indent=2))
