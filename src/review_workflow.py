@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,10 @@ class WorkflowError(ValueError):
 MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_PATCH_BYTES = 512 * 1024
 MAX_SOURCE_BYTES = 128 * 1024
+# Inline handoff budgets: a normal small job is fully readable in one response, and anything
+# beyond these bounds is an explicit follow-up instead of a silently partial review.
+MAX_INLINE_FILE_BYTES = 64 * 1024
+MAX_INLINE_TOTAL_BYTES = 256 * 1024
 REVIEW_SECTIONS = {'diff', 'sources', 'tests', 'findings', 'audit', 'screenshots'}
 REVIEW_VIEW_NAME = 'review.md'
 
@@ -231,6 +236,143 @@ def render_review(package):
 
 def write_review_view(package):
     atomic_bytes(package['review_path'], render_review(package).encode('utf-8'))
+
+
+def _decision_command(package, state):
+    """Exact next command: the reviewer still supplies the action and the rationale themselves."""
+    decision_path = Path(package['package_path']).parent / 'decision.json'
+    template = {'action': 'replace-with-accept-or-reject',
+                'package_sha256': package.get('package_sha256'),
+                'reviewer': 'cloud-planner', 'semantic_review': True,
+                'reviewed_sections': sorted(REVIEW_SECTIONS),
+                'rationale': 'replace-with-what-you-actually-checked-and-why'}
+    command = ('%s %s decide --job-id %s --decision %s --state-dir %s'
+               % (shlex.quote(sys.executable), shlex.quote(str(Path(__file__).resolve())),
+                  shlex.quote(str(package.get('job_id'))), shlex.quote(str(decision_path)),
+                  shlex.quote(str(state))))
+    return _block('\n'.join(['cat > %s <<\'JSON\'' % shlex.quote(str(decision_path)),
+                             json.dumps(template, indent=2, sort_keys=True),
+                             'JSON', command]), 'shell')
+
+
+def _inline_bound_bytes(package, path):
+    """Exact bytes of one file already pinned in the canonical package, or a hard stop.
+
+    Only a path the package itself bound by SHA-256 may appear inline, and it is rehashed before
+    being printed, so the inline copy can never disagree with what `decide` re-verifies. A missing,
+    symlinked, unbound, changed or oversized file stops the handoff by name: an incomplete inline
+    review must never look complete.
+    """
+    label = str(path)
+    try:
+        resolved = regular(path)
+    except (OSError, ValueError) as error:
+        raise WorkflowError('inline review evidence is unreadable: %s (%s); read this exact file '
+                            'before any decision' % (label, error))
+    expected = (package.get('bindings') or {}).get(str(resolved))
+    if expected is None:
+        raise WorkflowError('inline review evidence is not bound in the canonical package: %s '
+                            '(recorded as %s); read this exact file before any decision'
+                            % (resolved, label))
+    actual = lifecycle.hash_file(resolved)
+    if actual != expected:
+        raise WorkflowError('bound review evidence changed after packaging: %s (bound %s, read %s); '
+                            'resolve this exact file before any decision' % (label, expected, actual))
+    with resolved.open('rb') as handle:
+        data = handle.read(MAX_INLINE_FILE_BYTES + 1)
+    if len(data) > MAX_INLINE_FILE_BYTES:
+        raise WorkflowError('inline review evidence exceeds the %d byte per-file inline limit: %s; '
+                            'read this exact file before any decision'
+                            % (MAX_INLINE_FILE_BYTES, label))
+    return str(resolved), expected, data
+
+
+def _inline_evidence(package):
+    """Trusted acceptance inputs and verification logs, inline, only while every one is intact."""
+    task = package.get('contract') if isinstance(package.get('contract'), dict) else {}
+    paths = []
+    manifest_path = task.get('acceptance_checks')
+    if isinstance(manifest_path, str) and manifest_path:
+        repo = package.get('repo_path')
+        if not isinstance(repo, str) or not repo:
+            raise WorkflowError('canonical package does not record the repository path needed to '
+                                'read the trusted acceptance manifest inline: %s' % manifest_path)
+        try:
+            manifest = acceptance_checks.load_manifest(Path(manifest_path), repo=Path(repo))
+        except (OSError, ValueError) as error:
+            raise WorkflowError('trusted acceptance manifest could not be read for inline review: '
+                                '%s (%s); read it and the scripts it declares before any decision'
+                                % (manifest_path, error))
+        paths.extend(str(candidate) for candidate in [manifest.path] + list(manifest.protected_paths))
+    for test in (package.get('checks') or {}).get('tests') or []:
+        if isinstance(test, dict) and isinstance(test.get('log_path'), str) and test['log_path']:
+            paths.append(test['log_path'])
+    collected, total = [], 0
+    for candidate in dict.fromkeys(paths):
+        resolved, sha256, data = _inline_bound_bytes(package, candidate)
+        total += len(data)
+        if total > MAX_INLINE_TOTAL_BYTES:
+            raise WorkflowError('inline review evidence exceeds the %d byte total inline limit at '
+                                '%s; read the remaining bound files before any decision'
+                                % (MAX_INLINE_TOTAL_BYTES, resolved))
+        collected.append((resolved, sha256, data))
+    if not collected:
+        return ['- No trusted acceptance inputs and no bound verification logs exist for this job; '
+                'the binding summary above names every retained file and its full SHA-256.', '']
+    out = ['### Bound trusted inputs and verification logs (exact bytes)', '',
+           'Every file below is already pinned by full SHA-256 in the canonical package above and '
+           'was rehashed from disk before being printed, so these are exactly the bytes the '
+           'verifier used and what `decide` re-verifies. No separate read is needed for them.', '']
+    for resolved, sha256, data in collected:
+        out += ['#### `%s`' % resolved, '', '- SHA-256: `%s`' % sha256,
+                '- Bytes shown: %d (complete).' % len(data), '',
+                _block(data.decode('utf-8', 'replace'), 'text'), '']
+    return out
+
+
+def render_handoff(result, state):
+    """One tool response that is sufficient for semantic review: status plus the whole review.
+
+    The inline text is re-rendered from the canonical package after its digest and every bound
+    evidence file are re-verified, and it is byte-identical to the `review.md` view `decide`
+    re-checks, so what the reviewer reads here is exactly what a decision is bound to. Inline
+    evidence is never semantic approval: the decision still has to be posted explicitly.
+    """
+    jobs = result.get('jobs') or []
+    complete = sum(1 for job in jobs if job.get('complete'))
+    out = ['# Cloud review handoff', '',
+           '- Orchestration status: `%s`' % result.get('status'),
+           '- Jobs finished: %d (%d complete for acceptance)' % (len(jobs), complete),
+           '- Tasks not started: %d' % len(result.get('pending_tasks') or []),
+           '- Queue receipt: `%s`' % result.get('receipt_path'), '',
+           result.get('handoff') or _handoff(jobs), '']
+    for item in jobs:
+        out += ['---', '', '## Job `%s`' % item.get('job_id'), '']
+        if not item.get('package_path'):
+            out += ['- No review package: status `%s` (%s)'
+                    % (item.get('status'), item.get('reason') or 'see the queue receipt'),
+                    '- Follow-up: read the launcher receipt and the retained job report before any '
+                      'decision; nothing here is semantic approval.', '']
+            continue
+        package = read_json(item['package_path'])
+        _validate_package(package)
+        out += ['- Complete for acceptance: `%s`' % ('yes' if package.get('complete') else 'no'),
+                '- Package: `%s`' % package.get('package_path'),
+                '- Package SHA-256: `%s`' % package.get('package_sha256'),
+                '- Readable view: `%s`' % package.get('review_path'), '']
+        if package.get('incomplete_reasons'):
+            out += ['The review below is NOT complete; every item listed under Incomplete evidence '
+                    'must be read at its own path before a decision, and `decide` will refuse to '
+                    'accept it.', '']
+        out += ['### Next decision command', '',
+                'Read the review below, then post one explicit decision of your own bound to the '
+                'exact digest above: replace the action and rationale placeholders (a submitted '
+                'placeholder is refused), and add `combined_commands` argv arrays if extra '
+                'integration checks are required. Nothing is approved automatically.', '',
+                _decision_command(package, state), '']
+        out += ['### Complete review (verbatim `review.md` bytes)', '', render_review(package), '']
+        out += _inline_evidence(package)
+    return '\n'.join(out)
 
 
 def _overlaps(left, right):
@@ -707,6 +849,11 @@ def main(argv=None):
     entry.add_argument('--manifest', type=Path, help='legacy queue manifest of 1..32 task files')
     queue.add_argument('--settings')
     queue.add_argument('--codex-bin')
+    queue.add_argument('--review', action='store_true',
+                       help='print the complete validated review inline (status, verbatim '
+                            'review.md bytes, bound trusted inputs and verification logs, and the '
+                            'next decision command) instead of the compact JSON receipt summary; '
+                            'it approves nothing by itself')
     package = sub.add_parser('review-package')
     package.add_argument('--job-id', required=True)
     decision = sub.add_parser('decide')
@@ -730,6 +877,11 @@ def main(argv=None):
             value = decide(state, args.job_id, read_json(args.decision))
         displayed = value
         if args.command == 'orchestrate':
+            if args.review:
+                # Opt-in inline review. The reviewer still posts one explicit digest-bound
+                # decision; nothing here accepts, integrates or archives anything.
+                print(render_handoff(value, state))
+                return 0 if value.get('status') != 'blocked' else 1
             displayed = {key: value[key] for key in
                          ('status', 'jobs', 'pending_tasks', 'receipt_path', 'handoff')}
         elif args.command == 'decide':
@@ -740,6 +892,22 @@ def main(argv=None):
                 {key: test.get(key) for key in ('command', 'name', 'status', 'reason', 'log_path')}
                 for test in value.get('integration_tests', [])]
             displayed['archive_verified'] = bool(value.get('archive'))
+            tests = [test for test in (value.get('integration_tests') or []) if isinstance(test, dict)]
+            displayed['checks_total'] = len(tests)
+            displayed['checks_passed'] = sum(1 for test in tests if test.get('status') == 'passed')
+            displayed['checks_failed'] = displayed['checks_total'] - displayed['checks_passed']
+            # `archive` is recorded only after lifecycle.archive() was actually verified, so a
+            # verified terminal outcome is the only case that needs no further read at all.
+            if value.get('status') in ('accepted', 'rejected') and displayed['archive_verified']:
+                displayed['next_action'] = 'done'
+            else:
+                failed_logs = sorted({test['log_path'] for test in tests
+                                      if test.get('status') != 'passed' and test.get('log_path')})
+                displayed['next_action'] = (
+                    'follow-up required: status `%s`, %d/%d checks passed; read %s and the failing '
+                    'verification logs %s before the next explicit step'
+                    % (value.get('status'), displayed['checks_passed'], displayed['checks_total'],
+                       displayed['receipt_path'], failed_logs or '(none recorded)'))
         print(json.dumps(displayed, indent=2))
         return 0 if value.get('status') not in ('blocked', 'integration_failed', 'accepted_archive_pending', 'rejected_archive_pending') else 1
     except (WorkflowError, OSError, ValueError, lifecycle.LifecycleError, lw.LauncherError) as error:

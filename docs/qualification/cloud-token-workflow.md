@@ -11,7 +11,7 @@ cloud window. Put related stages into that one contract instead of buying extra 
 turns:
 
 ```sh
-<root>/bin/local-worker orchestrate --task-file /absolute/path/task.json --state-dir /absolute/path/state
+<root>/bin/local-worker orchestrate --review --task-file /absolute/path/task.json --state-dir /absolute/path/state
 ```
 
 A declared queue stays supported for independent tasks, with the same guarantees:
@@ -21,18 +21,27 @@ A declared queue stays supported for independent tasks, with the same guarantees
 ```
 
 ```sh
-<root>/bin/local-worker orchestrate --manifest /absolute/path/queue.json --state-dir /absolute/path/state
+<root>/bin/local-worker orchestrate --review --manifest /absolute/path/queue.json --state-dir /absolute/path/state
 ```
 
 Both entries validate and snapshot the contracts, use one inference slot, and record a durable
 receipt containing completed jobs and pending tasks. Each job retains its original attempt and
 time budget. A failed, incomplete, or timed-out job stops the queue without silently resetting a
-workstream, escalating to cloud, or deleting evidence. The command returns only review-package
-paths and digests plus status; no model polling is needed. Provider options `--settings` and
-`--codex-bin` are forwarded to the normal launcher.
+workstream, escalating to cloud, or deleting evidence. With `--review`, the command returns
+status, the exact decision command and complete review evidence inline; no separate model turn
+is needed to open the package. Omit the flag for the legacy machine-readable JSON response. No model polling is needed. Provider options `--settings` and
+`--codex-bin` are forwarded to the normal launcher. Discovery and model pinning still run
+inside that launcher; use `doctor`, `preflight` and `models` for diagnosis rather than as extra
+mandatory preparation calls for an already-scoped job. Use the supplied contract path instead of
+rediscovering it with another planner search.
 
-Each job returns a canonical `package.json` and a complete readable `review.md`. Read the view
-once: it reproduces the frozen contract, full diff, changed sources, actual checks, findings,
+Each job retains a canonical `package.json` and readable `review.md`. The `--review` handoff
+includes that validated view plus bound trusted inputs and verification logs. Review the inline
+evidence once; there is no routine need to reopen the canonical package or the same logs. Missing,
+unbound, oversized or changed inline inputs require follow-up and cannot be treated as a complete
+review. If the client truncates a tool response, read the missing evidence before deciding.
+
+The retained view reproduces the frozen contract, full diff, changed sources, actual checks, findings,
 audit and screenshots verbatim, keeping blank lines, literal escapes and code fences exactly. The
 view is not hashed into the package; it is verified byte-for-byte against a fresh rendering of the
 digest-bound canonical package before any decision, and read at most one byte past the expected
@@ -91,8 +100,9 @@ dictionary-key advisory catches overwritten expected values cheaply without exec
 ## Explicit cloud decision
 
 After inspecting the diff, source, tests, findings, audit and screenshots (where applicable), the
-cloud planner writes a decision JSON. `reviewer` and `semantic_review` are explicit caller
-attestations; this CLI does not authenticate a model identity or perform the review itself.
+cloud planner writes a decision JSON. Write that decision and invoke `decide` in one shell call,
+using the exact command returned in the handoff; no extra reviewer or preparation turn is needed.
+`reviewer` and `semantic_review` are explicit caller attestations; this CLI does not authenticate a model identity or perform the review itself.
 The reviewer is the same cloud planner session that planned the assignment: there is no noop cloud
 preparation session, no mandatory second cloud reviewer, and no model polling between the two
 commands. All existing gates stay: checks, semantic sections, permission-wrapped integration,
@@ -128,7 +138,10 @@ reported, never bypassed. Without an enforceable wrapper, automatic acceptance f
 After checks pass, the existing archive code verifies its recovery ref, bundle, and receipt before
 removing the worker checkout. The command writes the session summary without inference. The
 summary may still be an active planner snapshot; refresh after planner exit to obtain final counts.
-No commit, push, or merge is performed.
+The concise result reports check counts and verified archive status. A terminal
+`next_action: done` is sufficient for closeout; do not reopen the full receipt or generate another
+summary merely to restate that success. Follow the named receipt/logs on failures.
+No commit, push, or merge is performed by `decide`; the parent follows the user's completion policy.
 
 On a failed integration check, applied changes and the worker checkout remain available, with an
 `integration_failed` receipt. No automatic reset or rollback is attempted. A crash leaves an

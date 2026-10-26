@@ -24,25 +24,39 @@ wrapper availability, available simulators, state directory, and plugin version.
 checks the installed Codex CLI and live local model endpoint. `models` shows discovered local
 models and their limits. Treat unavailable discovery as an environment problem; do not guess a
 model or endpoint.
+`doctor` and `models` are optional diagnostics only: the launcher discovers and pins the model on
+every job, so a normal `orchestrate --review` run needs neither call.
 
 ## Prefer deterministic coordination
 
 For scoped work, prefer one complete bounded assignment in the calling cloud window:
-`<root>/bin/local-worker orchestrate --task-file <absolute-task.json> --state-dir <state>`. Put
+`<root>/bin/local-worker orchestrate --task-file <absolute-task.json> --state-dir <state> --review`. Put
 related stages in that single contract instead of spending extra cloud turns on coordination.
 `--manifest <absolute-queue.json>` (legacy, `{"tasks": ["/absolute/task.json"]}`) stays supported
 for independent tasks. Both pin the contract, run sequentially through existing verification and
-bounded retries, and return package paths, digests and a readable `review.md`. Read that view once;
-do not repeatedly poll with model calls. There is no noop cloud preparation session and no
+bounded retries, and return package paths, digests and a readable `review.md`. There is no noop
+cloud preparation session and no
 mandatory second cloud reviewer: the planner that planned the assignment is the reviewer.
 
-Cloud semantic review remains mandatory: inspect the view's diff, sources, tests, findings, audit
-and screenshots. Then use `local-worker decide --job-id <id> --decision <absolute-decision.json>`
-with an explicit cloud decision bound to `package_sha256`. This command validates unchanged
-review inputs, integrates exact bytes, reruns original/independent/combined checks, verifies
-archive recovery, and summarizes. It never creates semantic approval itself. Incomplete evidence,
-stale review, missing protection or failed checks block acceptance. Preserve failure receipts;
-never clear them to bypass a failed gate. See
+Pass `--review` on the normal run: it prints the complete evidence for every job inline in one
+response — orchestration status, the whole validated `review.md` view verbatim, the exact bytes of
+the bound trusted acceptance manifest and scripts and of each bound verification log (each rehashed
+against its package binding), and the ready-to-edit decision command with its digest-bound template.
+Inline evidence is never approval: you still make one explicit digest-bound decision, and you can
+create `decision.json` and invoke `decide` in the same shell call. A successful closeout reports
+`next_action: "done"` only for an accepted or rejected job whose archive was actually verified, so a
+verified job needs no canonical-package, log, receipt or summary rereads. Anything else — a blocked
+job, `next_action` asking for follow-up, a `TRUNCATED` marker, or an inline-evidence refusal that
+names a file — is a real follow-up: read exactly that file and act on it. Without `--review` the
+command keeps returning the compact JSON receipt summary.
+
+Cloud semantic review remains mandatory: read the inline review's diff, sources, tests, findings,
+audit and screenshots, then post `local-worker decide --job-id <id> --decision
+<absolute-decision.json>` with an explicit cloud decision bound to `package_sha256`. This command
+validates unchanged review inputs, integrates exact bytes, reruns original/independent/combined
+checks, verifies archive recovery, and summarizes. It never creates semantic approval itself.
+Incomplete evidence, stale review, missing protection or failed checks block acceptance. Preserve
+failure receipts; never clear them to bypass a failed gate. See
 [the workflow guide](../../docs/qualification/cloud-token-workflow.md) for the exact decision schema.
 
 Supply independent acceptance checks for predictable edge cases before implementation using the

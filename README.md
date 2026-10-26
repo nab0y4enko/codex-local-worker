@@ -57,15 +57,18 @@ The normal path is one complete bounded local assignment reviewed in the same cl
 planned it:
 
 ```sh
-<root>/bin/local-worker orchestrate --task-file /absolute/path/task.json --state-dir /absolute/path/state
+<root>/bin/local-worker orchestrate --review --task-file /absolute/path/task.json --state-dir /absolute/path/state
 ```
 
 `orchestrate --manifest /absolute/path/queue.json` stays supported for a declared queue of
 1..32 tasks. The command pins the contract, runs sequential bounded local repairs with all
-existing checks, and returns the canonical `package.json` plus a complete readable `review.md`.
-The calling planner/reviewer reads that view once, then posts an explicit `decide` bound to the
-exact `package_sha256`. No noop cloud preparation session, no mandatory second cloud reviewer and
-no model polling; related stages belong in one local assignment rather than extra coordination
+existing checks, and retains the canonical `package.json` plus readable `review.md`.
+`--review` returns the validated review, bound trusted inputs and verification output inline;
+omit the flag for legacy machine-readable JSON. The calling planner reviews this evidence once,
+then writes its explicit digest-bound decision and invokes `decide` in one shell call. A verified
+terminal `next_action: done` closes the job without reopening the receipt or summary; follow
+missing, truncated or failed evidence before deciding. No noop cloud preparation session, no
+mandatory second cloud reviewer and no model polling; related stages belong in one local assignment rather than extra coordination
 turns. Every check, semantic gate, permission wrapper, budget and archive verification still runs,
 and cloud-tier, duplicate-identity or dirty-target contracts are refused before any inference.
 Optional planner-owned acceptance checks still run before review and again after integration.

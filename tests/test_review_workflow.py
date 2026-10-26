@@ -493,6 +493,168 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertEqual(result['status'], 'blocked')
         self.assertEqual(result['pending_tasks'], paths[1:])
 
+    def queue_result(self, package):
+        """The receipt shape `orchestrate` returns, for CLI-level checks of the same object."""
+        job = dict(task_file=str(self.root / 'task.json'), job_id=self.job, status='ok',
+                   package_path=package['package_path'],
+                   package_sha256=package['package_sha256'],
+                   review_path=package['review_path'], complete=package['complete'])
+        return dict(status='awaiting_cloud_review', jobs=[job], pending_tasks=[],
+                    receipt_path=str(self.state / 'queues' / 'receipt.json'),
+                    handoff=rw._handoff([job]))
+
+    def cli(self, argv):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = rw.main(argv)
+        return code, output.getvalue()
+
+    def review_cli(self, package, *extra):
+        with mock.patch.object(rw, 'orchestrate', return_value=self.queue_result(package)):
+            return self.cli(['orchestrate', '--task-file', str(self.root / 'task.json'),
+                             '--state-dir', str(self.state)] + list(extra))
+
+    def test_review_flag_prints_the_whole_review_and_bound_bytes_and_decides_nothing(self):
+        self.trusted_checks('assert 1 + 1 == 2\n')
+        log = self.directory / 'verify-attempt-1-tests.log'
+        log.write_text('1 passed in 0.01s\n', encoding='utf-8')
+        self.report['tests'][0]['log_path'] = str(log)
+        self.report['logs'] = [str(log)]
+        self.save()
+        package = self.package()
+        self.assertTrue(package['complete'], package['incomplete_reasons'])
+        code, text = self.review_cli(package, '--review')
+        self.assertEqual(code, 0, text)
+        self.assertIn('- Orchestration status: `awaiting_cloud_review`', text)
+        # The complete validated review is inline, byte-for-byte the canonical view.
+        self.assertIn(rw.render_review(package), text)
+        self.assertIn(package['package_sha256'], text)
+        # Trusted manifest and script bytes, plus the actual verification log bytes.
+        self.assertIn('"name": "independent"', text)
+        self.assertIn('assert 1 + 1 == 2', text)
+        self.assertIn('1 passed in 0.01s', text)
+        # The next decision command and template are handed over unexecuted.
+        self.assertIn('decide --job-id', text)
+        self.assertIn('replace-with-accept-or-reject', text)
+        self.assertIn('Nothing is approved automatically', text)
+        self.assertFalse((self.state / 'reviews' / self.job / 'decision-result.json').exists())
+        self.assertTrue(self.worktree.exists())
+        self.assertIn('a - b', (self.repo / 'add.py').read_text())
+
+    def test_orchestrate_without_review_flag_keeps_the_compatible_json_output(self):
+        package = self.package()
+        code, text = self.review_cli(package)
+        payload = json.loads(text)
+        self.assertEqual(code, 0, text)
+        self.assertEqual(sorted(payload), ['handoff', 'jobs', 'pending_tasks',
+                                           'receipt_path', 'status'])
+        self.assertEqual(payload['status'], 'awaiting_cloud_review')
+        self.assertEqual(payload['jobs'][0]['package_sha256'], package['package_sha256'])
+        self.assertEqual(payload['jobs'][0]['review_path'], package['review_path'])
+        self.assertNotIn('Complete review (verbatim', text)
+
+    def test_mutated_bound_trusted_input_refuses_the_inline_handoff(self):
+        script = self.trusted_checks('pass\n')
+        package = self.package()
+        script.write_text('raise SystemExit(1)\n', encoding='utf-8')
+        code, text = self.review_cli(package, '--review')
+        payload = json.loads(text)
+        self.assertEqual(code, 1, text)
+        self.assertEqual(payload['status'], 'blocked')
+        self.assertIn(str(script.resolve()), payload['reason'])
+        self.assertNotIn('Complete review (verbatim', text)
+        self.assertFalse((self.state / 'reviews' / self.job / 'decision-result.json').exists())
+
+    def test_unbound_verification_log_refuses_the_inline_handoff(self):
+        log = self.directory / 'unbound.log'
+        log.write_text('never retained as bound evidence\n', encoding='utf-8')
+        self.report['tests'][0]['log_path'] = str(log)
+        self.save()
+        package = self.package()
+        code, text = self.review_cli(package, '--review')
+        payload = json.loads(text)
+        self.assertEqual(code, 1, text)
+        self.assertEqual(payload['status'], 'blocked')
+        self.assertIn('not bound', payload['reason'])
+        self.assertIn(str(log.resolve()), payload['reason'])
+        self.assertNotIn('Complete review (verbatim', text)
+
+    def test_inline_handoff_embeds_the_untouched_canonical_review_bytes(self):
+        package = self.package()
+        canonical = Path(package['review_path']).read_text(encoding='utf-8')
+        self.assertEqual(canonical, rw.render_review(package))
+        self.assertIn('# Cloud review: %s' % self.job, canonical)
+        self.assertIn('The reviewer is the calling cloud planner session. Nothing in this view is semantic',
+                      canonical)
+        text = rw.render_handoff(self.queue_result(package), self.state)
+        self.assertIn(canonical, text)
+        self.assertIn('## Evidence bindings', text)
+        self.assertIn('+    return a + b', text)
+
+    def test_concise_closeout_is_done_only_after_a_verified_archive(self):
+        package = self.package()
+        decision_path = self.root / 'decision.json'
+        decision = self.decision(package)
+        decision['action'] = 'reject'
+        decision['rationale'] = 'Reviewed the full diff; the change is out of scope for this goal.'
+        decision_path.write_text(json.dumps(decision))
+        with mock.patch.dict('os.environ', sp.GIT_ID):
+            code, text = self.cli(['decide', '--job-id', self.job, '--decision', str(decision_path),
+                                   '--state-dir', str(self.state)])
+        payload = json.loads(text)
+        self.assertEqual(payload['status'], 'rejected', payload)
+        self.assertEqual(code, 0, text)
+        self.assertFalse(payload['applied'])
+        self.assertTrue(payload['archive_verified'], payload)
+        self.assertEqual(payload['next_action'], 'done')
+        self.assertEqual((payload['checks_total'], payload['checks_passed'],
+                          payload['checks_failed']), (0, 0, 0))
+        self.assertFalse(self.worktree.exists())
+        self.assertIn('a - b', (self.repo / 'add.py').read_text())
+
+    def test_concise_closeout_is_not_done_while_the_archive_is_unverified(self):
+        package = self.package()
+        decision = self.decision(package)
+        decision['action'] = 'reject'
+        decision['rationale'] = 'Reviewed the full diff; the archive step will be retried.'
+        decision_path = self.root / 'decision.json'
+        decision_path.write_text(json.dumps(decision))
+        with mock.patch.dict('os.environ', sp.GIT_ID), mock.patch.object(
+                rw.lifecycle, 'archive',
+                side_effect=rw.lifecycle.LifecycleError('archive pool busy')):
+            code, text = self.cli(['decide', '--job-id', self.job, '--decision', str(decision_path),
+                                   '--state-dir', str(self.state)])
+        payload = json.loads(text)
+        self.assertEqual(payload['status'], 'rejected_archive_pending', payload)
+        self.assertEqual(code, 1, text)
+        self.assertFalse(payload['archive_verified'])
+        self.assertNotEqual(payload['next_action'], 'done')
+        self.assertIn('follow-up required', payload['next_action'])
+        self.assertIn(payload['receipt_path'], payload['next_action'])
+
+    def test_concise_closeout_points_at_receipt_and_failing_logs_until_verified(self):
+        package = self.package()
+        decision = self.decision(package)
+        decision['combined_commands'] = [[sys.executable, '-c', 'raise SystemExit(1)']]
+        decision_path = self.root / 'decision.json'
+        decision_path.write_text(json.dumps(decision))
+        code, text = self.cli(['decide', '--job-id', self.job, '--decision', str(decision_path),
+                               '--state-dir', str(self.state)])
+        payload = json.loads(text)
+        self.assertEqual(payload['status'], 'integration_failed', payload)
+        self.assertEqual(code, 1, text)
+        self.assertFalse(payload['archive_verified'])
+        self.assertNotEqual(payload['next_action'], 'done')
+        self.assertEqual(payload['checks_total'], payload['checks_passed'] + payload['checks_failed'])
+        self.assertEqual(payload['checks_total'], len(payload['integration_checks']))
+        self.assertIn(payload['receipt_path'], payload['next_action'])
+        failing = [check for check in payload['integration_checks'] if check['status'] != 'passed']
+        for check in failing:
+            self.assertIn(check['log_path'], payload['next_action'])
+            self.assertTrue(Path(check['log_path']).is_file())
+        self.assertTrue(self.worktree.exists())
+        self.assertIn('a + b', (self.repo / 'add.py').read_text())
+
 
 if __name__ == '__main__':
     unittest.main()
