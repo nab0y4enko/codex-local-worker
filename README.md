@@ -53,10 +53,23 @@ See [the setup skill](skills/setup/SKILL.md) for override handling and the migra
 
 ## Cloud-efficient orchestration
 
-Use `local-worker orchestrate` to run a sequential queue through bounded local repairs and all
-existing checks, then inspect its launcher-built review package. `local-worker decide` resumes
-only after an explicit cloud semantic review bound to the exact evidence. Optional planner-owned
-acceptance checks run before review and again after integration. See the
+The normal path is one complete bounded local assignment reviewed in the same cloud window that
+planned it:
+
+```sh
+<root>/bin/local-worker orchestrate --task-file /absolute/path/task.json --state-dir /absolute/path/state
+```
+
+`orchestrate --manifest /absolute/path/queue.json` stays supported for a declared queue of
+1..32 tasks. The command pins the contract, runs sequential bounded local repairs with all
+existing checks, and returns the canonical `package.json` plus a complete readable `review.md`.
+The calling planner/reviewer reads that view once, then posts an explicit `decide` bound to the
+exact `package_sha256`. No noop cloud preparation session, no mandatory second cloud reviewer and
+no model polling; related stages belong in one local assignment rather than extra coordination
+turns. Every check, semantic gate, permission wrapper, budget and archive verification still runs,
+and cloud-tier, duplicate-identity or dirty-target contracts are refused before any inference.
+Optional planner-owned acceptance checks still run before review and again after integration.
+See the
 [workflow guide](docs/qualification/cloud-token-workflow.md) for contracts, protection requirements,
 review decisions, failure recovery and matched benchmark accounting. No measured token saving is
 claimed without a paired benchmark.

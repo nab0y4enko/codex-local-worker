@@ -27,13 +27,17 @@ model or endpoint.
 
 ## Prefer deterministic coordination
 
-For scoped work, prefer `<root>/bin/local-worker orchestrate --manifest <absolute-queue.json>`.
-The queue contains `{"tasks": ["/absolute/task.json"]}`. It pins tasks, runs sequentially through
-existing verification and bounded retries, and returns package paths and digests. Inspect the
-returned package and relevant full evidence once; do not repeatedly poll with model calls.
+For scoped work, prefer one complete bounded assignment in the calling cloud window:
+`<root>/bin/local-worker orchestrate --task-file <absolute-task.json> --state-dir <state>`. Put
+related stages in that single contract instead of spending extra cloud turns on coordination.
+`--manifest <absolute-queue.json>` (legacy, `{"tasks": ["/absolute/task.json"]}`) stays supported
+for independent tasks. Both pin the contract, run sequentially through existing verification and
+bounded retries, and return package paths, digests and a readable `review.md`. Read that view once;
+do not repeatedly poll with model calls. There is no noop cloud preparation session and no
+mandatory second cloud reviewer: the planner that planned the assignment is the reviewer.
 
-Cloud semantic review remains mandatory: inspect diff, sources, tests, findings, audit and
-screenshots. Then use `local-worker decide --job-id <id> --decision <absolute-decision.json>`
+Cloud semantic review remains mandatory: inspect the view's diff, sources, tests, findings, audit
+and screenshots. Then use `local-worker decide --job-id <id> --decision <absolute-decision.json>`
 with an explicit cloud decision bound to `package_sha256`. This command validates unchanged
 review inputs, integrates exact bytes, reruns original/independent/combined checks, verifies
 archive recovery, and summarizes. It never creates semantic approval itself. Incomplete evidence,

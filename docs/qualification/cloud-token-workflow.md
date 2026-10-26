@@ -6,7 +6,15 @@ checks, an empty advisory list, or a worker's prose as permission to accept a pa
 
 ## Run to review
 
-Create normal task contracts and a queue manifest:
+The normal path is one complete bounded local assignment, planned and reviewed inside the same
+cloud window. Put related stages into that one contract instead of buying extra coordination
+turns:
+
+```sh
+<root>/bin/local-worker orchestrate --task-file /absolute/path/task.json --state-dir /absolute/path/state
+```
+
+A declared queue stays supported for independent tasks, with the same guarantees:
 
 ```json
 {"tasks": ["/absolute/path/task.json"]}
@@ -16,14 +24,21 @@ Create normal task contracts and a queue manifest:
 <root>/bin/local-worker orchestrate --manifest /absolute/path/queue.json --state-dir /absolute/path/state
 ```
 
-The queue validates and snapshots the contracts, uses one inference slot, and records a durable
+Both entries validate and snapshot the contracts, use one inference slot, and record a durable
 receipt containing completed jobs and pending tasks. Each job retains its original attempt and
 time budget. A failed, incomplete, or timed-out job stops the queue without silently resetting a
 workstream, escalating to cloud, or deleting evidence. The command returns only review-package
 paths and digests plus status; no model polling is needed. Provider options `--settings` and
 `--codex-bin` are forwarded to the normal launcher.
 
-Read the returned `package.json`. It includes the full bounded patch, changed source files,
+Each job returns a canonical `package.json` and a complete readable `review.md`. Read the view
+once: it reproduces the frozen contract, full diff, changed sources, actual checks, findings,
+audit and screenshots verbatim, keeping blank lines, literal escapes and code fences exactly. The
+view is not hashed into the package; it is verified byte-for-byte against a fresh rendering of the
+digest-bound canonical package before any decision, and read at most one byte past the expected
+length, so an edited, truncated or oversized view fails closed instead of misleading review.
+
+The canonical `package.json` includes the full bounded patch, changed source files,
 actual checks, static advisories, audit, screenshot references, task contract, and hashes of
 retained evidence. Large/missing evidence is explicitly incomplete and cannot be accepted by
 this command. Full original logs remain linked. An older report without its original contract
@@ -78,6 +93,10 @@ dictionary-key advisory catches overwritten expected values cheaply without exec
 After inspecting the diff, source, tests, findings, audit and screenshots (where applicable), the
 cloud planner writes a decision JSON. `reviewer` and `semantic_review` are explicit caller
 attestations; this CLI does not authenticate a model identity or perform the review itself.
+The reviewer is the same cloud planner session that planned the assignment: there is no noop cloud
+preparation session, no mandatory second cloud reviewer, and no model polling between the two
+commands. All existing gates stay: checks, semantic sections, permission-wrapped integration,
+budgets and verified archive.
 
 ```json
 {

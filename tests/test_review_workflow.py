@@ -246,17 +246,208 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertTrue(self.worktree.exists())
 
     def test_queue_timeout_retains_pending_tasks_and_receipt(self):
-        path = self.root / 'task.json'
-        path.write_text(json.dumps(self.report['contract']))
+        paths = []
+        for index in range(2):
+            path = self.root / ('timeout-task%d.json' % index)
+            path.write_text(json.dumps(dict(self.report['contract'], task_id='timeout%d' % index)))
+            paths.append(str(path))
         manifest = self.root / 'queue.json'
-        manifest.write_text(json.dumps({'tasks': [str(path), str(path)]}))
+        manifest.write_text(json.dumps({'tasks': paths}))
         def timeout(argv, **kwargs):
             raise sp.subprocess.TimeoutExpired(argv, 60)
         result = rw.orchestrate(manifest, self.state, run=timeout)
         self.assertEqual(result['status'], 'blocked')
-        self.assertEqual(result['pending_tasks'], [str(path)])
+        self.assertEqual(result['pending_tasks'], paths[1:])
         self.assertTrue(Path(result['receipt_path']).is_file())
         self.assertEqual(result['jobs'][0]['status'], 'launcher_timeout')
+
+    def single_task(self, **overrides):
+        """Current v2 write contract; the v1 nine-field shape is normalized by the loader."""
+        path = self.root / 'single-task.json'
+        payload = dict(self.report['contract'], kind='write', workstream='single',
+                       environment={'pass': []}, tier={'local': True}, ui_review=False)
+        path.write_text(json.dumps(dict(payload, **overrides)))
+        return path
+
+    def no_inference(self, argv, **kwargs):
+        raise AssertionError('inference started before every contract was validated')
+
+    def test_task_file_is_the_default_single_assignment_entry(self):
+        path = self.single_task()
+        settings = sp.write_settings(self.root / 'settings.json')
+        def run(argv, **kwargs):
+            self.assertIn('--task-file', argv)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), mock.patch.object(sp.lw, 'run_bounded',
+                    sp.FakeRun(worker_edit=sp.fix_add)):
+                code = sp.lw.main(argv[2:], omlx_fetch=sp.FakeOmlx('one'), codex_run=sp.fake_help())
+            return sp.subprocess.CompletedProcess(argv, code, output.getvalue(), '')
+        result = rw.orchestrate(None, self.state, task_file=path, run=run,
+                                launcher_args=['--settings', str(settings), '--codex-bin', 'codex-mock'])
+        self.assertEqual(result['status'], 'awaiting_cloud_review', result)
+        self.assertEqual(len(result['jobs']), 1)
+        job = result['jobs'][0]['job_id']
+        view = Path(result['jobs'][0]['review_path'])
+        self.assertTrue(view.is_file())
+        self.assertIn('same cloud planner session', result['handoff'])
+        package = rw.read_json(view.with_name('package.json'))
+        self.assertTrue(package['complete'], package['incomplete_reasons'])
+        with mock.patch.dict('os.environ', sp.GIT_ID):
+            accepted = rw.decide(self.state, job, self.decision(package))
+        self.assertEqual(accepted['status'], 'accepted', accepted)
+        self.assertIn('a + b', (self.repo / 'add.py').read_text())
+
+    def test_task_file_and_manifest_are_mutually_exclusive(self):
+        path = self.single_task()
+        manifest = self.root / 'queue.json'
+        manifest.write_text(json.dumps({'tasks': [str(path)]}))
+        with self.assertRaisesRegex(rw.WorkflowError, 'mutually exclusive'):
+            rw.orchestrate(manifest, self.state, task_file=path, run=self.no_inference)
+        with self.assertRaisesRegex(rw.WorkflowError, 'mutually exclusive'):
+            rw.orchestrate(None, self.state, run=self.no_inference)
+
+    def test_cloud_tier_is_refused_before_any_inference(self):
+        path = self.single_task(tier={'cloud': 'some-cloud-model'})
+        worktrees = self.state / 'worktrees'
+        self.assertTrue(worktrees.is_dir())
+        inventory = sorted(str(entry.relative_to(worktrees)) for entry in worktrees.rglob('*'))
+        calls = []
+        def runner(argv, **kwargs):
+            calls.append(argv)
+            return sp.subprocess.CompletedProcess(argv, 1, json.dumps({'status': 'worker_failed'}), '')
+        with self.assertRaisesRegex(rw.WorkflowError, 'local tier'):
+            rw.orchestrate(None, self.state, task_file=path, run=runner)
+        self.assertEqual(calls, [])
+        self.assertEqual(sorted(str(entry.relative_to(worktrees)) for entry in worktrees.rglob('*')),
+                         inventory)
+        self.assertFalse((self.state / 'queues').exists())
+
+    def test_dirty_target_audit_failure_is_refused_before_any_inference(self):
+        path = self.single_task()
+        calls = []
+        def runner(argv, **kwargs):
+            calls.append(argv)
+            return sp.subprocess.CompletedProcess(argv, 1, json.dumps({'status': 'worker_failed'}), '')
+        with mock.patch.object(sp.lw, 'dirty_primary_files',
+                               side_effect=sp.lw.LauncherError('git status unavailable')):
+            with self.assertRaisesRegex(rw.WorkflowError, 'cannot audit dirty primary work'):
+                rw.orchestrate(None, self.state, task_file=path, run=runner)
+        self.assertEqual(calls, [])
+        self.assertFalse((self.state / 'queues').exists())
+
+    def test_duplicate_task_identity_is_refused_before_any_inference(self):
+        first = self.root / 'task-a.json'
+        second = self.root / 'task-b.json'
+        first.write_text(json.dumps(dict(self.report['contract'], kind='write', task_id='dup',
+                                         workstream='a', environment={'pass': []},
+                                         tier={'local': True}, ui_review=False)))
+        second.write_text(json.dumps(dict(self.report['contract'], kind='write', task_id='dup',
+                                          goal='other goal', workstream='b',
+                                          environment={'pass': []}, tier={'local': True},
+                                          ui_review=False)))
+        manifest = self.root / 'queue.json'
+        manifest.write_text(json.dumps({'tasks': [str(first), str(second)]}))
+        with self.assertRaisesRegex(rw.WorkflowError, 'duplicate task identity'):
+            rw.orchestrate(manifest, self.state, run=self.no_inference)
+
+    def test_dirty_target_overlap_is_refused_before_any_inference(self):
+        (self.repo / 'notes.md').write_text('user work\n')
+        path = self.single_task(allowed_paths=['notes.md'])
+        with self.assertRaisesRegex(rw.WorkflowError, 'overlap'):
+            rw.orchestrate(None, self.state, task_file=path, run=self.no_inference)
+
+    def test_untracked_target_file_is_refused_before_any_inference(self):
+        (self.repo / 'draft.py').write_text('user draft\n')
+        path = self.single_task(allowed_paths=['draft.py'])
+        with self.assertRaisesRegex(rw.WorkflowError, 'overlap'):
+            rw.orchestrate(None, self.state, task_file=path, run=self.no_inference)
+
+    def test_unrelated_dirty_primary_work_still_runs_the_assignment(self):
+        (self.repo / 'notes.md').write_text('keep user work\n')
+        path = self.single_task()
+        calls = []
+        def runner(argv, **kwargs):
+            calls.append(argv)
+            return sp.subprocess.CompletedProcess(argv, 1, json.dumps({'status': 'worker_failed'}), '')
+        result = rw.orchestrate(None, self.state, task_file=path, run=runner)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result['status'], 'blocked')
+
+    def view_text(self, package):
+        return Path(package['review_path']).read_text(encoding='utf-8')
+
+    def test_review_view_keeps_full_diff_sources_checks_and_literal_escapes(self):
+        (self.worktree / 'add.py').write_text(
+            'def add(a, b):\n    return a + b  # tab:\\t newline:\\n fence: ```\n')
+        self.save()
+        package = self.package()
+        self.assertTrue(package['complete'], package['incomplete_reasons'])
+        view = self.view_text(package)
+        self.assertIn('+    return a + b', view)
+        self.assertIn('tab:\\t newline:\\n fence: ```', view)
+        self.assertNotIn('tab:\\\\t', view)
+        self.assertIn(package['package_sha256'], view)
+        self.assertIn('addition works', view)
+        self.assertIn('passed', view)
+        self.assertIn('No review findings recorded', view)
+        self.assertIn('No screenshots recorded', view)
+        self.assertIn('No native preflight recorded', view)
+        self.assertIn('No read/citation audit recorded', view)
+
+    def test_review_view_keeps_blank_lines_verbatim(self):
+        source = 'def add(a, b):\n\n\n\n    return a + b\n\n\n\n'
+        (self.worktree / 'add.py').write_text(source)
+        self.save()
+        package = self.package()
+        self.assertTrue(package['complete'], package['incomplete_reasons'])
+        view = self.view_text(package)
+        self.assertIn(source, view)
+        self.assertIn('\n\n\n', view)
+        self.assertEqual(view, rw.render_review(package))
+
+    def test_truncated_evidence_is_marked_and_never_looks_complete(self):
+        package = rw.build_package(self.state, self.job, max_patch_bytes=8)
+        self.assertFalse(package['complete'])
+        view = self.view_text(package)
+        self.assertIn('TRUNCATED', view)
+        self.assertIn('exceeds review package limit', view)
+
+    def test_tampered_review_view_blocks_acceptance(self):
+        package = self.package()
+        view = Path(package['review_path'])
+        view.write_text(view.read_text(encoding='utf-8') + '\napproved by nobody\n')
+        with self.assertRaisesRegex(rw.WorkflowError, 'review view'):
+            rw.decide(self.state, self.job, self.decision(package))
+        self.assertIn('a - b', (self.repo / 'add.py').read_text())
+
+    def test_missing_review_view_blocks_acceptance(self):
+        package = self.package()
+        Path(package['review_path']).unlink()
+        with self.assertRaisesRegex(rw.WorkflowError, 'review view'):
+            rw.decide(self.state, self.job, self.decision(package))
+
+    def test_symlinked_review_view_blocks_acceptance(self):
+        package = self.package()
+        view = Path(package['review_path'])
+        copy = view.parent / 'review-copy.md'
+        copy.write_text(view.read_text(encoding='utf-8'), encoding='utf-8')
+        view.unlink()
+        view.symlink_to(copy)
+        with self.assertRaisesRegex(rw.WorkflowError, 'review view'):
+            rw.decide(self.state, self.job, self.decision(package))
+
+    def test_historical_package_without_a_view_stays_canonical_only(self):
+        package = self.package()
+        package.pop('review_path')
+        unsigned = dict(package)
+        unsigned.pop('package_sha256')
+        package['package_sha256'] = rw.digest(unsigned)
+        # Canonical path is resolved; a raw state path under the macOS /var alias is refused.
+        rw.atomic_json(package['package_path'], package)
+        with mock.patch.dict('os.environ', sp.GIT_ID):
+            result = rw.decide(self.state, self.job, self.decision(package))
+        self.assertEqual(result['status'], 'accepted', result)
+        self.assertIn('a + b', (self.repo / 'add.py').read_text())
 
     def test_queue_to_explicit_cloud_decision_with_real_launcher_reports(self):
         payload = dict(self.report['contract'])
